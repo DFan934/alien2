@@ -9,6 +9,13 @@ import time
 from pathlib import Path
 from typing import Dict
 
+from datetime import datetime
+from data_ingestion.connectors.csv_local import Connector as CSVLocal
+from data_ingestion.pipelines.csv_pipeline import CSVPipeline
+from data_ingestion.persistence import write_parquet
+from .persistence import write_parquet
+
+import pandas as pd
 logger = logging.getLogger(__name__)
 
 
@@ -37,9 +44,36 @@ class IngestionManager:
     # -----------------------------------------------------------------
     # public API
     # -----------------------------------------------------------------
-    def fetch_bars(self, *args, **kwargs):
-        """Main entry – choose an available connector and fetch data."""
-        ...
+    async def fetch_bars(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        start: datetime | str,
+        end: datetime | str,
+        out_root: Path = Path("raw/minute"),
+    ) -> Path:
+        """Return path to partitioned Parquet after assuring data is on disk."""
+        # 1) choose provider (only csv_local for now)
+        cx = CSVLocal(root=Path("historical_csv"))
+
+        if not self._breaker_window_expired(cx.NAME):
+            raise RuntimeError(f"Provider {cx.NAME} still in cooldown")
+
+        try:
+            raw = await cx.fetch_data(symbols, timeframe, start, end)
+        except Exception as exc:                   # CSV read failure, etc.
+            self._trip_breaker(cx.NAME)
+            raise
+
+        # 2) pipeline standardisation
+        pipe = CSVPipeline()
+        frames = [pipe.parse(f, symbol=sym) for sym, f in zip(symbols, raw)]
+
+        df = pd.concat(frames, ignore_index=True)
+
+        # 3) persist with schema tag
+        path = write_parquet(df, out_root, partition_cols=["symbol", "year"])
+        return path
 
     # -----------------------------------------------------------------
     # circuit-breaker helpers
