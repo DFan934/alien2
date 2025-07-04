@@ -1,0 +1,15 @@
+# ===============================================================================
+# data_ingestion/ingest_config.yaml  (NEW – put at repo root next to setup.cfg)
+# ===============================================================================
+#
+# All tunables for historical CSV → Parquet conversion live here so you never
+# edit code for simple parameter tweaks.  Paths are resolved relative to the
+# *project* root at runtime.
+# -----------------------------------------------------------------------------
+csv_root: "./data/csv"            # where raw CSV minute bars live
+parquet_root: "./data/parquet"    # destination hive‑partitioned Parquet store
+splits_path: "./data/meta/splits.csv"
+dividends_path: "./data/meta/dividends.csv"
+mem_target_mb: 512                # MB memory budget per chunk (auto‑calc rows)
+bad_line_policy: "warn"           # one of: raise | warn | skip
+fail_fast: false                  # abort on first bad file if true
