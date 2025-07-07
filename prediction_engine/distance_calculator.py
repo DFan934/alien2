@@ -22,11 +22,44 @@ This file belongs in  ``prediction_engine/distance_calculator.py``  and is a
 import functools
 import hashlib
 from typing import Literal, Tuple
+from functools import lru_cache
 
 import numpy as np
 from numpy.typing import NDArray
 
-Metric = Literal["euclidean", "mahalanobis"]
+#Metric = Literal["euclidean", "mahalanobis"]
+Metric = Literal["euclidean", "mahalanobis", "rf_weighted"]
+
+
+# ---------------------------------------------------------------------------
+# Helper – cached inverse covariance
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Helpers – LRU‑cached inverse covariance
+# ---------------------------------------------------------------------------
+
+def _inv_cov_cached(ref_id: int, arr: NDArray[np.float32], eps: float) -> NDArray[np.float32]:
+    """Cache inverse covariance per *identity* of the reference array."""
+    key = (ref_id, eps)
+    if key in _inv_cov_cached._store:  # type: ignore[attr-defined]
+        return _inv_cov_cached._store[key]
+    cov = np.cov(arr, rowvar=False, dtype=np.float64)
+    cov.flat[:: cov.shape[0] + 1] += eps
+    inv = np.linalg.inv(cov).astype(np.float32)
+    _inv_cov_cached._store[key] = inv
+    if len(_inv_cov_cached._store) > 8:  # simple LRU max‑len
+        _inv_cov_cached._store.pop(next(iter(_inv_cov_cached._store)))
+    return inv
+
+
+_inv_cov_cached._store: dict[Tuple[int, float], NDArray[np.float32]] = {}  # type: ignore[attr-defined]
+
+
+
+# Global weak‑registry so the lru_cache can map id → ndarray
+_REF_REGISTRY: dict[int, NDArray[np.float32]] = {}
 
 
 class DistanceCalculator:  # pylint: disable=too-few-public-methods
@@ -45,14 +78,14 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         prevent singularities.
     """
 
-    __slots__ = ("_ref", "_metric", "_inv_cov", "_cache")
+    __slots__ = ("_ref", "_metric", "_inv_cov","_rf_w", "_cache")
 
     def __init__(
         self,
         ref: NDArray[np.float32],
+        *,
         metric: Metric = "euclidean",
         eps: float = 1e-12,
-        *,
         cov_inv: NDArray[np.float32] | None = None,  # <-- NEW
         rf_weights: NDArray[np.float32] | None = None,  # <-- NEW
     ) -> None:
@@ -61,6 +94,8 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         self._ref: NDArray[np.float32] = ref.astype(np.float32, copy=False)
         self._metric: Metric = metric  # type: ignore[assignment]
         self._cache: dict[Tuple[int, int], Tuple[NDArray[np.float32], NDArray[np.int64]]] = {}
+        #self._rf_w = rf_weights.astype(np.float32) if rf_weights is not None else None
+
 
         if metric == "mahalanobis":
             cov = np.cov(self._ref, rowvar=False, dtype=np.float64)
@@ -69,6 +104,12 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             self._inv_cov = np.linalg.inv(cov).astype(np.float32)
         else:
             self._inv_cov = None  # type: ignore[assignment]
+
+        # ---- RF‑weighted ----------------------------------------------------
+        self._rf_w = rf_weights.astype(np.float32, copy=False) if rf_weights is not None else None
+        if metric == "rf_weighted" and self._rf_w is None:
+            raise ValueError("rf_weighted metric requires rf_weights vector")
+
 
     # ---------------------------------------------------------------------
     # Public API
@@ -97,15 +138,6 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             pass  # cold‑start
 
         # Compute full distance vector
-        '''if self._metric == "euclidean":
-            diff = self._ref - x  # broadcasting
-            dist_vec = np.sqrt(np.sum(diff * diff, axis=1, dtype=np.float32))
-        else:  # Mahalanobis
-            diff = self._ref - x
-            left = diff @ self._inv_cov  # (n_ref, n_feat)
-            dist_vec = np.sqrt(np.sum(left * diff, axis=1, dtype=np.float32))
-        '''
-
         if self._metric == "euclidean":
             diff = self._ref - x
             dist_vec = np.sqrt(np.sum(diff * diff, axis=1, dtype=np.float32))
@@ -159,10 +191,12 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
 
     @classmethod
     def from_artifacts(
-        cls,
-        ref_path: str | Path,
-        metric: Metric = "euclidean",
+            cls,
+            ref_path: str | Path,
+            *,
+            metric: Metric = "euclidean",
+            rf_weights: str | None = None,
     ) -> "DistanceCalculator":
-        """Load reference matrix from ``.npy`` file and build a calculator."""
-        ref_arr = np.load(Path(ref_path), mmap_mode="r")  # memory map: zero‑copy
-        return cls(ref=ref_arr, metric=metric)
+        ref_arr = np.load(Path(ref_path), mmap_mode="r")
+        w = np.load(rf_weights) if rf_weights else None
+        return cls(ref_arr, metric=metric, rf_weights=w)

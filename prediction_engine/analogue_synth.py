@@ -94,7 +94,8 @@ class AnalogueSynth:
         by the novel proxy (e.g., current mark‑to‑market).  If your pipeline
         pre‑computes outcome deltas, pass zero for *novel_outcome_proxy*.
         """
-        assert neighbour_outcomes.shape == β.shape, "β/outcome dim mismatch"
+        if neighbour_outcomes.shape != β.shape:
+            raise ValueError("β/outcome dim mismatch")
         return novel_outcome_proxy + float(β @ neighbour_outcomes)
 
 

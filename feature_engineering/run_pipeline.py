@@ -85,6 +85,11 @@ def main() -> None:
         end=args.end   or "2100-01-01",
     )
 
+    # Replace any unnamed numeric columns with pca_X labels so schema hash is stable
+    unnamed = [c for c in df.select_dtypes("number").columns if isinstance(c, int) or c == ""]
+    for i, col in enumerate(unnamed, 1):
+        df.rename(columns={col: f"feat_{i}"}, inplace=True)
+
     write_feature_dataset(df, output_root)
     logger.info("Saved features → %s", output_root)
     logger.info("PCA retained %d components covering %.2f%% variance",

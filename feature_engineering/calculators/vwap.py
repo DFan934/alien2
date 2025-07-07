@@ -7,10 +7,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .base import Calculator, RollingCalculatorMixin
+from .base import Calculator, RollingCalculatorMixin, BaseCalculator
 
 
-class VWAPCalculator(RollingCalculatorMixin):
+class VWAPCalculator(RollingCalculatorMixin, BaseCalculator):
     name = "vwap_delta"
     # Session‑cumulative → no rolling lookback, but we reset at each trading day.
     lookback = 0

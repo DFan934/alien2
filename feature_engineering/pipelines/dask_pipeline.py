@@ -1,125 +1,86 @@
-# ──────────────────────────────────────────────────────────────────────────
-# pipelines/dask_pipeline.py  (completed)
-# ──────────────────────────────────────────────────────────────────────────
-"""Dask‑based scalable feature pipeline.
-
-Uses the same public interface as :class:`feature_engineering.pipelines.core.FeaturePipeline`.
-
-Example
--------
->>> from feature_engineering.pipelines.dask_pipeline import DaskFeaturePipeline
->>> pipe = DaskFeaturePipeline()
->>> df, pca_meta = pipe.run(
-...     parquet_root="parquet",
-...     symbols=["AAPL", "MSFT"],
-...     start="2019-01-01",
-...     end="2019-12-31",
-...     npartitions=4,
-... )
-"""
+# ============================================================================
+# feature_engineering/pipelines/dask_pipeline.py
+# ============================================================================
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Tuple, List
+from typing import Iterable, Tuple
 
 import dask.dataframe as dd
 import pandas as pd
-from dask.diagnostics import ProgressBar
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import IncrementalPCA
+import pyarrow as pa
+from dask_ml.impute import SimpleImputer
+from dask_ml.preprocessing import StandardScaler
+from dask_ml.decomposition import PCA
 
-from feature_engineering.utils import logger
 from feature_engineering.calculators import (
-    vwap as _vwap,
-    rvol as _rvol,
-    ema as _ema,
-    momentum as _mom,
-    atr as _atr,
-    adx as _adx,
+    VWAPCalculator,
+    RVOLCalculator,
+    EMA9Calculator,
+    EMA20Calculator,
+    MomentumCalculator,
+    ATRCalculator,
+    ADXCalculator,
 )
-from feature_engineering.patterns import candlestick as _candle
-from feature_engineering.reducers.pca import PCAReducer
+from feature_engineering.config import settings
+from feature_engineering.pipelines.dataset_loader import load_parquet_dataset
+from feature_engineering.utils import logger, timeit
 
 __all__ = ["DaskFeaturePipeline"]
 
+_CALCULATORS = [
+    VWAPCalculator(),
+    RVOLCalculator(lookback_days=20),
+    EMA9Calculator(),
+    EMA20Calculator(),
+    MomentumCalculator(period=10),
+    ATRCalculator(period=14),
+    ADXCalculator(period=14),
+]
+
 
 class DaskFeaturePipeline:
-    """Drop‑in replacement for the pandas FeaturePipeline but using Dask."""
+    """Dask‑based feature builder – parallel + lazy."""
 
-    def __init__(self, npartitions: int | None = None):
-        self.npartitions = npartitions or 8  # sensible default on 8‑core boxes
+    def __init__(self, parquet_root: Path | str, npartitions: int | None = None):
+        self.parquet_root = Path(parquet_root)
+        self.npartitions = npartitions
 
-        # --- calculators ordered list --------------------------------------------------
-        self._calculators = [
-            _vwap.VWAPCalculator(),
-            _rvol.RVOLCalculator(window=20),
-            _ema.EMACalculator(span=9),
-            _ema.EMACalculator(span=20),
-            _mom.MomentumCalculator(window=10),
-            _atr.ATRCalculator(window=14),
-            _adx.ADXCalculator(window=14),
-            _candle.CandlestickCalculator(),
-        ]
-
-    # ---------------------------------------------------------------------
-    # Public API – mirrors core.FeaturePipeline
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    @timeit("dask‑run")
     def run(
         self,
-        parquet_root: str | Path,
         symbols: Iterable[str],
-        start: str,
-        end: str,
-        *,
-        explained_var: float = 0.95,
-        impute_thresh: float = 0.2,
+        start: str | datetime,
+        end: str | datetime,
     ) -> Tuple[pd.DataFrame, dict]:
-        """Load data ➜ compute features ➜ fit PCA ➜ return pandas DF + meta."""
+        dataset = load_parquet_dataset(self.parquet_root)
+        filt = dataset.field("symbol").isin(list(symbols))
+        df = dataset.to_table(filter=filt).to_pandas()
 
-        ds = dd.read_parquet(
-            str(parquet_root),
-            engine="pyarrow",
-            filters=[("symbol", "in", list(symbols))],
-            chunksize="16MB",
+        df = df[(df["timestamp"] >= pd.Timestamp(start)) & (df["timestamp"] <= pd.Timestamp(end))]
+        if df.empty:
+            raise FileNotFoundError("No rows match symbol/date slice – aborting.")
+
+        ddf = dd.from_pandas(df, npartitions=self.npartitions or 4)
+
+        # Apply calculators sequentially
+        for calc in _CALCULATORS:
+            ddf = calc(ddf)
+
+        numeric = list(ddf.select_dtypes("number").columns)
+
+        pipe = PCA(n_components=settings.pca_variance, svd_solver="full")
+        ddf[numeric] = (
+            StandardScaler().fit_transform(
+                SimpleImputer(strategy=settings.impute_strategy).fit_transform(ddf[numeric])
+            ).map_blocks(pipe.fit_transform)
         )
-        # Date filter – convert to pandas Timestamp for comparison
-        ds = ds[(ds.timestamp >= pd.Timestamp(start, tz="UTC")) & (ds.timestamp <= pd.Timestamp(end, tz="UTC"))]
-
-        logger.info("Dask read: %s rows across %d partitions", ds.shape[0].compute(), ds.npartitions)
-
-        # Ensure proper partitioning
-        if self.npartitions:
-            ds = ds.repartition(npartitions=self.npartitions)
-
-        # Sequentially apply each calculator via map_partitions
-        for calc in self._calculators:
-            logger.info("Applying %s…", calc.name)
-            ds = ds.map_partitions(calc.transform, meta=calc.meta())
-
-        # Drop rows with too many NaNs, then impute the rest (mean per column)
-        missing_frac = ds.isna().mean(axis=1)
-        ds = ds[missing_frac <= impute_thresh]
-        ds = ds.map_partitions(lambda d: d.fillna(d.mean()), meta=ds._meta)
-
-        # Convert to pandas for PCA (IncrementalPCA processes batches)
-        with ProgressBar():
-            pdf = ds.compute()
-
-        feature_cols = pdf.columns.drop(["timestamp", "symbol"])
-        scaler = StandardScaler()
-        ipca = IncrementalPCA(n_components=explained_var, whiten=False)
-        pca_pipe: Pipeline = Pipeline([("scaler", scaler), ("pca", ipca)])
-        features_reduced = pca_pipe.fit_transform(pdf[feature_cols])
+        df_final = ddf.compute()
 
         pca_meta = {
-            "explained_variance_ratio_": ipca.explained_variance_ratio_.tolist(),
-            "components_": ipca.components_.tolist(),
-            "n_components_": ipca.n_components_.item() if hasattr(ipca.n_components_, "item") else int(ipca.n_components_),
+            "n_components_": pipe.n_components_,
+            "explained_variance_ratio_": pipe.explained_variance_ratio_.tolist(),
         }
-
-        final_df = pd.concat(
-            [pdf[["timestamp", "symbol"]].reset_index(drop=True), pd.DataFrame(features_reduced)],
-            axis=1,
-        )
-        return final_df, pca_meta
+        return df_final, pca_meta

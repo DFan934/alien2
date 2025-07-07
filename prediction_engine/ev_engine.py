@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import hashlib
 
+from hypothesis.extra.numpy import NDArray
+
+from .analogue_synth import AnalogueSynth
+
 """Expected‑Value Engine
 ========================
 
@@ -91,6 +95,7 @@ class EVEngine:
         h: float,
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
         cov_inv: np.ndarray | None = None,
+        rf_weights: np.ndarray | None = None,
         k: int | None = None,
         #tx_cost: tx_cost | None = None,
         cost_model: object | None = None,
@@ -103,7 +108,7 @@ class EVEngine:
         self.h = float(h)
         self.k_max = k or 32  # fair default; will be density‑capped later
         self.metric = metric
-        self._dist = DistanceCalculator(self.centers, metric=metric, cov_inv=cov_inv)
+        self._dist = DistanceCalculator(self.centers, metric=metric, cov_inv=cov_inv, rf_weights=rf_weights)
         #self.tx_cost = tx_cost or tx_cost.basic()
 
         self._cost = cost_model if cost_model is not None else _tx_cost
@@ -153,16 +158,14 @@ class EVEngine:
             )
 
         cov_inv = None
+        rf_w = None
         if metric == "mahalanobis":
             cov_inv = np.load(artefact_dir / "centroid_cov_inv.npy")
         elif metric == "rf_weighted":
-         # just verify weights file exists – DistanceCalculator loads it lazily
-
-            if not (artefact_dir / "weights.npy").exists():
-
-                raise FileNotFoundError(
-                                    f"metric='rf_weighted' requested but {artefact_dir / 'weights.npy'} missing")
-
+            rf_path = artefact_dir / "weights.npy"
+            if not rf_path.exists():
+                raise FileNotFoundError("RF weights file missing for rf_weighted metric")
+            rf_w = np.load(rf_path)
 
         return cls(
             centers=centers,
@@ -172,6 +175,7 @@ class EVEngine:
             h=h,
             metric=metric,
             cov_inv=cov_inv,
+            rf_weights=rf_w,
             k=k,
             #tx_cost=tx_cost,
             cost_model=cost_model,
@@ -181,47 +185,61 @@ class EVEngine:
     # Core API
     # ------------------------------------------------------------------
 
-    def evaluate(self, x: np.ndarray, adv_percentile: float | None = None) -> EVResult:
-        """Compute EV stats for one *live* feature vector.
-
-        Parameters
-        ----------
-        x : np.ndarray
-            Feature vector, shape ``(n_features,)``.
-        adv_percentile : float, optional
-            ADV percentile of the traded symbol (0‑100). Used for
-            dynamic slippage adjustment; low‑liquidity names widen the
-            assumed spread.
-        """
+    def evaluate(self, x: NDArray[np.float32], adv_percentile: float | None = None) -> EVResult:  # noqa: N802
+        """Return expected‑value statistics for one live feature vector."""
         x = np.ascontiguousarray(x, dtype=np.float32)
         if x.ndim != 1:
             raise ValueError("x must be 1‑D vector")
 
-        # density‑aware k: √N but at least 2 and at most k_max
+        # ------------------------------------------------------------
+        # 1. Find nearest neighbours (density‑aware k)
+        # ------------------------------------------------------------
         k_eff = int(max(2, min(self.k_max, sqrt(len(self.centers)))))
         idx, dist2 = self._dist(x, k_eff)
 
-        # Gaussian kernel weights
-        w = np.exp(-0.5 * dist2 / (self.h**2))
-        if w.sum() == 0.0:
-            w[:] = 1  # fallback uniform if all distances large
+        # density cut‑off – remove outliers beyond 2 h
+        mask = dist2 < (2 * self.h) ** 2
+        if not mask.any():
+            mask[:] = True  # fallback – keep all if everything out of range
+        idx, dist2 = idx[mask], dist2[mask]
+
+        # ------------------------------------------------------------
+        # 2. Kernel estimate (Gaussian)
+        # ------------------------------------------------------------
+        w = np.exp(-0.5 * dist2 / (self.h ** 2))
+        if w.sum() == 0.0:  # <-- add this
+            w[:] = 1.0
         w /= w.sum()
+        mu_k = float(np.dot(w, self.mu[idx]))
+        var_k = float(np.dot(w, self.var[idx]))
+        var_down_k = float(np.dot(w, self.var_down[idx]))
 
-        mu = float(np.dot(w, self.mu[idx]))
-        sig2 = float(np.dot(w, self.var[idx]))
-        sig2_down = float(np.dot(w, self.var_down[idx]))
+        # ------------------------------------------------------------
+        # 3. Synthetic analogue via inverse‑difference weights
+        # ------------------------------------------------------------
+        delta_mat = self.centers[idx] - x  # (k, d)
+        beta = AnalogueSynth.weights(delta_mat, -x)
+        mu_syn = AnalogueSynth.synthesize(0.0, self.mu[idx], beta)
+        var_syn = float(beta @ self.var[idx])  # <— one-liner
+        var_down_syn = float(beta @ self.var_down[idx])
 
-        # subtract slippage / commission
-        #cost = self.tx_cost.estimate(adv_percentile=adv_percentile)
+        # blend 50‑50
+        mu = 0.5 * mu_k + 0.5 * mu_syn
+        sig2 = 0.5 * var_k + 0.5 * var_syn
+        sig2_down = 0.5 * var_down_k + 0.5 * var_down_syn
 
-        cost = (
-            self._cost.estimate(order_size=1, ADV=1)
-            if hasattr(self._cost, "estimate")
-            else 0.0
-        )
+        # ------------------------------------------------------------
+        # 4. Subtract transaction cost
+        # ------------------------------------------------------------
+        if hasattr(self._cost, "estimate"):
+            try:
+                cost = self._cost.estimate(adv_percentile=adv_percentile)
+            except TypeError:
+                cost = self._cost.estimate()
+        else:
+            cost = 0.0
 
         mu_net = mu - cost
-
         return EVResult(mu_net, sig2, sig2_down, int(idx[0]))
 
 

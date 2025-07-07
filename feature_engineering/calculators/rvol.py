@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .base import Calculator, RollingCalculatorMixin
+from .base import Calculator, RollingCalculatorMixin, BaseCalculator
 
 
-class RVOLCalculator(RollingCalculatorMixin):
+class RVOLCalculator(RollingCalculatorMixin, BaseCalculator):
     def __init__(self, lookback_days: int = 20):
         self.name = f"rvol_{lookback_days}d"
         # 390 min per session (US equities) → store days for window calc

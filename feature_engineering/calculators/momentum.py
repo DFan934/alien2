@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .base import RollingCalculatorMixin
+from .base import RollingCalculatorMixin, BaseCalculator
 
 
-class MomentumCalculator(RollingCalculatorMixin):
+class MomentumCalculator(RollingCalculatorMixin, BaseCalculator):
     """N‑period rate of change (%)."""
 
     def __init__(self, period: int = 20):

@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .base import RollingCalculatorMixin
+from .base import RollingCalculatorMixin, BaseCalculator
 
 
-class ATRCalculator(RollingCalculatorMixin):
+class ATRCalculator(RollingCalculatorMixin, BaseCalculator):
     """Average True Range (volatility proxy)."""
 
     def __init__(self, period: int = 14):

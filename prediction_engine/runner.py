@@ -183,10 +183,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:  # noqa: BLE001
-        log.exception("Fatal error")
-    try:
-        main()
     except Exception as exc:  # noqa: BLE001
         log.exception("Fatal error", exc_info=exc)
         sys.exit(1)

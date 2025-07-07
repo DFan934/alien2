@@ -1,15 +1,28 @@
 # ---------------------------------------------------------------------------
-# tx_cost.py
+# tx_cost.py  – square-root impact with optional liquidity flag
 # ---------------------------------------------------------------------------
-"""Simple square‑root‑impact slippage model (unit‑tested elsewhere)."""
-
 import numpy as np
 
-# calibrated nightly via scripts/nightly_calibrate.py
-_IMPACT_COEFF = 0.9e-4
+_IMPACT_COEFF = 9e-5    # nightly calibration
 
+def estimate(
+    order_size: float = 1.0,
+    ADV: float = 1.0,
+    *,                       # keyword-only from here on
+    adv_percentile: float | None = None,
+) -> float:
+    """
+    Return per-share slippage.
 
-def estimate(order_size: float, ADV: float) -> float:  # noqa: D401
-    """Return per‑share slippage given order size and daily vol (ADV)."""
-    frac = np.clip(order_size / ADV, 1e-6, 1)
+    Parameters
+    ----------
+    order_size
+        Shares in the order (defaults to 1 for back-tests).
+    ADV
+        Average daily volume (shares).
+    adv_percentile
+        Liquidity percentile 0–100 – ignored for now but accepted so that the
+        prediction engine can pass it without raising a TypeError.
+    """
+    frac = np.clip(order_size / ADV, 1e-6, 1.0)
     return _IMPACT_COEFF * np.sqrt(frac)

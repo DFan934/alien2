@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .base import Calculator, RollingCalculatorMixin
+from .base import Calculator, RollingCalculatorMixin, BaseCalculator
 
 
-class EMACalculator(RollingCalculatorMixin):
+class EMACalculator(RollingCalculatorMixin, BaseCalculator):
     def __init__(self, period: int):
         self.period = period
         self.name = f"ema_{period}_dist"

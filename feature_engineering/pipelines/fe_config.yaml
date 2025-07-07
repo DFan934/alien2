@@ -1,0 +1,9 @@
+# ===========================================================================
+# feature_engineering/config/fe_config.yaml  (NEW – place in project root)
+# ---------------------------------------------------------------------------
+paths:
+  parquet_root: "C:/Users/.../parquet"  # replace with your path
+
+impute_strategy: mean  # {mean | median | most_frequent}
+row_nan_frac: 0.2
+pca_variance: 0.95
