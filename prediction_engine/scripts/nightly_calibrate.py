@@ -18,7 +18,10 @@ import pathlib
 
 import pandas as pd
 
+from prediction_engine.market_regime import RegimeDetector
 from prediction_engine.path_cluster_engine import PathClusterEngine
+from prediction_engine.weight_optimization import WeightOptimizer
+
 
 FEATURES = [
     "vwap_dev", "rvol", "ema_21", "roc_60", "atr", "adx",
@@ -53,4 +56,6 @@ if __name__ == "__main__":
     p.add_argument("--k", type=int, default=32)
     p.add_argument("--lookback", type=int, default=365)
     p.add_argument("--out-dir", default="weights/path_cluster/")
+    p.add_argument("--regime-aware", action="store_true")
+
     main(p.parse_args())

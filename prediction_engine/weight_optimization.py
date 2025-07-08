@@ -1,39 +1,36 @@
 # ---------------------------------------------------------------------------
-# weight_optimization.py
+# FILE: prediction_engine/weight_optimization.py
 # ---------------------------------------------------------------------------
+"""Recency‑curve optimiser with train/valid/test split + Optuna fine search.
+
+The optimiser produces **one JSON per market‑regime** so EVEngine can apply
+ageing weights dynamically.  A curve is accepted only if
+``test_sharpe >= 0.8 * train_sharpe`` to curb over‑fitting.
+"""
 from __future__ import annotations
 
-"""Nightly Recency/Tail‐Curve Optimiser (revised)
-================================================
-
-This replaces the earlier lightweight ``weight_optimization.py``.  It adds:
-
-* **Train/validation split** by date to avoid look‑ahead.
-* **Two‑stage search** – coarse multiprocessing grid, then local Optuna search.
-* **Curve families** (linear, exponential, sigmoid) each with *tail_len* and
-  *shape* hyper‑parameters.
-* **Pluggable back‑test function** so optimiser stays I/O‑free.
-* **Persistence** to ``best_curve...yaml`` for next trading session.
-"""
-
+import concurrent.futures as cf
+import json
+import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Callable, Tuple, Dict, Any
-
-import concurrent.futures as _fut
-import json
+from typing import Dict, Tuple, Literal
 
 import numpy as np
 import optuna
 import pandas as pd
+from typing import IO
 
-# ---------------------------------------------------------------------------
-@dataclass
+
+RegimeT = Literal["trend", "range", "volatile", "global"]
+
+
+@dataclass(slots=True)
 class CurveParams:
-    family: str           # linear | exp | sigmoid
-    tail_len: int         # days of history (5‑120)
-    shape: float          # decay rate or slope (0.1‑10)
+    family: Literal["linear", "exp", "sigmoid"]
+    tail_len: int      # days
+    shape: float       # decay / slope
 
     def to_dict(self):
         return self.__dict__
@@ -41,70 +38,101 @@ class CurveParams:
 
 # ---------------------------------------------------------------------------
 class WeightOptimizer:
-    """Search for the curve that maximises Sharpe on *validation* slice."""
+    """Optimises ageing‑weight curve for a single *regime* PnL series."""
 
     def __init__(self, n_jobs: int | None = None):
-        self.n_jobs = n_jobs or max(1, _fut.ProcessPoolExecutor()._max_workers - 1)
+        #self.n_jobs = n_jobs or max(1, (cf.ProcessPoolExecutor()._max_workers - 1))
+        cpu = max(2, (os.cpu_count() or 2))
+        self.n_jobs = n_jobs or max(1, cpu - 1)
 
-    # .................................................................
-    def optimise(self,
-                 pnl_series: pd.Series,
-                 validation_frac: float = 0.2,
-                 storage_dir: Path | str = "./weights") -> Dict[str, Any]:
-        """Return dict with best params and Sharpe; save YAML to *storage_dir*."""
+    # .....................................................................
+    def optimise(
+        self,
+        pnl: pd.Series,
+        *,
+        regime: RegimeT,
+        validation_frac: float = 0.2,
+        test_frac: float = 0.1,
+        out_dir: Path | str = Path("weights/recency_curves"),
+    ) -> Dict[str, float]:
+        """Return dict with train/valid/test Sharpe and persist JSON."""
+        pnl = pnl.dropna().sort_index()
+        n = len(pnl)
+        n_train = int(n * (1 - validation_frac - test_frac))
+        n_valid = int(n * validation_frac)
+        train, valid, test = (
+            pnl.iloc[:n_train],
+            pnl.iloc[n_train : n_train + n_valid],
+            pnl.iloc[n_train + n_valid :],
+        )
 
-        pnl_series = pnl_series.dropna().sort_index()
-        split_idx = int(len(pnl_series) * (1 - validation_frac))
-        train, valid = pnl_series.iloc[:split_idx], pnl_series.iloc[split_idx:]
+        # ---------- coarse grid --------------------------------------
+        grid = self._grid()
+        with cf.ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
+            scores = list(pool.map(lambda p: self._score(p, valid), grid))
+        best_p, best_sh_valid = max(scores, key=lambda t: t[1])
 
-        # 1) coarse grid ------------------------------------------------
-        grid = self._build_grid()
-        with _fut.ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
-            scores = list(pool.map(lambda p: self._score_curve(p, valid), grid))
-        best_curve, best_sharpe = max(scores, key=lambda t: t[1])
-
-        # 2) Optuna fine search ----------------------------------------
+        # ---------- Optuna refine ------------------------------------
         study = optuna.create_study(direction="maximize")
-        study.optimize(lambda t: self._objective(t, valid, best_curve.family),
-                       n_trials=50, show_progress_bar=False)
-        if study.best_value > best_sharpe:
-            best_params = CurveParams(**study.best_params)
-            best_sharpe = study.best_value
-        else:
-            best_params = best_curve
 
-        # 3) save ------------------------------------------------------
-        out_dir = Path(storage_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        fname = out_dir / f"best_curve_{date.today():%Y%m%d}.json"
-        json.dump({"params": best_params.to_dict(), "sharpe": best_sharpe}, fname.open("w"))
+        def _obj(trial: optuna.Trial):
+            cand = CurveParams(
+                family=best_p.family,
+                tail_len=trial.suggest_int("tail_len", 5, 120),
+                shape=trial.suggest_float("shape", 0.1, 10),
+            )
+            return self._score(cand, valid)[1]
 
-        return {"params": best_params.to_dict(), "sharpe": best_sharpe, "file": str(fname)}
+        study.optimize(_obj, n_trials=64, show_progress_bar=False)
+        p_opt = CurveParams(**study.best_params)
+        sharpe_valid = study.best_value
+        if sharpe_valid < best_sh_valid:
+            p_opt = best_p
+            sharpe_valid = best_sh_valid
 
-    # ================= internal helpers ==============================
-    def _score_curve(self, params: CurveParams, pnl: pd.Series) -> Tuple[CurveParams, float]:
-        w = self._make_weights(len(pnl), params)
+        sharpe_train = self._score(p_opt, train)[1]
+        sharpe_test = self._score(p_opt, test)[1]
+
+        if sharpe_test < 0.8 * sharpe_train:
+            raise RuntimeError("Curve over‑fits – test Sharpe too low vs train")
+
+        # ---------- persist -----------------------------------------
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        fname = Path(out_dir) / f"best_curve_{regime}_{date.today():%Y%m%d}.json"
+        with fname.open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "params": p_opt.to_dict(),
+                    "train_sharpe": sharpe_train,
+                    "valid_sharpe": sharpe_valid,
+                    "test_sharpe": sharpe_test,
+                },
+                fh,
+                indent=2,
+            )
+
+        return {
+            "file": str(fname),
+            "train": sharpe_train,
+            "valid": sharpe_valid,
+            "test": sharpe_test,
+        }
+
+    # ================= helpers ======================================
+    def _score(self, p: CurveParams, pnl: pd.Series) -> Tuple[CurveParams, float]:
+        w = self._weights(len(pnl), p)
         w /= w.sum()
-        ret = np.sum(w * pnl.values)
-        risk = np.sqrt(np.sum(w * (pnl.values - ret) ** 2)) + 1e-8
-        sharpe = ret / risk
-        return params, sharpe
+        ret = np.dot(w, pnl.values)
+        risk = np.sqrt(np.dot(w, (pnl.values - ret) ** 2)) + 1e-9
+        return p, ret / risk
 
     @staticmethod
-    def _objective(trial: optuna.trial.Trial, valid: pd.Series, family: str) -> float:
-        tail_len = trial.suggest_int("tail_len", 5, 120)
-        shape = trial.suggest_float("shape", 0.1, 10)
-        params = CurveParams(family, tail_len, shape)
-        _, sharpe = WeightOptimizer()._score_curve(params, valid)
-        return sharpe
-
-    @staticmethod
-    def _make_weights(n: int, p: CurveParams):
-        idx = np.arange(n)[::-1].astype(float)
+    def _weights(n: int, p: CurveParams):
+        idx = np.arange(n, dtype=float)[::-1]
         mask = idx < p.tail_len
         idx = idx[mask]
         if p.family == "linear":
-            w = 1 - (idx / p.tail_len)
+            w = 1 - idx / p.tail_len
         elif p.family == "exp":
             w = np.exp(-idx / (p.shape * 10))
         else:  # sigmoid
@@ -112,24 +140,17 @@ class WeightOptimizer:
             w = 1 / (1 + np.exp(z))
         return w
 
-    def _build_grid(self):
-        grid = []
-        for fam in ("linear", "exp", "sigmoid"):
-            for tail in (10, 20, 40, 60, 90, 120):
-                for shape in (0.5, 1, 2, 5):
-                    grid.append(CurveParams(fam, tail, shape))
-        return grid
+    @staticmethod
+    def _grid() -> list[CurveParams]:
+        families: tuple[Literal["linear", "exp", "sigmoid"], ...] = (
+            "linear",
+            "exp",
+            "sigmoid",
+        )
+        return [
+            CurveParams(fam, tail, shape)
+            for fam in families
+            for tail in (10, 20, 40, 60, 90, 120)
+            for shape in (0.5, 1, 2, 5)
+        ]
 
-
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import argparse, yaml
-
-    parser = argparse.ArgumentParser(description="Run nightly weight optimisation")
-    parser.add_argument("pnl_csv", help="CSV with columns date,pnl")
-    parser.add_argument("--out", default="./weights", help="dir to save best curve")
-    args = parser.parse_args()
-
-    pnl = pd.read_csv(args.pnl_csv, parse_dates=[0], index_col=0).squeeze()
-    best = WeightOptimizer().optimise(pnl, storage_dir=args.out)
-    print("Best curve →", yaml.safe_dump(best, sort_keys=False))
