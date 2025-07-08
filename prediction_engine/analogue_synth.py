@@ -43,7 +43,12 @@ class AnalogueSynth:
     """Static helpers for inverse‑difference analogue synthesis."""
 
     @staticmethod
-    def weights(delta_mat: np.ndarray, target_delta: np.ndarray) -> np.ndarray:
+    def weights(
+            delta_mat: np.ndarray,
+            target_delta: np.ndarray,
+            *,
+            var_nn: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Compute non‑negative weights that make ΔXᵀ·β ≈ target.
 
         Parameters
@@ -58,29 +63,34 @@ class AnalogueSynth:
         -------
         β : np.ndarray, shape (k,)
             Non‑negative weights summing to one.
+            :param var_nn:
         """
         k, d = delta_mat.shape
         assert target_delta.shape == (d,), "target_delta dim mismatch"
 
-        # Augment with equality constraint Σβ = 1  ==>  add a row of ones.
+        # Build augmented system enforcing Σβ = 1
         A_aug = np.vstack([delta_mat.T, np.ones(k)])  # (d+1) × k
-        b_aug = np.append(target_delta, 1.0)          # (d+1,)
+        b_aug = np.append(target_delta, 1.0)  # (d+1,)
+
+        if var_nn is not None:
+            if var_nn.shape != (k,):
+                raise ValueError("var_nn shape mismatch – expected (k,)")
+            W = np.diag(1.0 / np.sqrt(var_nn + 1e-12))
+            A_aug = W @ A_aug
+            b_aug = W @ b_aug
 
         if _HAS_SCIPY:
-            # Non‑negative least‑squares: SciPy's NNLS expects A (#m×n) and b (#m,)
             β, _ = nnls(A_aug, b_aug)
         else:
-            # Fallback to unconstrained LS + rectifier
             β, *_ = lstsq(A_aug, b_aug, rcond=None)
             β = np.maximum(β, 0.0)
 
-        # ---- Stability clamp ------------------------------------------------
         s = β.sum()
-        if s < 1e-8:  # all‑zero or numerically underflowed
+        if s < 1e-8 or np.isnan(s):
             β = np.full(k, 1.0 / k, dtype=float)
         else:
             β /= s
-        return β
+        return β.astype(np.float32, copy=False)
 
     @staticmethod
     def synthesize(

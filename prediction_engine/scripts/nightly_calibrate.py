@@ -1,61 +1,46 @@
 # ---------------------------------------------------------------------------
-# scripts/nightly_calibrate.py
+# FILE: scripts/nightly_calibrate.py
 # ---------------------------------------------------------------------------
-"""Nightly calibration job
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-1. Loads a parquet slice (last *N* days)
-2. Builds/updates path‑clusters and outcome stats
-3. Performs kernel‑bandwidth CV for `EVEngine`
-4. Drops artefacts into `weights/`
+"""Run one WeightOptimizer per market-regime in parallel.
 
-Schedule this via CRON or Windows Task Scheduler to run after market close.
+This script should be launched by cron at 02:05 UTC every night **after** the
+previous trading day has fully settled and all PnL series are written to
+``data/pnl_by_regime/<regime>.csv`` (one column, date index).
+
+Output
+------
+`artifacts/weights/regime=<name>/curve_params.json` – four JSONs, one per
+`MarketRegime` enum.  Existing files are **over-written** – keep last night in
+version-control or S3 if needed.
 """
 from __future__ import annotations
 
-import argparse
-import datetime as dt
-import pathlib
-
+import concurrent.futures as cf
+from pathlib import Path
 import pandas as pd
-
-from prediction_engine.market_regime import RegimeDetector
-from prediction_engine.path_cluster_engine import PathClusterEngine
+from prediction_engine.market_regime import MarketRegime  # noqa: F401 – only for enum names
 from prediction_engine.weight_optimization import WeightOptimizer
 
-
-FEATURES = [
-    "vwap_dev", "rvol", "ema_21", "roc_60", "atr", "adx",
-]
+_DATA_DIR = Path("data/pnl_by_regime")
+_OUT_DIR = Path("artifacts/weights")
 
 
-def _load_data(path: pathlib.Path, start: str, end: str) -> pd.DataFrame:
-    ds = pd.read_parquet(path, filters=[[("date", ">=", start)], [("date", "<=", end)]])
-    return ds
+def _run_one(regime_name: str) -> tuple[str, dict]:
+    csv_path = _DATA_DIR / f"{regime_name}.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+
+    pnl = pd.read_csv(csv_path, index_col=0, parse_dates=True, squeeze=True)
+    res = WeightOptimizer().optimise(pnl, regime=regime_name, artefact_root=_OUT_DIR)
+    return regime_name, res
 
 
-def main(args: argparse.Namespace):
-    today = dt.date.today()
-    start = (today - dt.timedelta(days=args.lookback)).isoformat()
-    end = today.isoformat()
-
-    df = _load_data(pathlib.Path(args.parquet_dir), start, end)
-    engine = PathClusterEngine.build(
-        df,
-        features=FEATURES,
-        outcome_col="future_ret",
-        n_clusters=args.k,
-        cfg={"seed": 42},
-        out_dir=args.out_dir,
-    )
-    print("[nightly_calibrate] saved centres & stats →", args.out_dir)
+def main() -> None:
+    regimes = [r.name.lower() for r in MarketRegime]  # trend, range, volatile, global
+    with cf.ProcessPoolExecutor(max_workers=4) as pool:
+        for regime, outcome in pool.map(_run_one, regimes):
+            print(f"✓ {regime:8s} → test Sharpe {outcome['test']:+.3f}  → {outcome['file']}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--parquet-dir", required=True)
-    p.add_argument("--k", type=int, default=32)
-    p.add_argument("--lookback", type=int, default=365)
-    p.add_argument("--out-dir", default="weights/path_cluster/")
-    p.add_argument("--regime-aware", action="store_true")
-
-    main(p.parse_args())
+    main()

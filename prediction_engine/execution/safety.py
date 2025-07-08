@@ -41,6 +41,14 @@ import numpy as np
 
 __all__ = ["SafetyFSM", "HaltReason"]
 
+COOLDOWNS = {
+    "MICRO_HALT": 30,
+    "SINGLE_TRADE_LOSS": 900,
+    "DAILY_LOSS": 28_800,  # 8 h
+    "INTRADAY_DRAWDOWN": 7_200,  # 2 h
+    "VOLATILITY_HALT": 900,
+}
+
 
 class HaltReason(Enum):
     """Enumeration of possible safety stops."""
@@ -50,6 +58,7 @@ class HaltReason(Enum):
     DAILY_LOSS = auto()
     INTRADAY_DRAWDOWN = auto()
     VOLATILITY_HALT = auto()
+
 
 
 class SafetyFSM:
@@ -131,7 +140,7 @@ class SafetyFSM:
     # Internal helpers
     # ------------------------------------------------------------------
     def _trigger(self, reason: HaltReason) -> None:
-        duration = timedelta(seconds=self.cfg["cooldowns"].get(reason.name, 300))
+        duration = timedelta(seconds=COOLDOWNS.get(reason.name, 300))
         self._cooldown_until[reason] = datetime.utcnow() + duration
 
     # ------------------------------------------------------------------

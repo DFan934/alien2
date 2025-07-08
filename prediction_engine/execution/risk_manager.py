@@ -60,3 +60,31 @@ class RiskManager:
 
     def drawdown(self) -> float:
         return 1.0 - self.account_equity / self._peak_equity
+
+    def kelly_position(
+            self,
+            mu: float,
+            variance_down: float,
+            price: float,
+            kelly_cap: float = 1.0,
+    ) -> int:
+        """
+        Position size based on down-side Kelly fraction.
+        Returns **0** when µ ≤ 0 (negative Kelly clamp).
+        """
+        if price <= 0 or variance_down <= 0 or mu <= 0:
+            return 0
+
+        kelly_f = min(mu / (2 * variance_down), kelly_cap)
+        dollar_notional = kelly_f * self.account_equity
+        max_notional = self.account_equity * self.max_leverage
+        qty = math.floor(min(dollar_notional, max_notional) / price)
+        return max(qty, 0)
+
+    @staticmethod
+    def scale_variance(var: float, adv_percentile: float | None) -> float:
+        """Piece‑wise linear volatility uplift based on liquidity."""
+        if adv_percentile is None:
+            return var
+        mult = 1.0 + 0.5 * min(max((adv_percentile - 5) / 15, 0.0), 1.0)
+        return var * mult

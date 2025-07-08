@@ -28,3 +28,5 @@ def get_top_influencers(model, X_sample: np.ndarray, n: int = 5) -> List[int]:
         shap_vals = explainer(X_sample)
         imp = np.abs(shap_vals.values).mean(axis=0)
     return np.argsort(imp)[::-1][:n].tolist()
+
+

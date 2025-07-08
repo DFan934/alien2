@@ -1,16 +1,20 @@
 # ============================================================================
 # FILE: prediction_engine/distance_calculator.py
-# Re‑written: batch queries, FAISS path, LRU‑cache, RF‑weighted pre‑mult.
+# UPDATED: fixed Mahalanobis cache‑key, auto‑load RF weights artefact
 # ============================================================================
 """Fast *k*‑NN distance lookup with FAISS / BallTree back‑ends and RF‑weights.
 
-Changes vs. previous stub:
-* Add ``batch_top_k`` using backend search when available.
-* RF‑weighted metric pre‑multiplies reference once (O(nd)) instead of per call.
-* LRU cache switched to ``functools.lru_cache(maxsize=8192)`` keyed by
-  ``(id(ref), sha1(query))``.
-* Optionally select ANN backend via ``ann_backend`` (sklearn | faiss).
+Key changes in this patch
+------------------------
+* Mahalanobis inverse‑covariance matrix is now cached by **shape + SHA‑1 hash** of
+  the reference bytes instead of the ambiguous `id(ref)` heuristic – eliminates
+  cross‑contamination when two matrices share column count.
+* `DistanceCalculator.from_artifacts()` automatically looks for
+  `rf_feature_weights.npy` alongside the reference file when the requested
+  metric is ``"rf_weighted"``.
+* Added tighter runtime shape checks and clarified error paths.
 """
+
 from __future__ import annotations
 
 import functools
@@ -30,12 +34,16 @@ Metric = Literal["euclidean", "mahalanobis", "rf_weighted"]
 # Distance helper (Mahalanobis) – cached per (id(ref), eps)
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=128)
-def _inv_cov_cached(ref_id: int, eps: float, ref_bytes: bytes) -> NDArray[np.float32]:  # noqa: D401
-    arr = np.frombuffer(ref_bytes, dtype=np.float32)
-    n_rows = arr.shape[0] // ref_id  # bogus – will rebuild below if raw bytes
-    arr = arr.reshape(-1, ref_id)
+def _inv_cov_cached(
+    key: str,  # "(rows, cols)-sha1"  – ensures uniqueness per matrix
+    eps: float,
+    n_features: int,
+    ref_bytes: bytes,
+) -> NDArray[np.float32]:
+    """Return (Σ + eps·I)^‑¹ for the reference array encoded in *ref_bytes*."""
+    arr = np.frombuffer(ref_bytes, dtype=np.float32).reshape(-1, n_features)
     cov = np.cov(arr, rowvar=False, dtype=np.float64)
-    cov.flat[:: cov.shape[0] + 1] += eps
+    cov.flat[:: cov.shape[0] + 1] += eps  # Tikhonov regularisation
     return np.linalg.inv(cov).astype(np.float32)
 
 
@@ -89,9 +97,10 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         # Mahalanobis pre‑compute
         # ------------------------------------------------------------------
         if metric == "mahalanobis":
-            self._inv_cov = _inv_cov_cached(
-                self._ref.shape[1], eps, self._ref.tobytes()
-            )
+            byt = self._ref.tobytes()
+            sha = hashlib.sha1(byt).hexdigest()
+            key = f"{self._ref.shape}-{sha}"
+            self._inv_cov = _inv_cov_cached(key, eps, self._ref.shape[1], byt)
         else:
             self._inv_cov = None  # type: ignore[assignment]
 
@@ -167,6 +176,12 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         backend_kwargs: dict[str, Any] | None = None,
     ) -> "DistanceCalculator":
         ref_arr = np.load(Path(ref_path), mmap_mode="r")
+
+        # Auto‑discover RF weights if needed and caller did not specify a path
+        if metric == "rf_weighted" and rf_weights_path is None:
+            cand = Path(ref_path).with_name("rf_feature_weights.npy")
+            rf_weights_path = cand if cand.exists() else None
+
         w = np.load(rf_weights_path) if rf_weights_path else None
         return cls(
             ref_arr,
@@ -182,3 +197,4 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
     def __call__(self, x: NDArray[np.float32], k: int):
         idxs, dist2 = self.top_k(x, k)
         return idxs, dist2
+

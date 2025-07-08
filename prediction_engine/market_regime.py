@@ -32,11 +32,94 @@ Blueprint mapping
 """
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
 from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
+
+
+# ----------------------------------------------------------------------
+#   Light, intraday regime detector (Task 4)  ✨
+# ----------------------------------------------------------------------
+from enum import Enum, auto
+import pickle, time
+from pathlib import Path
+
+class MarketRegime(Enum):
+    TREND   = auto()
+    RANGE   = auto()
+    VOLATILE = auto()
+
+_STATE_PATH = Path("state/market_regime.pkl")
+
+class RegimeDetector:
+    """
+    Streaming detector that recalculates every call to **update()** on the
+    most-recent bars (expects columns high/low/close).  The mapping rules are
+        ADX > 25   &  RV < 0.75×median  → TREND
+        ADX < 20   &  RV < 1.25×median → RANGE
+        otherwise                         VOLATILE
+    The latest label is pickled every 15 minutes to *_STATE_PATH* so any
+    worker process (e.g. nightly calibration) can read it.
+    """
+
+    def __init__(self) -> None:
+        self.state: MarketRegime = MarketRegime.RANGE
+        self._rv_median: float   = 0.0
+        self._last_save: float   = 0.0
+
+    # ---- public -----------------------------------------------------
+    def update(self, bar_df: pd.DataFrame) -> MarketRegime:
+        if not {"high", "low", "close"}.issubset(bar_df.columns):
+            raise ValueError("bar_df must have high/low/close")
+
+        df = bar_df.tail(60).copy()
+        adx = _dmi(df, 14)[2].iloc[-1]
+
+        rv = df["close"].pct_change().rolling(5).std() * np.sqrt(5)
+        rv_latest = float(rv.iloc[-1])
+        self._rv_median = rv.median() if self._rv_median == 0 else \
+                          0.95 * self._rv_median + 0.05 * rv_latest
+
+        # --- inside RegimeDetector.update() ---------------------------------
+        # ------------------------------------------------------------------
+        # inside RegimeDetector.update()
+        # ------------------------------------------------------------------
+        rv = df["close"].pct_change().rolling(5).std() * np.sqrt(5)
+        rv_latest = float(rv.iloc[-1])
+        rv_median = rv.median() if self._rv_median == 0 else self._rv_median
+        self._rv_median = 0.95 * rv_median + 0.05 * rv_latest
+
+        ratio = rv_latest / (self._rv_median + 1e-9)
+
+        # ---- final mapping ------------------------------------------------
+        if ratio >= 2.5:  # big noise spike ⇒ VOLATILE  (override)
+            self.state = MarketRegime.VOLATILE
+        elif adx >= 20:  # clear direction ⇒ TREND
+            self.state = MarketRegime.TREND
+        else:  # everything else ⇒ RANGE
+            self.state = MarketRegime.RANGE
+
+        # persist every 15 min
+        now = time.time()
+        if now - self._last_save > 900:
+            _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_STATE_PATH, "wb") as fh:
+                pickle.dump({"ts": now, "state": self.state}, fh)
+            self._last_save = now
+
+        # ──--- DEBUG – remove after we’re happy ───────────────
+        print(f"[DEBUG] rv_latest={rv_latest:.5f} "
+              f"rv_median={self._rv_median:.5f} "
+              f"ratio={ratio:.3f}  → {self.state.name}")
+        # ───────────────────────────────────────────────────────
+        return self.state
+
+
+        return self.state
+
+
 
 # ---------------------------------------------------------------------
 class Regime(str, Enum):

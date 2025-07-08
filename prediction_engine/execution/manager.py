@@ -48,7 +48,7 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self.lat_monitor = lat_monitor
         self.safety = SafetyFSM(config.get("safety", {}))
 
-        self._sig_q: "asyncio.Queue[str]" = asyncio.Queue(maxsize=10_000)
+        self._sig_q: "asyncio.Queue[str]" = asyncio.Queue(maxsize=config.get("max_queue", 5000))
         self._writer_task: Optional[asyncio.Task] = None
         self._log_path = Path(log_path)
         self._numeric_keys: Optional[list[str]] = None
@@ -74,6 +74,7 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         price = bar["price"]
         adv = bar["adv"]
         feats: Dict[str, Any] = bar["features"]
+
 
         # 0) Live metrics for safety check -----------------------------
         latency_ms: float = float(getattr(self.lat_monitor, "mean", 0.0))
@@ -126,7 +127,9 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         ev_res = self.ev.evaluate(x_vec, adv_percentile=adv)
 
         # 4) Kelly scaling (downside variance) -------------------------
-        denom = max(ev_res.variance_down, 1e-8)
+        #denom = max(ev_res.variance_down, 1e-8)
+        denom = self.risk_mgr.scale_variance(ev_res.variance_down, adv)
+
         kelly_frac = max(0.0, ev_res.mu / (denom * 2))
         final_qty = int(base_qty * min(kelly_frac, 1.0))
         if final_qty <= 0:

@@ -7,8 +7,6 @@ import hashlib
 
 from hypothesis.extra.numpy import NDArray
 
-from .analogue_synth import AnalogueSynth
-
 """Expected‑Value Engine
 ========================
 
@@ -28,18 +26,24 @@ File location:  ``prediction_engine/ev_engine.py`` – drop‑in replacement for
 old module.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import sqrt
 from pathlib import Path
 from typing import Iterable, Literal, Tuple
 
 import json
 import numpy as np
-from scipy.stats import kurtosis
+from numpy.typing import NDArray
+
+from .analogue_synth import AnalogueSynth
 
 from .distance_calculator import DistanceCalculator
-#from . import tx_cost
-from . import tx_cost as _tx_cost          # ← alias to avoid shadowing
+#from . import tx_cost as _tx_cost # ← alias to avoid shadowing
+from .tx_cost import BasicCostModel, estimate as _legacy_estimate
+
+
+
+__all__: Tuple[str, ...] = ("EVEngine", "EVResult")
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +56,7 @@ class EVResult:
     mu: float  # µ – expected return/ share
     sigma: float  # full variance (σ²)
     variance_down: float  # downside variance for Sortino / Kelly denom
+    beta: NDArray[np.float32] = field(repr=False)
     cluster_id: int  # closest centroid index
 
 
@@ -81,8 +86,7 @@ class EVEngine:
         Pre‑computed inverse covariance for Mahalanobis.
     k : int | None
         Maximum neighbours used in kernel; will be down‑capped dynamically.
-    tx_cost : tx_cost | None
-        Optional slippage/commission model to be subtracted from µ.
+
     """
 
     def __init__(
@@ -93,12 +97,12 @@ class EVEngine:
         var: np.ndarray,
         var_down: np.ndarray,
         h: float,
+        blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
         cov_inv: np.ndarray | None = None,
         rf_weights: np.ndarray | None = None,
         k: int | None = None,
-        #tx_cost: tx_cost | None = None,
-        cost_model: object | None = None,
+        cost_model: BasicCostModel | None = None,
 
     ) -> None:
         self.centers = np.ascontiguousarray(centers, dtype=np.float32)
@@ -106,12 +110,18 @@ class EVEngine:
         self.var = var.astype(np.float32, copy=False)
         self.var_down = var_down.astype(np.float32, copy=False)
         self.h = float(h)
+        self.alpha = float(blend_alpha)
         self.k_max = k or 32  # fair default; will be density‑capped later
         self.metric = metric
-        self._dist = DistanceCalculator(self.centers, metric=metric, cov_inv=cov_inv, rf_weights=rf_weights)
-        #self.tx_cost = tx_cost or tx_cost.basic()
+        # Build distance helper – no external cov_inv needed (DistanceCalculator
+        # computes Σ⁻¹ internally for mahalanobis).
+        self._dist = DistanceCalculator(
+            self.centers,
+            metric=metric,
+            rf_weights=rf_weights,
+        )
 
-        self._cost = cost_model if cost_model is not None else _tx_cost
+        self._cost: BasicCostModel = cost_model or BasicCostModel()
 
 
         if len(self.centers) != len(self.mu):
@@ -128,12 +138,10 @@ class EVEngine:
         *,
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
         k: int | None = None,
-        #tx_cost: tx_cost | None = None,
         cost_model: object | None = None,
     ) -> "EVEngine":
         artefact_dir = Path(artefact_dir)
         centers = np.load(artefact_dir / "centers.npy")
-        #stats = np.load(artefact_dir / "cluster_stats.npz")
         stats_path = artefact_dir / "cluster_stats.npz"
         stats = np.load(stats_path)
 
@@ -147,7 +155,7 @@ class EVEngine:
                 )
 
 
-        h = float(json.loads((artefact_dir / "kernel_bandwidth.json").read_text())["h"])
+        #h = float(json.loads((artefact_dir / "kernel_bandwidth.json").read_text())["h"])
 
         # Schema guard – fail fast if feature list drifted
         meta = json.loads((artefact_dir / "meta.json").read_text())
@@ -157,27 +165,32 @@ class EVEngine:
                 "Feature schema drift detected – retrain PathClusterEngine before loading EVEngine."
             )
 
+        kernel_cfg = json.loads((artefact_dir / "kernel_bandwidth.json").read_text())
+        blend_alpha = kernel_cfg.get("blend_alpha", 0.5)
+        h = float(kernel_cfg["h"])
+
         cov_inv = None
         rf_w = None
         if metric == "mahalanobis":
             cov_inv = np.load(artefact_dir / "centroid_cov_inv.npy")
         elif metric == "rf_weighted":
-            rf_path = artefact_dir / "weights.npy"
-            if not rf_path.exists():
-                raise FileNotFoundError("RF weights file missing for rf_weighted metric")
-            rf_w = np.load(rf_path)
+            rf_file = artefact_dir / "rf_feature_weights.py"
+            rf_w = np.load(rf_file)
+        #if not rf_path.exists():
+        #        raise FileNotFoundError("RF weights file missing for rf_weighted metric")
+
 
         return cls(
             centers=centers,
             mu=stats["mu"],
             var=stats["var"],
             var_down=stats["var_down"],
+            blend_alpha=blend_alpha,
             h=h,
             metric=metric,
             cov_inv=cov_inv,
             rf_weights=rf_w,
             k=k,
-            #tx_cost=tx_cost,
             cost_model=cost_model,
         )
 
@@ -195,7 +208,7 @@ class EVEngine:
         # 1. Find nearest neighbours (density‑aware k)
         # ------------------------------------------------------------
         k_eff = int(max(2, min(self.k_max, sqrt(len(self.centers)))))
-        idx, dist2 = self._dist(x, k_eff)
+        dist2, idx = self._dist(x, k_eff)
 
         # density cut‑off – remove outliers beyond 2 h
         mask = dist2 < (2 * self.h) ** 2
@@ -223,24 +236,40 @@ class EVEngine:
         var_syn = float(beta @ self.var[idx])  # <— one-liner
         var_down_syn = float(beta @ self.var_down[idx])
 
-        # blend 50‑50
+        alpha = self.alpha
+        mu = alpha * mu_syn + (1 - alpha) * mu_k
+        sig2 = alpha ** 2 * var_syn + (1 - alpha) ** 2 * var_k
+        sig2_down = alpha ** 2 * var_down_syn + (1 - alpha) ** 2 * var_down_k
+
+        '''# blend 50‑50
         mu = 0.5 * mu_k + 0.5 * mu_syn
         sig2 = 0.5 * var_k + 0.5 * var_syn
         sig2_down = 0.5 * var_down_k + 0.5 * var_down_syn
+        '''
+        '''if adv_percentile is not None:
+            if adv_percentile >= 20:
+                liq_fac = 1.5
+            elif adv_percentile <= 5:
+                liq_fac = 1.0
+            else:  # linear 5 → 20 pct
+                liq_fac = 1.0 + (adv_percentile - 5) * (0.5 / 15)
+            sig2 *= liq_fac ** 2
+            sig2_down *= liq_fac ** 2'''
+        if adv_percentile is None:
+            liquidity_mult = 1.0
+        else:  # piece‑wise linear: 1× below 5 % ADV  → 1.5× at 20 %
+            liquidity_mult = 1.0 + 0.5 * min(max((adv_percentile - 5) / 15, 0.0), 1.0)
+
+        sig2 *= liquidity_mult
+        sig2_down *= liquidity_mult
 
         # ------------------------------------------------------------
         # 4. Subtract transaction cost
         # ------------------------------------------------------------
-        if hasattr(self._cost, "estimate"):
-            try:
-                cost = self._cost.estimate(adv_percentile=adv_percentile)
-            except TypeError:
-                cost = self._cost.estimate()
-        else:
-            cost = 0.0
+        cost_ps = self._cost.estimate(adv_percentile=adv_percentile)
+        mu_net = mu - cost_ps
 
-        mu_net = mu - cost
-        return EVResult(mu_net, sig2, sig2_down, int(idx[0]))
+        return EVResult(mu_net, sig2, sig2_down, beta.astype(np.float32), int(idx[0]))
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\schemas.py
+# hypothesis_version: 6.135.17
+
+[0.12, 0.3, 'faiss', 'forbid', 'logs/', 'logs_dir', 'signal_dir', 'signals/', 'sklearn', 'weight_dir', 'weights/']

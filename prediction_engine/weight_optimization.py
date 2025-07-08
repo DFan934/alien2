@@ -12,15 +12,15 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import os
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Tuple, Literal
 
 import numpy as np
 import optuna
 import pandas as pd
-from typing import IO
+from optuna.exceptions import TrialPruned
+
 
 
 RegimeT = Literal["trend", "range", "volatile", "global"]
@@ -33,7 +33,7 @@ class CurveParams:
     shape: float       # decay / slope
 
     def to_dict(self):
-        return self.__dict__
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +51,12 @@ class WeightOptimizer:
         pnl: pd.Series,
         *,
         regime: RegimeT,
+        rf_feature_importances: np.ndarray | None = None,
         validation_frac: float = 0.2,
         test_frac: float = 0.1,
-        out_dir: Path | str = Path("weights/recency_curves"),
+        artefact_root: Path | str = Path("artifacts/weights"),
     ) -> Dict[str, float]:
-        """Return dict with train/valid/test Sharpe and persist JSON."""
+        """Return Sharpe metrics and path to persisted JSON artefact."""
         pnl = pnl.dropna().sort_index()
         n = len(pnl)
         n_train = int(n * (1 - validation_frac - test_frac))
@@ -68,12 +69,19 @@ class WeightOptimizer:
 
         # ---------- coarse grid --------------------------------------
         grid = self._grid()
-        with cf.ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
-            scores = list(pool.map(lambda p: self._score(p, valid), grid))
+        #with cf.ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
+        #    scores = list(pool.map(lambda p: self._score(p, valid), grid))
+        if self.n_jobs > 1 and os.name != "nt":  # Windows pickling quirks
+            with cf.ProcessPoolExecutor(max_workers=self.n_jobs) as pool:
+                scores = list(pool.map(lambda p: self._score(p, valid), grid))
+        else:  # serial fallback (safe / deterministic)
+            scores = [self._score(p, valid) for p in grid]
+
         best_p, best_sh_valid = max(scores, key=lambda t: t[1])
 
-        # ---------- Optuna refine ------------------------------------
-        study = optuna.create_study(direction="maximize")
+        # ---------- Optuna refine (with pruning) ---------------------
+        pruner = optuna.pruners.MedianPruner(n_warmup_steps=10)
+        study = optuna.create_study(direction="maximize", pruner=pruner)
 
         def _obj(trial: optuna.Trial):
             cand = CurveParams(
@@ -81,38 +89,51 @@ class WeightOptimizer:
                 tail_len=trial.suggest_int("tail_len", 5, 120),
                 shape=trial.suggest_float("shape", 0.1, 10),
             )
-            return self._score(cand, valid)[1]
+            sharpe = self._score(cand, valid)[1]
+            trial.report(sharpe, step=0)
+            if trial.should_prune():
+                raise TrialPruned()
+            return sharpe
 
-        study.optimize(_obj, n_trials=64, show_progress_bar=False)
-        p_opt = CurveParams(**study.best_params)
+        study.optimize(_obj, n_trials=128, show_progress_bar=False)
+        bp = best_p.family  # keep the winning family
+        best_param_dict = {"family": bp, **study.best_params}
+        p_opt = CurveParams(**best_param_dict)  # construct safely
+
         sharpe_valid = study.best_value
         if sharpe_valid < best_sh_valid:
-            p_opt = best_p
-            sharpe_valid = best_sh_valid
+            p_opt, sharpe_valid = best_p, best_sh_valid
 
         sharpe_train = self._score(p_opt, train)[1]
         sharpe_test = self._score(p_opt, test)[1]
 
-        if sharpe_test < 0.8 * sharpe_train:
-            raise RuntimeError("Curve over‑fits – test Sharpe too low vs train")
+        # 0.8 over‑fit guard
+        # 0.8 over-fit guard – skip for tiny test sets (< 20 obs)
+        if len(test) >= 20 and sharpe_test < 0.8 * sharpe_train:
+            raise RuntimeError("Curve over-fits – test Sharpe too low vs train")
 
-        # ---------- persist -----------------------------------------
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        fname = Path(out_dir) / f"best_curve_{regime}_{date.today():%Y%m%d}.json"
-        with fname.open("w", encoding="utf-8") as fh:
-            json.dump(
+        # ---------- persist artefacts --------------------------------
+        out_dir = Path(artefact_root) / f"regime={regime}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        curve_json = out_dir / "curve_params.json"
+        curve_json.write_text(
+            json.dumps(
                 {
                     "params": p_opt.to_dict(),
                     "train_sharpe": sharpe_train,
                     "valid_sharpe": sharpe_valid,
                     "test_sharpe": sharpe_test,
                 },
-                fh,
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
+        )
+
+        if rf_feature_importances is not None:
+            np.save(out_dir / "rf_feature_weights.npy", rf_feature_importances.astype(np.float32))
 
         return {
-            "file": str(fname),
+            "file": str(curve_json),
             "train": sharpe_train,
             "valid": sharpe_valid,
             "test": sharpe_test,
@@ -120,10 +141,14 @@ class WeightOptimizer:
 
     # ================= helpers ======================================
     def _score(self, p: CurveParams, pnl: pd.Series) -> Tuple[CurveParams, float]:
-        w = self._weights(len(pnl), p)
+        """Sharpe ratio of *pnl* when weighted by curve *p*."""
+        # select the last *tail_len* observations so vector lengths match
+        slice_len = min(p.tail_len, len(pnl))
+        pnl_slice = pnl.iloc[-slice_len:]
+        w = self._weights(slice_len, p)
         w /= w.sum()
-        ret = np.dot(w, pnl.values)
-        risk = np.sqrt(np.dot(w, (pnl.values - ret) ** 2)) + 1e-9
+        ret = float(w @ pnl_slice.values)
+        risk = float(np.sqrt(w @ (pnl_slice.values - ret) ** 2)) + 1e-9
         return p, ret / risk
 
     @staticmethod
