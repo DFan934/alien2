@@ -77,10 +77,6 @@ class RegimeDetector:
         df = bar_df.tail(60).copy()
         adx = _dmi(df, 14)[2].iloc[-1]
 
-        rv = df["close"].pct_change().rolling(5).std() * np.sqrt(5)
-        rv_latest = float(rv.iloc[-1])
-        self._rv_median = rv.median() if self._rv_median == 0 else \
-                          0.95 * self._rv_median + 0.05 * rv_latest
 
         # --- inside RegimeDetector.update() ---------------------------------
         # ------------------------------------------------------------------

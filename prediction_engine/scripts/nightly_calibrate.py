@@ -27,12 +27,21 @@ _OUT_DIR = Path("artifacts/weights")
 
 def _run_one(regime_name: str) -> tuple[str, dict]:
     csv_path = _DATA_DIR / f"{regime_name}.csv"
+    print(f"Running regime: {regime_name} (csv_path={csv_path})")
     if not csv_path.exists():
         raise FileNotFoundError(csv_path)
+    pnl = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+    if pnl.shape[1] == 1:
+        pnl = pnl.iloc[:, 0]  # Convert to Series if only one column
+    try:
+        res = WeightOptimizer().optimise(pnl, regime=regime_name, artefact_root=_OUT_DIR)
+        print(f"Success for {regime_name}")
+        return regime_name, res
+    except Exception as e:
+        print(f"FAILED for {regime_name}: {e}")
+        raise
 
-    pnl = pd.read_csv(csv_path, index_col=0, parse_dates=True, squeeze=True)
-    res = WeightOptimizer().optimise(pnl, regime=regime_name, artefact_root=_OUT_DIR)
-    return regime_name, res
+
 
 
 def main() -> None:

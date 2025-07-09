@@ -18,7 +18,12 @@ from prediction_engine.distance_calculator import _inv_cov_cached
 )
 @settings(deadline=None, max_examples=25)
 def test_inverse_cov_cache_isolation(arr1: np.ndarray, arr2: np.ndarray):
-    if np.allclose(arr1, arr2):
+    # Skip degenerate cases where arrays are all zeros or are equal
+    if (
+        np.allclose(arr1, 0)
+        or np.allclose(arr2, 0)
+        or (arr1.shape == arr2.shape and np.allclose(arr1, arr2))
+    ):
         return  # degenerate – extremely unlikely
     for arr in (arr1, arr2):
         arr[:, 0] += 1e-3  # ensure non‑singular

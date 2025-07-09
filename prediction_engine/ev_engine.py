@@ -29,7 +29,7 @@ old module.
 from dataclasses import dataclass, field
 from math import sqrt
 from pathlib import Path
-from typing import Iterable, Literal, Tuple
+from typing import Iterable, Literal, Tuple, Dict
 
 import json
 import numpy as np
@@ -38,8 +38,9 @@ from numpy.typing import NDArray
 from .analogue_synth import AnalogueSynth
 
 from .distance_calculator import DistanceCalculator
-#from . import tx_cost as _tx_cost # ← alias to avoid shadowing
 from .tx_cost import BasicCostModel, estimate as _legacy_estimate
+from .market_regime import MarketRegime # NEW
+from .weight_optimization import CurveParams, WeightOptimizer  # NEW
 
 
 
@@ -58,6 +59,8 @@ class EVResult:
     variance_down: float  # downside variance for Sortino / Kelly denom
     beta: NDArray[np.float32] = field(repr=False)
     cluster_id: int  # closest centroid index
+    outcome_probs: Dict[str, float] = field(default_factory=dict)   # flat dict
+    #regime_curves: Dict[str, CurveParams] | None = None,
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,8 @@ class EVEngine:
         var: np.ndarray,
         var_down: np.ndarray,
         h: float,
+        outcome_probs: Dict[str, Dict[str, float]] | None = None,
+        regime_curves: Dict[str, CurveParams] | None = None,
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
         cov_inv: np.ndarray | None = None,
@@ -123,6 +128,9 @@ class EVEngine:
 
         self._cost: BasicCostModel = cost_model or BasicCostModel()
 
+        # NEW: Store regime-specific curves and outcome probabilities
+        self.regime_curves = regime_curves or {}
+        self.outcome_probs = outcome_probs or {}
 
         if len(self.centers) != len(self.mu):
             raise ValueError("centers and mu size mismatch")
@@ -159,9 +167,8 @@ class EVEngine:
 
         # Schema guard – fail fast if feature list drifted
         meta = json.loads((artefact_dir / "meta.json").read_text())
-        features_live = stats["feature_list"].tolist() if "feature_list" in stats else None
-        if features_live is not None and meta["sha"] != _sha1_list(features_live):
-            raise RuntimeError(
+        features_live = stats["feature_list"].tolist()
+        if meta["sha"] != _sha1_list(features_live):            raise RuntimeError(
                 "Feature schema drift detected – retrain PathClusterEngine before loading EVEngine."
             )
 
@@ -169,13 +176,28 @@ class EVEngine:
         blend_alpha = kernel_cfg.get("blend_alpha", 0.5)
         h = float(kernel_cfg["h"])
 
+        # NEW: Load outcome probabilities
+        probs_path = artefact_dir / "outcome_probabilities.json"
+        outcome_probs = json.loads(probs_path.read_text()) if probs_path.exists() else {}
+
+        # NEW: Load all available regime-specific weighting curves
+        regime_curves = {}
+        for regime_dir in artefact_dir.glob("regime=*"):
+            regime_name = regime_dir.name.split("=")[-1]
+            params_file = regime_dir / "curve_params.json"
+            if params_file.exists():
+                params_data = json.loads(params_file.read_text())["params"]
+                regime_curves[regime_name] = CurveParams(**params_data)
+
+
+
         cov_inv = None
         rf_w = None
         if metric == "mahalanobis":
             cov_inv = np.load(artefact_dir / "centroid_cov_inv.npy")
         elif metric == "rf_weighted":
-            rf_file = artefact_dir / "rf_feature_weights.py"
-            rf_w = np.load(rf_file)
+            rf_file = artefact_dir / "rf_feature_weights.npy"
+            rf_w = np.load(rf_file, allow_pickle=False)
         #if not rf_path.exists():
         #        raise FileNotFoundError("RF weights file missing for rf_weighted metric")
 
@@ -191,14 +213,28 @@ class EVEngine:
             cov_inv=cov_inv,
             rf_weights=rf_w,
             k=k,
+            outcome_probs=outcome_probs,
+            regime_curves=regime_curves,
             cost_model=cost_model,
         )
+
+    def _get_recency_weights(self, regime: MarketRegime, n_points: int) -> np.ndarray:
+        """NEW: Generate recency weights based on the current market regime."""
+        #curve = self.regime_curves.get(regime.name.lower())
+        # Allow either lower- or upper-case keys ("trend" / "TREND")
+        curve = (self.regime_curves.get(regime.name.lower())
+                or self.regime_curves.get(regime.name.upper())
+                or self.regime_curves.get(regime.name.capitalize()))
+        if not curve:
+            return np.ones(n_points)  # Fallback to uniform weights
+
+        return WeightOptimizer._weights(n_points, curve)
 
     # ------------------------------------------------------------------
     # Core API
     # ------------------------------------------------------------------
 
-    def evaluate(self, x: NDArray[np.float32], adv_percentile: float | None = None) -> EVResult:  # noqa: N802
+    def evaluate(self, x: NDArray[np.float32], adv_percentile: float | None = None, regime: MarketRegime = MarketRegime.RANGE) -> EVResult:  # noqa: N802
         """Return expected‑value statistics for one live feature vector."""
         x = np.ascontiguousarray(x, dtype=np.float32)
         if x.ndim != 1:
@@ -208,19 +244,24 @@ class EVEngine:
         # 1. Find nearest neighbours (density‑aware k)
         # ------------------------------------------------------------
         k_eff = int(max(2, min(self.k_max, sqrt(len(self.centers)))))
-        dist2, idx = self._dist(x, k_eff)
-
+        # Corrected version
+        idx, dist2 = self._dist(x, k_eff)
         # density cut‑off – remove outliers beyond 2 h
         mask = dist2 < (2 * self.h) ** 2
         if not mask.any():
-            mask[:] = True  # fallback – keep all if everything out of range
+            mask[:] = True
         idx, dist2 = idx[mask], dist2[mask]
+        if idx.size == 0:  # << add
+            raise RuntimeError("No centroids within 2 h – check bandwidth or data.")
 
         # ------------------------------------------------------------
-        # 2. Kernel estimate (Gaussian)
+        # 2. Kernel estimate (Gaussian) with NEW regime-based recency weighting
         # ------------------------------------------------------------
-        w = np.exp(-0.5 * dist2 / (self.h ** 2))
-        if w.sum() == 0.0:  # <-- add this
+        recency_w = self._get_recency_weights(regime, len(dist2))
+        kernel_w = np.exp(-0.5 * dist2 / (self.h ** 2))
+        w = kernel_w * recency_w # Combine kernel with recency
+
+        if w.sum() < 1e-8:  # <-- add this
             w[:] = 1.0
         w /= w.sum()
         mu_k = float(np.dot(w, self.mu[idx]))
@@ -241,20 +282,7 @@ class EVEngine:
         sig2 = alpha ** 2 * var_syn + (1 - alpha) ** 2 * var_k
         sig2_down = alpha ** 2 * var_down_syn + (1 - alpha) ** 2 * var_down_k
 
-        '''# blend 50‑50
-        mu = 0.5 * mu_k + 0.5 * mu_syn
-        sig2 = 0.5 * var_k + 0.5 * var_syn
-        sig2_down = 0.5 * var_down_k + 0.5 * var_down_syn
-        '''
-        '''if adv_percentile is not None:
-            if adv_percentile >= 20:
-                liq_fac = 1.5
-            elif adv_percentile <= 5:
-                liq_fac = 1.0
-            else:  # linear 5 → 20 pct
-                liq_fac = 1.0 + (adv_percentile - 5) * (0.5 / 15)
-            sig2 *= liq_fac ** 2
-            sig2_down *= liq_fac ** 2'''
+
         if adv_percentile is None:
             liquidity_mult = 1.0
         else:  # piece‑wise linear: 1× below 5 % ADV  → 1.5× at 20 %
@@ -269,7 +297,37 @@ class EVEngine:
         cost_ps = self._cost.estimate(adv_percentile=adv_percentile)
         mu_net = mu - cost_ps
 
-        return EVResult(mu_net, sig2, sig2_down, beta.astype(np.float32), int(idx[0]))
+
+        #5. NEW: Calculate blended probabilistic outcomes
+        blended_probs = {}
+        all_labels = set(label for probs in self.outcome_probs.values() for label in probs.keys())
+
+        # Kernel-weighted probabilities
+        probs_k = {label: 0.0 for label in all_labels}
+        for i, cluster_idx in enumerate(idx):
+            for label, prob in self.outcome_probs.get(str(cluster_idx), {}).items():
+                probs_k[label] += w[i] * prob
+
+        # Synthetic analogue-weighted probabilities
+        probs_syn = {label: 0.0 for label in all_labels}
+        for i, cluster_idx in enumerate(idx):
+            for label, prob in self.outcome_probs.get(str(cluster_idx), {}).items():
+                probs_syn[label] += beta[i] * prob
+
+        # Final blend
+        for label in all_labels:
+            blended_probs[label] = (
+                self.alpha * probs_syn[label] +
+                (1.0 - self.alpha) * probs_k[label]
+            )
+
+        # --- ensure probabilities sum to 1 --------------------------
+        tot = sum(blended_probs.values())
+        if tot > 0:
+            for k in blended_probs:
+                 blended_probs[k] /= tot
+
+        return EVResult(mu_net, sig2, sig2_down, beta, int(idx[0]), blended_probs)
 
 
 # ---------------------------------------------------------------------------

@@ -27,12 +27,16 @@ class BaseCostModel(ABC):
 class BasicCostModel(BaseCostModel):
     """Square-root market-impact model, calibrated nightly."""
 
-    _IMPACT_COEFF: float = 9e-5  # <- tuned by nightly calibration
+    _IMPACT_COEFF: float = 9e-5
+    _SPREAD_CENTS: float = 2.0  # average half-spread, cents
+    _COMMISSION: float = 0.002  # $/share
+
 
     def cost(self, qty: float = 1.0, adv_pct: float | None = None) -> float:
         adv = 1.0  # unit ADV normalisation – fine for per-share usage
-        frac = np.clip(qty / adv, 1e-6, 1.0)
-        return float(self._IMPACT_COEFF * np.sqrt(frac))
+        impact = self._IMPACT_COEFF * np.sqrt(np.clip(qty / adv, 1e-6, 1.0))
+        spread  = self._SPREAD_CENTS * 0.01      # convert to $
+        return float(spread + self._COMMISSION + impact)
 
     def estimate(self, adv_percentile: float | None = None) -> float:
         # delegate to cost() with 1-share notional

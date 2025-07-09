@@ -85,11 +85,19 @@ class AnalogueSynth:
             β, *_ = lstsq(A_aug, b_aug, rcond=None)
             β = np.maximum(β, 0.0)
 
-        s = β.sum()
+        β_sum = β.sum()
+        if β_sum > 0:
+            β /= β_sum
+
+        '''s = β.sum()
         if s < 1e-8 or np.isnan(s):
             β = np.full(k, 1.0 / k, dtype=float)
         else:
-            β /= s
+            β /= s'''
+
+        if β_sum < 1e-8 or np.isnan(β_sum):
+            β = np.full(k, 1.0 / k, dtype=float)
+
         return β.astype(np.float32, copy=False)
 
     @staticmethod

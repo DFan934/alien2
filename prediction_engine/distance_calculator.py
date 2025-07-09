@@ -113,7 +113,7 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             self._rf_w = np.asarray(rf_weights, dtype=np.float32)
             if self._rf_w.ndim != 1 or self._rf_w.shape[0] != self._ref.shape[1]:
                 raise ValueError("rf_weights shape mismatch – must be (n_features,)")
-            self._ref = self._ref * self._rf_w  # broadcasting – inplace OK
+            # NOTE: self._ref stays *unchanged*  (no double-weighting)
         else:
             self._rf_w = None
 
@@ -125,43 +125,48 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         d, i = self.batch_top_k(x[np.newaxis, :], k)
         return d[0], i[0]
 
+    # In prediction_engine/distance_calculator.py
+
     def batch_top_k(
-        self, Q: NDArray[np.float32], k: int, *, workers: int = 0
+            self, Q: NDArray[np.float32], k: int, *, workers: int = 0
     ) -> Tuple[NDArray[np.float32], NDArray[np.int32]]:
-        """Vectorised top‑k for a batch of queries ``Q`` (n_queries, n_features)."""
+        """Vectorised top-k for a batch of queries Q (n_queries, n_features)."""
+
+        print("--- EXECUTING CORRECT BATCH_TOP_K METHOD ---")
+
         if Q.ndim != 2:
-            raise ValueError("Q must be 2‑D")
-        if k <= 0 or k > self._ref.shape[0]:
+            raise ValueError("Q must be 2-D")
+        if not 0 < k <= self._ref.shape[0]:
             raise ValueError("Invalid k value")
 
-        # --------------------------------------------------------------
-        # Fast path – FAISS / BallTree if metric is Euclidean
-        # --------------------------------------------------------------
+        # FIX: The "fast path" now correctly handles the (indices, distances)
+        # signature returned from the backend indexer.
         if self._index is not None:
-            idx, dist2 = self._index.kneighbors(Q, k)
-            return dist2.astype(np.float32), idx.astype(np.int32)
+            # 1. Unpack correctly: indices first, then squared distances.
+            indices, squared_distances = self._index.kneighbors(Q, k)
+            # 2. Return in the consistent (distances, indices) order.
+            return squared_distances, indices
 
-        # --------------------------------------------------------------
-        # Fallback NumPy (Mahalanobis / RF‑weighted)
-        # --------------------------------------------------------------
+        # Fallback for other metrics
         if self._metric == "mahalanobis":
             diff = Q[:, None, :] - self._ref[None, :, :]
-            left = diff @ self._inv_cov  # type: ignore[operator]
+            left = diff @ self._inv_cov
             dist2 = np.sum(left * diff, axis=2, dtype=np.float32)
         elif self._metric == "rf_weighted":
             diff = Q[:, None, :] - self._ref[None, :, :]
-            dist2 = np.sum(diff * diff, axis=2, dtype=np.float32)
-        else:  # shouldn't reach (euclidean handled above)
+            dist2 = np.sum(diff * diff * self._rf_w, axis=2, dtype=np.float32)
+        else:  # Default to Euclidean if no indexer is used
             diff = Q[:, None, :] - self._ref[None, :, :]
             dist2 = np.sum(diff * diff, axis=2, dtype=np.float32)
 
+        # Partition and sort to get the top k results
         idx = np.argpartition(dist2, kth=k - 1, axis=1)[:, :k]
         part = np.take_along_axis(dist2, idx, axis=1)
         order = np.argsort(part, axis=1)
         sorted_idx = np.take_along_axis(idx, order, axis=1)
         sorted_dist2 = np.take_along_axis(part, order, axis=1)
-        return sorted_dist2.astype(np.float32), sorted_idx.astype(np.int32)
 
+        return sorted_dist2, sorted_idx
     # ------------------------------------------------------------------
     # Convenience ctor – from artefact folder
     # ------------------------------------------------------------------
@@ -182,7 +187,7 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             cand = Path(ref_path).with_name("rf_feature_weights.npy")
             rf_weights_path = cand if cand.exists() else None
 
-        w = np.load(rf_weights_path) if rf_weights_path else None
+        w = np.load(rf_weights_path, allow_pickle=False) if rf_weights_path else None
         return cls(
             ref_arr,
             metric=metric,
@@ -194,7 +199,10 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
     # ------------------------------------------------------------------
     # Callable – keep legacy signature ``idxs, dist2``
     # ------------------------------------------------------------------
-    def __call__(self, x: NDArray[np.float32], k: int):
-        idxs, dist2 = self.top_k(x, k)
-        return idxs, dist2
+
+    def __call__(self, x: NDArray[np.float32], k: int) -> Tuple[NDArray[np.int32], NDArray[np.float32]]:
+        # self.top_k returns (distances, indices)
+        distances, indices = self.top_k(x, k)
+        # Return in the documented order: (indices, distances)
+        return indices, distances
 

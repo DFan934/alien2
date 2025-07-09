@@ -2,12 +2,16 @@
 # FILE: tests/test_nightly_calibrate.py
 # ---------------------------------------------------------------------------
 """CI smoke test: ensure nightly_calibrate writes four JSON files."""
+import sys
 from pathlib import Path
 import shutil, tempfile, importlib
 
 def test_nightly_calibrate_smoke(monkeypatch):
     tmp = Path(tempfile.mkdtemp())
     (tmp / "data/pnl_by_regime").mkdir(parents=True)
+
+    # --- INSERT HERE, at the start of the function ---
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     # write toy PnL per regime
     import numpy as np, pandas as pd
