@@ -22,8 +22,7 @@ Key Features
   during extreme volatility.
 """
 
-import json
-import logging
+import json, logging, threading, time          # ⇦ add threading & time
 from collections import Counter, deque
 from enum import Enum
 from pathlib import Path
@@ -72,12 +71,15 @@ class DriftMonitor:
         self.ref_acc: float | None = None  # long‑term baseline accuracy
         self.ckpt_path = ckpt_path
         self._updates = 0
+        self._pending: dict[int, float] = {}
+        self._counter: int = 0
+
         # load checkpoint if exists
         if ckpt_path and ckpt_path.exists():
             self._load()
 
     # ------------------------------------------------------------------
-    def update(self, pred_prob: float, outcome: bool):
+    '''def update(self, pred_prob: float, outcome: bool):
         """Add one trade outcome.
 
         Parameters
@@ -92,7 +94,18 @@ class DriftMonitor:
         if self.ref_acc is None and len(self.hist) == self.win_size:
             self.ref_acc = self._accuracy()
         if self.ckpt_path and self._updates % 1000 == 0:
-            self._save()
+            self._save()'''
+
+    # ------------------------------------------------------------------
+    def update(self, pred_prob: float, outcome: bool):
+        """
+        Legacy one-shot helper that records a prediction **and**
+        its outcome in one call.  Internally delegates to the
+        two-stage API so everything goes through the same path.
+        """
+        tid = self.log_pred(pred_prob)        # ticket id → pending dict
+        self.log_outcome(tid, outcome)        # attaches realised P/L
+
 
     # ------------------------------------------------------------------
     def status(self) -> Tuple[DriftStatus, dict]:
@@ -125,6 +138,17 @@ class DriftMonitor:
         q = np.full_like(p_hist, 1.0 / len(p_hist))
         return float(entropy(p_hist + 1e-9, q + 1e-9))
 
+
+    # ------------------------------------------------------------------
+    def _roll_and_checkpoint(self) -> None:
+        """House-keeps counters & checkpoints every 1 000 updates."""
+        self._updates += 1
+        if self.ref_acc is None and len(self.hist) == self.win_size:
+            self.ref_acc = self._accuracy()
+        if self.ckpt_path and self._updates % 1000 == 0:
+            self._save()
+
+
     # ------------------------------------------------------------------
     def _save(self):
         self.ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +180,34 @@ class DriftMonitor:
         self._updates = 0
         if self.ckpt_path and self.ckpt_path.exists():
             self.ckpt_path.unlink(missing_ok=True)
+
+    def log_pred(self, prob: float) -> int:
+        """Return ticket id for this prediction."""
+        tid = self._counter
+        self._pending[tid] = float(prob)
+        self._counter += 1
+        return tid
+
+    def log_outcome(self, tid: int, made_money: bool):
+        """Attach realised outcome to a prior prediction."""
+        prob = self._pending.pop(tid, None)
+        if prob is None:  # late or duplicate call: ignore
+            return
+        self.hist.append((prob, bool(made_money)))
+        self._roll_and_checkpoint()
+
+# ------------------------------------------------------------------
+# Hook for external caller
+# ------------------------------------------------------------------
+GLOBAL_MONITOR: DriftMonitor | None = None
+
+def get_monitor() -> DriftMonitor:
+    """Return (or create) the process-wide DriftMonitor singleton."""
+    global GLOBAL_MONITOR                # noqa: PLW0603
+    if GLOBAL_MONITOR is None:
+        GLOBAL_MONITOR = DriftMonitor()
+    return GLOBAL_MONITOR
+
 
 
 # ---------------------------------------------------------------------

@@ -1,3 +1,8 @@
+# ---------------------------------------------------------------------------
+# prediction_engine/feature_weights.py
+# ---------------------------------------------------------------------------
+
+
 from __future__ import annotations
 
 """Random‑Forest Feature‑Weight Trainer
@@ -129,7 +134,9 @@ def train_weights(features_path: Path, labels_path: Path) -> None:
     w /= w.sum()
 
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    np.save(ARTIFACT_DIR / "weights.npy", w)
+    # Save under canonical name expected by EVEngine plus legacy alias
+    np.save(ARTIFACT_DIR / "rf_feature_weights.npy", w)  # canonical
+    np.save(ARTIFACT_DIR / "weights.npy", w)  # legacy              # backward‑compat alias
 
     meta = RunMeta(
         date=datetime.utcnow().isoformat(timespec="seconds"),

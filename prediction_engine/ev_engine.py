@@ -30,6 +30,9 @@ from dataclasses import dataclass, field
 from math import sqrt
 from pathlib import Path
 from typing import Iterable, Literal, Tuple, Dict
+import joblib
+from .position_sizer import KellySizer        # NEW
+from .drift_monitor import get_monitor, DriftStatus        # NEW
 
 import json
 import numpy as np
@@ -38,13 +41,18 @@ from numpy.typing import NDArray
 from .analogue_synth import AnalogueSynth
 
 from .distance_calculator import DistanceCalculator
-from .tx_cost import BasicCostModel, estimate as _legacy_estimate
+from .tx_cost import BasicCostModel
 from .market_regime import MarketRegime # NEW
 from .weight_optimization import CurveParams, WeightOptimizer  # NEW
 
 
 
 __all__: Tuple[str, ...] = ("EVEngine", "EVResult")
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +69,46 @@ class EVResult:
     cluster_id: int  # closest centroid index
     outcome_probs: Dict[str, float] = field(default_factory=dict)   # flat dict
     #regime_curves: Dict[str, CurveParams] | None = None,
+    position_size: float = 0.0
+    drift_ticket: int = -1            # NEW – link to DriftMonitor
+    # NEW – Kelly size
+
+
+
+
+# ------------------------------------------------------------------
+# internal async retrain trigger
+# ------------------------------------------------------------------
+def _kickoff_retrain() -> None:
+    """Call PathClusterEngine.build() in a background thread."""
+    import logging, time
+    from prediction_engine.path_cluster_engine import PathClusterEngine
+    log = logging.getLogger(__name__)
+
+    # crude debounce: only allow one retrain per hour
+    tag_file = Path("prediction_engine/artifacts/last_retrain.txt")
+    if tag_file.exists() and time.time() - tag_file.stat().st_mtime < 3600:
+        return
+
+    log.warning("[Drift] RETRAIN_SIGNAL received – rebuilding centroids …")
+    # (*real code would pull latest parquet, rebuild, then atomically swap artefacts*)
+    try:
+        #  --- demo stub: reload existing artefacts as “new” ---
+        artefacts = Path("prediction_engine/artifacts")
+        # NOTE: insert actual ETL + PathClusterEngine.build() call here
+        PathClusterEngine.build(
+            X=np.load(artefacts / "centers.npy"),        # placeholder
+            y_numeric=np.load(artefacts / "cluster_stats.npz")["mu"],
+            y_categorical=None,
+            feature_names=["f1","f2"],
+            n_clusters=8,
+            out_dir=artefacts
+        )
+        tag_file.touch()
+        log.warning("[Drift] retrain completed.")
+    except Exception:           # noqa: BLE001
+        log.exception("Background retrain failed")
+
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +151,13 @@ class EVEngine:
         outcome_probs: Dict[str, Dict[str, float]] | None = None,
         regime_curves: Dict[str, CurveParams] | None = None,
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
+        lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
         cov_inv: np.ndarray | None = None,
         rf_weights: np.ndarray | None = None,
         k: int | None = None,
         cost_model: BasicCostModel | None = None,
+        cluster_regime: np.ndarray | None = None,
 
     ) -> None:
         self.centers = np.ascontiguousarray(centers, dtype=np.float32)
@@ -116,6 +166,7 @@ class EVEngine:
         self.var_down = var_down.astype(np.float32, copy=False)
         self.h = float(h)
         self.alpha = float(blend_alpha)
+        self.lambda_reg = float(lambda_reg)  # NEW
         self.k_max = k or 32  # fair default; will be density‑capped later
         self.metric = metric
         # Build distance helper – no external cov_inv needed (DistanceCalculator
@@ -128,9 +179,19 @@ class EVEngine:
 
         self._cost: BasicCostModel = cost_model or BasicCostModel()
 
+        # Kelly-sizer helper (singleton inside engine)
+        self._sizer = KellySizer()
+
         # NEW: Store regime-specific curves and outcome probabilities
         self.regime_curves = regime_curves or {}
         self.outcome_probs = outcome_probs or {}
+
+        #NEW: Loading the meta boost model
+        model_path = Path("prediction_engine/artifacts/gbm_meta.pkl")
+        self._meta_model = joblib.load(model_path) if model_path.exists() else None
+
+        #NEW: Cluster regime
+        self.cluster_regime = cluster_regime if cluster_regime is not None else np.full(len(mu), "ANY", dtype="U10")
 
         if len(self.centers) != len(self.mu):
             raise ValueError("centers and mu size mismatch")
@@ -152,8 +213,9 @@ class EVEngine:
         centers = np.load(artefact_dir / "centers.npy")
         stats_path = artefact_dir / "cluster_stats.npz"
         stats = np.load(stats_path)
+        regime_arr = stats["regime"] if "regime" in stats.files else np.full(len(stats["mu"]), "ANY", dtype="U10")
 
-          # -------- sanity-check required arrays --------------------
+        # -------- sanity-check required arrays --------------------
 
         for key in ("mu", "var", "var_down"):
             if key not in stats.files:  # older file from previous build
@@ -216,6 +278,7 @@ class EVEngine:
             outcome_probs=outcome_probs,
             regime_curves=regime_curves,
             cost_model=cost_model,
+            cluster_regime=regime_arr,
         )
 
     def _get_recency_weights(self, regime: MarketRegime, n_points: int) -> np.ndarray:
@@ -243,7 +306,7 @@ class EVEngine:
         # ------------------------------------------------------------
         # 1. Find nearest neighbours (density‑aware k)
         # ------------------------------------------------------------
-        k_eff = int(max(2, min(self.k_max, sqrt(len(self.centers)))))
+        k_eff = int(max(2, min(self.k_max, (len(self.centers))**0.5)))
         # Corrected version
         idx, dist2 = self._dist(x, k_eff)
         # density cut‑off – remove outliers beyond 2 h
@@ -251,6 +314,15 @@ class EVEngine:
         if not mask.any():
             mask[:] = True
         idx, dist2 = idx[mask], dist2[mask]
+
+        # --- regime filter ---------------------------------------------------
+        if regime is not None:
+            reg_mask = self.cluster_regime[idx] == regime.name.upper()
+            if reg_mask.any():  # only keep matches if at least one survives
+                idx, dist2 = idx[reg_mask], dist2[reg_mask]
+                #w = w[reg_mask] if 'w' in locals() else None  # w defined later
+        # ---------------------------------------------------------------------
+
         if idx.size == 0:  # << add
             raise RuntimeError("No centroids within 2 h – check bandwidth or data.")
 
@@ -273,7 +345,23 @@ class EVEngine:
         # ------------------------------------------------------------
         delta_mat = self.centers[idx] - x  # (k, d)
         beta = AnalogueSynth.weights(delta_mat, -x)
-        mu_syn = AnalogueSynth.synthesize(0.0, self.mu[idx], beta)
+
+        # ▶ NEW: variance‑weighted β – favour low‑risk neighbours ◀
+        var_arr = np.maximum(self.var[idx], 1e-12)
+        beta /= var_arr  # down‑weight high‑variance clusters
+        beta = np.maximum(beta, 0.0)
+        beta /= beta.sum()  # renormalise to Σβ = 1
+
+        mu_syn = float(beta @ self.mu[idx])
+        mu_syn = (1.0 - self.lambda_reg) * mu_syn + self.lambda_reg * float(self.mu.mean()) #NEW
+
+        # ---- ensemble meta-model override ----------------------------------
+        if hasattr(self, "_meta_model") and self._meta_model is not None:
+            feat_meta = np.array([[mu_syn, mu_k, var_syn := float(beta @ self.var[idx]), var_k]])
+            mu_meta = float(self._meta_model.predict(feat_meta))
+            mu_syn = 0.3 * mu_meta + 0.7 * mu_syn  # gamma = 0.3 for now
+
+
         var_syn = float(beta @ self.var[idx])  # <— one-liner
         var_down_syn = float(beta @ self.var_down[idx])
 
@@ -327,7 +415,27 @@ class EVEngine:
             for k in blended_probs:
                  blended_probs[k] /= tot
 
-        return EVResult(mu_net, sig2, sig2_down, beta, int(idx[0]), blended_probs)
+
+        # ------------------------------------------------------------
+        # 6. Kelly position size (NEW)
+        # ------------------------------------------------------------
+        pos_size = self._sizer.size(mu_net, sig2_down ** 0.5, adv_percentile)
+
+        # ------------------------------------------------------------
+        # 7. Drift-monitor registration  (prob ≈ P(μ>0) assuming normal)
+        # ------------------------------------------------------------
+        from math import erf, sqrt as _sqrt
+
+        p_up = 0.5 * (1.0 + erf(mu / (_sqrt(2.0 * sig2) + 1e-9)))
+        dm = get_monitor()
+        ticket_id = dm.log_pred(p_up)  # OMS must later call
+        # dm.log_outcome(ticket_id, realised_pnl > 0)
+
+        if dm.status()[0] is DriftStatus.RETRAIN_SIGNAL:
+            from threading import Thread
+            Thread(target=_kickoff_retrain, daemon=True).start()
+
+        return EVResult(mu_net, sig2, sig2_down, beta, int(idx[0]), blended_probs, pos_size, ticket_id)
 
 
 # ---------------------------------------------------------------------------

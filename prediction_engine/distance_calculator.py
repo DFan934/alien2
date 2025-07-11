@@ -184,8 +184,11 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
 
         # Auto‑discover RF weights if needed and caller did not specify a path
         if metric == "rf_weighted" and rf_weights_path is None:
-            cand = Path(ref_path).with_name("rf_feature_weights.npy")
-            rf_weights_path = cand if cand.exists() else None
+            for fname in ("rf_feature_weights.npy", "weights.npy"):
+                cand = Path(ref_path).with_name(fname)
+                if cand.exists():
+                    rf_weights_path = cand
+                    break
 
         w = np.load(rf_weights_path, allow_pickle=False) if rf_weights_path else None
         return cls(

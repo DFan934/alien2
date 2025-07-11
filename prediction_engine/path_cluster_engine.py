@@ -26,6 +26,8 @@ import numpy as np
 from numpy.linalg import norm
 from scipy.spatial.distance import pdist
 from sklearn.cluster import KMeans
+from collections import Counter
+
 
 
 class PathClusterEngine:
@@ -99,6 +101,7 @@ class PathClusterEngine:
         # ------------------------------------------------------------------
         # 2. Outcome stats per cluster (mu, var) -----------------------------
         labels = km.labels_
+        cluster_regime = np.full(n_clusters, "ANY", dtype="U10")  # default placeholder
         mu = np.zeros(n_clusters, dtype=np.float32)
         var = np.zeros(n_clusters, dtype=np.float32)
         var_down = np.zeros(n_clusters, dtype=np.float32)
@@ -130,11 +133,20 @@ class PathClusterEngine:
                     probs = cat_vals.value_counts(normalize=True).to_dict()
                     outcome_probs[str(c)] = probs
 
-        np.savez_compressed(out_dir / "cluster_stats.npz",
-                            mu=mu,
-                            var=var,
-                            var_down=var_down,
-                            feature_list=np.array(feature_names, dtype="U"))
+            if y_categorical is not None and y_categorical.dtype == object:
+                # treat object‐dtype column as regime label
+                regs = y_categorical[idx].str.upper()
+                if not regs.empty:
+                    cluster_regime[c] = Counter(regs).most_common(1)[0][0]
+
+        np.savez_compressed(
+            out_dir / "cluster_stats.npz",
+            mu=mu,
+            var=var,
+            var_down=var_down,
+            regime=cluster_regime,  # NEW
+            feature_list=np.array(feature_names, dtype="U"),
+        )
 
         if outcome_probs:
             with open(out_dir / "outcome_probabilities.json", "w", encoding="utf-8") as f:
@@ -162,7 +174,7 @@ class PathClusterEngine:
         with open(out_dir / "meta.json", "w", encoding="utf-8") as mf:
             json.dump(meta, mf, indent=2)
 
-        return cls(centers, mu, var, var_down, h_val, feature_names, sha, outcome_probs)
+        return cls(centers, mu, var, var_down, h_val, feature_names, sha, cluster_regime, outcome_probs)
 
     @classmethod
     def load(cls, artifact_dir: Path, feature_names: List[str]) -> "PathClusterEngine":
@@ -170,6 +182,8 @@ class PathClusterEngine:
         artifact_dir = Path(artifact_dir)
         centers = np.load(artifact_dir / "centers.npy")
         stats = np.load(artifact_dir / "cluster_stats.npz")
+        regime_arr = stats["regime"] if "regime" in stats.files else np.full(len(stats["mu"]), "ANY", dtype="U10")
+
         with open(artifact_dir / "kernel_bandwidth.json", "r", encoding="utf-8") as f:
             h_val = float(json.load(f)["h"])
         with open(artifact_dir / "meta.json", "r", encoding="utf-8") as f:
@@ -187,7 +201,9 @@ class PathClusterEngine:
         if expected_sha != actual_sha:
             raise RuntimeError(f"Feature schema mismatch!")
 
-        return cls(centers, stats["mu"].astype(np.float32), stats["var"].astype(np.float32), stats["var_down"].astype(np.float32), h_val, feature_names, expected_sha, outcome_probs)
+        return cls(centers, stats["mu"].astype(np.float32), stats["var"].astype(np.float32),
+                   stats["var_down"].astype(np.float32), h_val,
+                   feature_names, expected_sha, regime_arr, outcome_probs)
 
     # ---- core object -----------------------------------------------------
 
@@ -200,6 +216,7 @@ class PathClusterEngine:
         h: float,
         feature_names: List[str],
         sha: str,
+        regime: np.ndarray,
         outcome_probs: dict,
 
     ) -> None:
@@ -210,6 +227,7 @@ class PathClusterEngine:
         self.h = h
         self.feature_names = feature_names
         self.sha = sha
+        self.cluster_regime = regime
         self.outcome_probs = outcome_probs
 
 

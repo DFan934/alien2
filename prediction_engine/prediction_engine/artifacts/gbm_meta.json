@@ -1,0 +1,10 @@
+{
+  "date": "2025-07-10T11:42:05",
+  "n_rows": 4000,
+  "rmse_val": 0.019935084265293217,
+  "params": {
+    "n_estimators": 200,
+    "learning_rate": 0.05,
+    "subsample": 0.7
+  }
+}
