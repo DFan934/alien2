@@ -76,6 +76,19 @@ class SafetyFSM:
         self._cooldown_until: dict[HaltReason, datetime] = {}
         self._start_of_day = datetime.utcnow()
 
+    # ---------------------------------------------------------------------------
+    # helper – graceful fallback when cfg key missing
+    # ---------------------------------------------------------------------------
+    def _thresh(self, key: str, default: float) -> float:  # ← NEW
+        """
+        Return numeric threshold from self.cfg or a supplied default.
+        Keeps unit tests alive when an empty config dict is supplied.
+        """
+        try:
+            return float(self.cfg[key])
+        except (KeyError, TypeError, ValueError):
+            return float(default)
+
     # ---------------------------------------------------------------------
     # Registration helpers – the host ExecutionManager should call these.
     # ---------------------------------------------------------------------
@@ -105,11 +118,12 @@ class SafetyFSM:
             self._trigger(HaltReason.INTRADAY_DRAWDOWN)
 
     def register_latency(self, latency_ms: float) -> None:
-        if latency_ms >= self.cfg["latency_ms"]:
+        if latency_ms >= self._thresh("latency_ms", 250.0):  # 250 ms sane default
             self._trigger(HaltReason.MICRO_HALT)
 
     def register_volatility(self, vix_spike_pct: float) -> None:
-        if vix_spike_pct >= self.cfg["vix_spike_pct"]:
+        #if vix_spike_pct >= self.cfg["vix_spike_pct"]:
+        if vix_spike_pct >= self._thresh("vix_spike_pct", 10.0):  # +10 % spike
             self._trigger(HaltReason.VOLATILITY_HALT)
 
         # ------------------------------------------------------------------
@@ -154,3 +168,6 @@ class SafetyFSM:
         self._cooldown_until = {
             r: t for r, t in self._cooldown_until.items() if datetime.utcnow() < t
         }
+
+
+

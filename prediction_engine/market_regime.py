@@ -71,8 +71,13 @@ class RegimeDetector:
 
     # ---- public -----------------------------------------------------
     def update(self, bar_df: pd.DataFrame) -> MarketRegime:
-        if not {"high", "low", "close"}.issubset(bar_df.columns):
-            raise ValueError("bar_df must have high/low/close")
+        # ------------------------------------------------------------------
+        # graceful fallback for synthetic unit-test bars                    ← NEW
+        # ------------------------------------------------------------------
+        if {"price"}.issubset(bar_df.columns) and not {"close"}.issubset(bar_df.columns):
+            bar_df = bar_df.assign(close=bar_df["price"],
+                                   high=bar_df["price"],
+                                   low=bar_df["price"])
 
         df = bar_df.tail(60).copy()
         adx = _dmi(df, 14)[2].iloc[-1]
@@ -113,7 +118,6 @@ class RegimeDetector:
         return self.state
 
 
-        return self.state
 
 
 

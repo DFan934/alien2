@@ -29,7 +29,7 @@ Place this file in  ``prediction_engine/analogue_synth.py``.
 from typing import Tuple
 
 import numpy as np
-from numpy.linalg import lstsq
+from numpy.linalg import lstsq, LinAlgError
 
 try:
     from scipy.optimize import nnls  # type: ignore
@@ -48,6 +48,7 @@ class AnalogueSynth:
             target_delta: np.ndarray,
             *,
             var_nn: np.ndarray | None = None,
+            lambda_ridge: float = 0.0,
     ) -> np.ndarray:
         """Compute non‑negative weights that make ΔXᵀ·β ≈ target.
 
@@ -68,6 +69,18 @@ class AnalogueSynth:
         k, d = delta_mat.shape
         assert target_delta.shape == (d,), "target_delta dim mismatch"
 
+        # --------------------------------------------------------------
+        # 1. Clamp neighbour count if k > d (avoids singular ΔXᵀ matrix)
+        # --------------------------------------------------------------
+        if k > d and lambda_ridge == 0.0:  # ridge also cures singularity
+            keep = d
+            delta_mat = delta_mat[:keep, :]
+            if var_nn is not None:
+                var_nn = var_nn[:keep]
+            k = keep
+
+
+
         # Build augmented system enforcing Σβ = 1
         A_aug = np.vstack([delta_mat.T, np.ones(k)])  # (d+1) × k
         b_aug = np.append(target_delta, 1.0)  # (d+1,)
@@ -79,21 +92,24 @@ class AnalogueSynth:
             A_aug = W @ A_aug
             b_aug = W @ b_aug
 
+        # Optional ridge (adds √λ·I_k rows)
+        if lambda_ridge > 0.0:
+            ridge_blk = np.sqrt(lambda_ridge) * np.eye(k, dtype=A_aug.dtype)
+            A_aug = np.vstack([A_aug, ridge_blk])
+            b_aug = np.append(b_aug, np.zeros(k, dtype=A_aug.dtype))
+
         if _HAS_SCIPY:
             β, _ = nnls(A_aug, b_aug)
         else:
-            β, *_ = lstsq(A_aug, b_aug, rcond=None)
+            try:
+                β, *_ = lstsq(A_aug, b_aug, rcond=None)
+            except LinAlgError:
+                β = np.full(k, 1.0 / k, dtype=float)  # last-ditch uniform
             β = np.maximum(β, 0.0)
 
         β_sum = β.sum()
         if β_sum > 0:
             β /= β_sum
-
-        '''s = β.sum()
-        if s < 1e-8 or np.isnan(s):
-            β = np.full(k, 1.0 / k, dtype=float)
-        else:
-            β /= s'''
 
         if β_sum < 1e-8 or np.isnan(β_sum):
             β = np.full(k, 1.0 / k, dtype=float)

@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import hashlib
 from pathlib import Path
+import time
 from typing import Any, Literal, Tuple
 
 import numpy as np
@@ -99,7 +100,7 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         if metric == "mahalanobis":
             byt = self._ref.tobytes()
             sha = hashlib.sha1(byt).hexdigest()
-            key = f"{self._ref.shape}-{sha}"
+            key = f"{self._ref.shape}-{int(time.time())}-{sha}"
             self._inv_cov = _inv_cov_cached(key, eps, self._ref.shape[1], byt)
         else:
             self._inv_cov = None  # type: ignore[assignment]

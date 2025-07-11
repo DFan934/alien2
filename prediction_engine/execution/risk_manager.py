@@ -17,6 +17,9 @@ class RiskManager:
     risk_per_trade: float = 0.001  # fraction of equity risked per trade (0.1 %)
     atr_multiplier: float = 1.5    # used for stop distance
 
+    # ▲ NEW – optional pointer to external SafetyFSM
+    safety_fsm: "SafetyFSM | None" = None
+
     _symbol_atr: Dict[str, float] = field(default_factory=dict, init=False)
     _peak_equity: float = field(init=False)
 
@@ -57,6 +60,11 @@ class RiskManager:
     def on_closed_trade(self, pnl: float):
         self.account_equity += pnl
         self._peak_equity = max(self._peak_equity, self.account_equity)
+
+        # ▲ NEW – forward realised PnL to external safety guard
+        if self.safety_fsm is not None:
+            self.safety_fsm.register_trade(pnl)
+
 
     def drawdown(self) -> float:
         return 1.0 - self.account_equity / self._peak_equity

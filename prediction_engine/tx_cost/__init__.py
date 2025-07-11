@@ -1,53 +1,127 @@
+# =============================================================================
+# FILE: tx_cost/__init__.py
+# =============================================================================
 """
 Transaction-cost models
 =======================
 
 `BaseCostModel` – abstract interface
-`BasicCostModel` – square-root-impact Slippage model (old `_tx_cost.basic`)
-The module still exposes the free-function **estimate(...)** so legacy code
-continues to work (`EVEngine` expects it).
+`BasicCostModel` – half-spread + commission + square-root-impact model
+
+The module still exports the free function **estimate(…)** so legacy code
+(`EVEngine`, test-benches, etc.) keeps working unchanged.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
 import numpy as np
 
 __all__ = ("BaseCostModel", "BasicCostModel", "estimate")
 
 
+# ---------------------------------------------------------------------------#
+# Abstract interface                                                         #
+# ---------------------------------------------------------------------------#
 class BaseCostModel(ABC):
-    """Every cost-model must implement these two helpers."""
+    """All cost-models expose the same two helpers."""
 
     @abstractmethod
-    def cost(self, qty: float, adv_pct: float | None = None) -> float: ...
+    def cost(
+        self,
+        qty: float = 1.0,
+        *,
+        half_spread: float | None = None,
+        adv_pct: float | None = None,
+    ) -> float: ...
+
     @abstractmethod
-    def estimate(self, adv_percentile: float | None = None) -> float: ...
+    def estimate(
+        self,
+        *,
+        half_spread: float | None = None,
+        adv_percentile: float | None = None,
+    ) -> float: ...
 
 
+# ---------------------------------------------------------------------------#
+# Default implementation – calibrated nightly                                #
+# ---------------------------------------------------------------------------#
 class BasicCostModel(BaseCostModel):
-    """Square-root market-impact model, calibrated nightly."""
+    """
+    Realistic per-share transaction cost:
 
-    _IMPACT_COEFF: float = 9e-5
-    _SPREAD_CENTS: float = 2.0  # average half-spread, cents
-    _COMMISSION: float = 0.002  # $/share
+        cost = half_spread  +  commission  +  impact
+
+    * **half_spread** – default 2¢; caller can pass live quote for accuracy.
+    * **commission**   – broker fee, default 0.2 ¢/share (≈ 0.002 USD).
+    * **impact**       – square-root model :math:`κ·√(q/ADV)`.
+    """
+
+    # Nightly-calibrated constants (override before back-test if needed)
+    _IMPACT_COEFF: float = 9e-5          # κ
+    _DEFAULT_SPREAD_CENTS: float = 2.0   # ½-spread when no quote supplied
+    _COMMISSION: float = 0.002           # $/share
+
+    # ------------------------------------------------------------------ #
+    # Core                                                               #
+    # ------------------------------------------------------------------ #
+    def cost(
+        self,
+        qty: float = 1.0,
+        *,
+        half_spread: float | None = None,
+        adv_pct: float | None = None,
+    ) -> float:
+        """
+        Parameters
+        ----------
+        qty
+            Order size in shares.
+        half_spread
+            Live half-spread in **USD** (not ¢).  Falls back to 2 ¢ if omitted.
+        adv_pct
+            Order size **as % of ADV** (0–100).  When supplied, impact is scaled
+            by that liquidity tier; otherwise unit ADV is assumed.
+        """
+        # --- spread + commission ------------------------------------- #
+        hs = half_spread if half_spread is not None else self._DEFAULT_SPREAD_CENTS * 0.01
+        commission = self._COMMISSION
+
+        # --- market-impact (square-root) ----------------------------- #
+        if adv_pct is None:
+            frac = 1.0  # assume 1 × ADV normalisation (unit share cost)
+        else:
+            # adv_pct is “% of ADV” for *this* order; clamp to [1e-6, 100]
+            frac = np.clip(adv_pct / 100.0, 1e-6, 1.0)
+
+        impact = self._IMPACT_COEFF * np.sqrt(frac)
+
+        return float(hs + commission + impact)
+
+    # ------------------------------------------------------------------ #
+    # Convenience alias (back-compat with old code)                      #
+    # ------------------------------------------------------------------ #
+    def estimate(
+        self,
+        *,
+        half_spread: float | None = None,
+        adv_percentile: float | None = None,
+    ) -> float:
+        """Delegates to :meth:`cost` using a unit share."""
+        return self.cost(
+            1.0,
+            half_spread=half_spread,
+            adv_pct=adv_percentile,
+        )
 
 
-    def cost(self, qty: float = 1.0, adv_pct: float | None = None) -> float:
-        adv = 1.0  # unit ADV normalisation – fine for per-share usage
-        impact = self._IMPACT_COEFF * np.sqrt(np.clip(qty / adv, 1e-6, 1.0))
-        spread  = self._SPREAD_CENTS * 0.01      # convert to $
-        return float(spread + self._COMMISSION + impact)
-
-    def estimate(self, adv_percentile: float | None = None) -> float:
-        # delegate to cost() with 1-share notional
-        return self.cost(1.0, adv_percentile)
+# ---------------------------------------------------------------------------#
+# Legacy free-function shim  – forwards to singleton instance                #
+# ---------------------------------------------------------------------------#
+_basic = BasicCostModel()  # stateless singleton
 
 
-# ------------------------------------------------------------------#
-# Back-compat helpers – keep the free function used in older code   #
-# ------------------------------------------------------------------#
-_basic = BasicCostModel()          # singleton – stateless
-
-def estimate(*args, **kwargs):     # noqa: D401  (simple alias)
-    """Compatibility shim – forwards to `BasicCostModel.estimate()`."""
+def estimate(*args, **kwargs):  # noqa: D401
+    """Compatibility wrapper for old `tx_cost.estimate` import paths."""
     return _basic.estimate(*args, **kwargs)

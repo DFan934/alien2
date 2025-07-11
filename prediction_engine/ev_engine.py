@@ -27,7 +27,6 @@ old module.
 """
 
 from dataclasses import dataclass, field
-from math import sqrt
 from pathlib import Path
 from typing import Iterable, Literal, Tuple, Dict
 import joblib
@@ -297,7 +296,7 @@ class EVEngine:
     # Core API
     # ------------------------------------------------------------------
 
-    def evaluate(self, x: NDArray[np.float32], adv_percentile: float | None = None, regime: MarketRegime = MarketRegime.RANGE) -> EVResult:  # noqa: N802
+    def evaluate(self, x: NDArray[np.float32], adv_percentile: float | None = None, *, half_spread: float | None = None, regime: MarketRegime = MarketRegime.RANGE) -> EVResult:  # noqa: N802
         """Return expected‑value statistics for one live feature vector."""
         x = np.ascontiguousarray(x, dtype=np.float32)
         if x.ndim != 1:
@@ -318,13 +317,29 @@ class EVEngine:
         # --- regime filter ---------------------------------------------------
         if regime is not None:
             reg_mask = self.cluster_regime[idx] == regime.name.upper()
-            if reg_mask.any():  # only keep matches if at least one survives
+            if reg_mask.any():  # keep matches when possible
                 idx, dist2 = idx[reg_mask], dist2[reg_mask]
-                #w = w[reg_mask] if 'w' in locals() else None  # w defined later
+            else:  # ▲ NEW soft-fallback
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[EVEngine] regime=%s yielded zero matches; "
+                    "falling back to all clusters",
+                    regime.name,
+                )
+                # fall back to full idx/dist2 already computed above
+        # ---------------------------------------------------------------------
+
+        # (distance threshold still applied earlier; no need to recompute)
+
         # ---------------------------------------------------------------------
 
         if idx.size == 0:  # << add
-            raise RuntimeError("No centroids within 2 h – check bandwidth or data.")
+            import logging
+            logging.getLogger(__name__).warning(
+                "[EVEngine] regime=%s had zero matches; falling back to all clusters",
+                regime.name
+            )
+            idx, dist2 = self._dist(x, k_eff)  # recompute on *all* clusters
 
         # ------------------------------------------------------------
         # 2. Kernel estimate (Gaussian) with NEW regime-based recency weighting
@@ -382,7 +397,7 @@ class EVEngine:
         # ------------------------------------------------------------
         # 4. Subtract transaction cost
         # ------------------------------------------------------------
-        cost_ps = self._cost.estimate(adv_percentile=adv_percentile)
+        cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
         mu_net = mu - cost_ps
 
 

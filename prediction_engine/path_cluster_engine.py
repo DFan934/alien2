@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import warnings
+from sklearn.impute import SimpleImputer
+
 from pathlib import Path
 from typing import List, Tuple, Optional
 import pandas as pd
@@ -86,6 +89,23 @@ class PathClusterEngine:
         if X.shape[0] != y_numeric.shape[0]:
             raise ValueError("X and y must have the same number of rows")
 
+        # --------------------------------------------------------------#
+        # 0. Mean-impute NaNs  (Task-2.2)                                #
+        # --------------------------------------------------------------#
+        nan_mask = np.isnan(X).any(axis=1)
+        ratio_nan = nan_mask.mean()
+        if ratio_nan >= 0.10:
+            warnings.warn(
+                f"[PathClusterEngine] {ratio_nan:.1%} of rows contained NaNs; "
+                "mean-imputation applied."
+            )
+
+        imputer = SimpleImputer(strategy="mean")
+        X = imputer.fit_transform(X)
+
+    # --------------------------------------------------------------#
+    # 1. K-Means                                                    #
+    # --------------------------------------------------------------#
         km = KMeans(
             n_clusters=n_clusters,
             n_init="auto",
@@ -94,12 +114,12 @@ class PathClusterEngine:
         ).fit(X.astype(np.float32))
 
         # ------------------------------------------------------------------
-        # 1. Save centroids --------------------------------------------------
+        # 2. Save centroids --------------------------------------------------
         centers = km.cluster_centers_.astype(np.float32)
         np.save(out_dir / "centers.npy", centers)
 
         # ------------------------------------------------------------------
-        # 2. Outcome stats per cluster (mu, var) -----------------------------
+        # 3. Outcome stats per cluster (mu, var) -----------------------------
         labels = km.labels_
         cluster_regime = np.full(n_clusters, "ANY", dtype="U10")  # default placeholder
         mu = np.zeros(n_clusters, dtype=np.float32)
@@ -153,7 +173,7 @@ class PathClusterEngine:
                 json.dump(outcome_probs, f, indent=2)
 
         # ------------------------------------------------------------------
-        # 3. Kernel bandwidth (median pairwise dist of centroids) -----------
+        # 4. Kernel bandwidth (median pairwise dist of centroids) -----------
         if centers.shape[0] > 1:
             h_val: float = float(np.median(pdist(centers)))
         else:
@@ -163,7 +183,7 @@ class PathClusterEngine:
             json.dump({"h": h_val}, f, indent=2)
 
         # ------------------------------------------------------------------
-        # 4. Meta / schema hash ---------------------------------------------
+        # 5. Meta / schema hash ---------------------------------------------
         sha = hashlib.sha1("|".join(feature_names).encode()).hexdigest()[:12]
         meta = {
             "n_clusters": int(n_clusters),

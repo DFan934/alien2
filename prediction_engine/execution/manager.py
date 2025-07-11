@@ -100,7 +100,16 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         if len(self._bar_history) < 60: return  # Wait for enough data for indicators
 
         # 0) Live metrics for safety check -----------------------------
-        latency_ms: float = float(getattr(self.lat_monitor, "mean", 0.0))
+        # ▲ Compute latency mean robustly – works for Prometheus Summary too
+        if hasattr(self.lat_monitor, "mean"):
+            latency_ms: float = float(self.lat_monitor.mean)
+        elif all(hasattr(self.lat_monitor, a) for a in ("_sum", "_count")):
+            try:
+                latency_ms = float(self.lat_monitor._sum.get()) / max(self.lat_monitor._count.get(), 1)
+            except Exception:  # fallback if Prometheus internals absent
+                latency_ms = 0.0
+        else:
+            latency_ms = 0.0
         atr = float(feats.get("atr", 0.0))
         trade_loss = float(getattr(self.risk_mgr, "last_loss", 0.0))
         day_pl = float(getattr(self.risk_mgr, "day_pl", 0.0))
@@ -110,8 +119,34 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         dd_obj = getattr(self.risk_mgr, "drawdown", 0.0)
         drawdown = float(dd_obj() if callable(dd_obj) else dd_obj)
 
+
+        # ------------------------------------------------------------
+        # Realised volatility / VIX spike (feeds Safety FSM)
+        # ------------------------------------------------------------
+        # 1) Use explicit feed value when present
+        vix_spike = float(bar.get("vix_spike_pct", 0.0))
+
+        # 2) Otherwise derive from last 30 bars’ realised σ
+        if len(self._bar_history) >= 30:
+            prices = np.array([b["price"] for b in list(self._bar_history)[-30:]])
+            rets = np.diff(np.log(prices))
+            if rets.size:                       # guard against division by zero
+                sigma_now = np.std(rets)
+                sigma_hist = getattr(self, "_sigma_hist", [])
+                median_sigma = np.median(sigma_hist) if sigma_hist else sigma_now
+                spike_pct = 0.0 if median_sigma == 0 else 100.0 * (sigma_now - median_sigma) / median_sigma
+                vix_spike = max(vix_spike, spike_pct)
+
+                # keep rolling window of sigmas for future median
+                sigma_hist.append(sigma_now)
+                if len(sigma_hist) > 200:
+                    sigma_hist.pop(0)
+                self._sigma_hist = sigma_hist
+
+
         if self.safety.should_halt(
             latency_ms=latency_ms,
+            vix_spike_pct=vix_spike,
             symbol_volatility=atr,
             #volatility=atr or 0.0,
             trade_loss=trade_loss,
@@ -183,7 +218,15 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             "outcome_probs": ev_res.outcome_probs,
             "market_regime": current_regime.name
         }
-        await self._sig_q.put(json.dumps(signal_data))
+        #await self._sig_q.put(json.dumps(signal_data))
+        # ▲ Non-blocking put with timeout; drop on overflow
+        try:
+            await asyncio.wait_for(
+                self._sig_q.put(json.dumps(signal_data)),
+                timeout=0.05,
+            )
+        except (asyncio.TimeoutError, asyncio.QueueFull):  # type: ignore[attr-defined]
+            logger.warning("signal queue full – dropped trade %s", trade_id)
 
         # Store the initial prediction probability to compare against the actual outcome later
         self._open_trades[trade_id] = {"pred_prob": ev_res.mu}

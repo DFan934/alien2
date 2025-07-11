@@ -31,10 +31,12 @@ class KellySizer:
         # Hard Kelly clip
         f_kelly = min(f_raw, self.f_max)
 
-        # Liquidity taper – linear from 10 % ADV → 0 % at adv_cap_pct
+        # Liquidity taper – LOG curve: 100 % size ≤ 10 % ADV,
+        # then decays as   scale = 1 − log1p(adv − 10) / log1p(cap − 10)
         if adv_percentile is not None and adv_percentile > 10.0:
-            scale = max(0.0, 1.0 - (adv_percentile - 10.0) /
-                                (self.adv_cap_pct - 10.0))
+            adv = min(adv_percentile, self.adv_cap_pct)
+            decay = np.log1p(adv - 10.0) / np.log1p(self.adv_cap_pct - 10.0)
+            scale = max(0.0, 1.0 - decay)
             f_kelly *= scale
 
         return float(np.clip(f_kelly, 0.0, self.f_max))

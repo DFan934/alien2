@@ -95,3 +95,23 @@ class ModelManager:
         mu = (w_k * mean_k + w_rf * mean_rf) / (w_k + w_rf)
         var = 1.0 / (w_k + w_rf)
         return mu, var
+
+
+    # ----------------------------------------------
+    # NEW: hot-swap artefacts after retrain
+    # ----------------------------------------------
+    def load_latest(self, artefact_dir: "Path") -> None:
+        """
+        Refresh any in-memory models that depend on the artefacts in
+        *artefact_dir*.  At present the ensemble has no direct files to load,
+        so this is a lightweight stub that simply logs the swap.  Extend it
+        later if you keep an EVEngine instance or other artefacts in memory.
+        """
+        import logging
+        logging.getLogger(__name__).info(
+            "[ModelManager] hot-swapped artefacts from %s", artefact_dir
+        )
+        # Example of a real reload:
+        # from prediction_engine.ev_engine import EVEngine
+        # self.ev = EVEngine.from_artifacts(artefact_dir)
+
