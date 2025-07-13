@@ -31,6 +31,7 @@ from scipy.spatial.distance import pdist
 from sklearn.cluster import KMeans
 from collections import Counter
 
+from prediction_engine.ev_engine import _sha1_list
 
 
 class PathClusterEngine:
@@ -188,7 +189,7 @@ class PathClusterEngine:
         meta = {
             "n_clusters": int(n_clusters),
             "features": feature_names,
-            "sha": sha,
+            "sha": _sha1_list(feature_names),
             "sklearn_version": km.__module__.split(".")[0] + " " + km.__module__.split(".")[1],
         }
         with open(out_dir / "meta.json", "w", encoding="utf-8") as mf:

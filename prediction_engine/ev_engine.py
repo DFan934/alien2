@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Tuple, Dict
 import joblib
-from .position_sizer import KellySizer        # NEW
+from prediction_engine.position_sizer import KellySizer        # NEW
 from .drift_monitor import get_monitor, DriftStatus        # NEW
 
 import json
@@ -229,6 +229,12 @@ class EVEngine:
         # Schema guard – fail fast if feature list drifted
         meta = json.loads((artefact_dir / "meta.json").read_text())
         features_live = stats["feature_list"].tolist()
+
+        print("[DEBUG] meta['sha']:", meta["sha"])
+        print("[DEBUG] current sha:", _sha1_list(features_live))
+        print("[DEBUG] meta['features']:", meta.get("features"))
+        print("[DEBUG] current features:", features_live)
+
         if meta["sha"] != _sha1_list(features_live):            raise RuntimeError(
                 "Feature schema drift detected – retrain PathClusterEngine before loading EVEngine."
             )
@@ -458,7 +464,7 @@ class EVEngine:
 # ---------------------------------------------------------------------------
 
 def _sha1_list(items: Iterable[str]) -> str:
-    h = hashlib.sha1()
-    for it in items:
-        h.update(it.encode())
-    return h.hexdigest()
+
+    feat_str = "|".join(items)
+    full = hashlib.sha1(feat_str.encode()).hexdigest()
+    return full[:12]
