@@ -3,15 +3,15 @@
 # Grid-search over gap-pct, RVOL thresh, PCA variance in a *single* run.
 # ---------------------------------------------------------------------------
 from __future__ import annotations
-import itertools, logging, math, shutil, tempfile
+import itertools, logging, math, tempfile
 from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
 import numpy as np
 
-from prediction_engine.scripts import run_backtest   # existing file!
-from prediction_engine.scripts.run_backtest import run as run_bt
+from scripts.scripts import run_backtest
+from scripts.scripts.run_backtest import run as run_bt
 
 # ────────────────────────────────────────────────────────────────────────
 # Define your parameter grid  ⬇︎  (edit here)

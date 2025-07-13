@@ -76,7 +76,7 @@ def rebuild_if_needed(
         raise RuntimeError("Rebuild slice returned zero rows – check dates/symbols.")
 
     # 2) run in-memory pipeline
-    pipe = CoreFeaturePipeline(parquet_root=Path("."))  # dummy, in-mem
+    pipe = CoreFeaturePipeline(parquet_root=Path(""))  # dummy, in-mem
     feats, _ = pipe.run_mem(raw)
     feats = feats[live_feat].astype(np.float32)
 

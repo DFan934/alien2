@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -26,8 +25,7 @@ from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel        # NEW
 from prediction_engine.execution.risk_manager import RiskManager
 from prediction_engine.testing_validation.backtester import BrokerStub #NEW
-from prediction_engine.scripts.rebuild_artefacts import rebuild_if_needed   #  NEW
-from scanner.schema import FEATURE_ORDER
+from scripts.scripts.rebuild_artefacts import rebuild_if_needed   #  NEW
 
 
 # Keep only PCA feature columns (produced by CoreFeaturePipeline)
@@ -66,11 +64,8 @@ def _resolve_path(path_like: str | Path) -> Path:
     p = Path(path_like).expanduser().resolve()
     if p.exists():
         return p
-    root = Path(__file__).resolve().parents[2]
-    q = (root / path_like).resolve()
-    if q.exists():
-        return q
     raise FileNotFoundError(path_like)
+
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -109,7 +104,7 @@ def run(cfg: Dict[str, Any]) -> None:
         raise ValueError("Date filter returned zero rows")
 
     # 2 ─ Feature engineering
-    pipe = CoreFeaturePipeline(parquet_root=Path("."))  # in-mem
+    pipe = CoreFeaturePipeline(parquet_root=Path(""))  # in-mem
     feats, _ = pipe.run_mem(df_raw)
 
     # ------------------------------------------------------------------
