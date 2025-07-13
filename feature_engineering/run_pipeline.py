@@ -93,7 +93,7 @@ def main() -> None:
     write_feature_dataset(df, output_root)
     logger.info("Saved features → %s", output_root)
     logger.info("PCA retained %d components covering %.2f%% variance",
-                pca_meta["n_components_"],
+                pca_meta.get("n_components", pca_meta.get("n_components_")),
                 sum(pca_meta["explained_variance_ratio_"]) * 100)
 
 if __name__ == "__main__":      # pragma: no cover
