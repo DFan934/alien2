@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\ev_engine.py
+# hypothesis_version: 6.135.17
+
+[-0.5, 0.0, 1e-12, 1e-09, 1e-08, 0.05, 0.3, 0.5, 0.7, 1.0, 2.0, 3600, '=', 'ANY', 'EVEngine', 'EVResult', 'U10', '[DEBUG] current sha:', "[DEBUG] meta['sha']:", '_meta_model', 'blend_alpha', 'centers.npy', 'centroid_cov_inv.npy', 'cluster_stats.npz', 'curve_params.json', 'euclidean', 'f1', 'f2', 'feature_list', 'features', 'h', 'mahalanobis', 'meta.json', 'mu', 'params', 'regime', 'regime=*', 'rf_weighted', 'sha', 'var', 'var_down', 'x must be 1‑D vector', '|']

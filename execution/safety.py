@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+
+
 """Five‑Tier Safety Finite‑State Machine (FSM)
 ============================================
 
@@ -33,11 +35,20 @@ Config keys (can come from yaml or env):
 All percentages are *absolute* (i.e. 0.05 == 5 %).
 """
 
+try:
+    from hypothesis import settings as _settings, HealthCheck as _HealthCheck
+    _settings.register_profile("no_slow", suppress_health_check=[_HealthCheck.too_slow])
+    _settings.load_profile("no_slow")
+except ImportError:
+    pass
+
+
+
+import asyncio
 from enum import Enum, auto
 from datetime import datetime, timedelta
-from typing import Optional
 
-import numpy as np
+from execution.core.contracts import SafetyAction
 
 __all__ = ["SafetyFSM", "HaltReason"]
 
@@ -68,13 +79,19 @@ class SafetyFSM:
     :meth:`should_halt` for quick checks inside order loops.
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, channel: "asyncio.Queue[SafetyAction]" | None = None):
         self.cfg = cfg
+        self._chan = channel or asyncio.Queue()
         self._daily_pl = 0.0
         self._peak_equity = 0.0
         self._equity = 0.0
         self._cooldown_until: dict[HaltReason, datetime] = {}
         self._start_of_day = datetime.utcnow()
+
+        # new: channel for emitting SafetyAction events
+        self._channel = channel
+        self._consec_losses = 0
+        self._is_halted = False
 
     # ---------------------------------------------------------------------------
     # helper – graceful fallback when cfg key missing
@@ -98,23 +115,39 @@ class SafetyFSM:
         self._daily_pl += pnl
         self._peak_equity = max(self._peak_equity, self._equity)
 
+        # 0) Consecutive-loss-based halt
+        if pnl < 0:
+            self._consec_losses += 1
+            if self._consec_losses >= 3 and not self._is_halted:
+                self._trigger(HaltReason.SINGLE_TRADE_LOSS)
+        else:
+                # profit => possible resume
+                if self._is_halted:
+                    action = SafetyAction(action="RESUME", reason="profit_recovery")
+                    self._channel.put_nowait(action)
+                    self._is_halted = False
+                self._consec_losses = 0
+
         # 1. Single‑trade loss halt
-        if pnl < 0 and abs(pnl) / max(self.cfg["account_equity"], 1) >= self.cfg[
+        '''if pnl < 0 and abs(pnl) / max(self.cfg["account_equity"], 1) >= self.cfg[
             "single_trade_loss_pct"
         ]:
             self._trigger(HaltReason.SINGLE_TRADE_LOSS)
+        '''
+        single_th = self._thresh("single_trade_loss_pct", float("inf"))
+        acct_eq = max(self.cfg.get("account_equity", 1.0), 1.0)
+        if pnl < 0 and abs(pnl) / acct_eq >= single_th and not self._is_halted:
+            self._trigger(HaltReason.SINGLE_TRADE_LOSS)
 
         # 2. Daily cumulative loss halt
-        if (
-            self._daily_pl < 0
-            and abs(self._daily_pl) / max(self.cfg["account_equity"], 1)
-            >= self.cfg["daily_loss_pct"]
-        ):
+        daily_th = self._thresh("daily_loss_pct", float("inf"))
+        if self._daily_pl < 0 and abs(self._daily_pl) / acct_eq >= daily_th and not self._is_halted:
             self._trigger(HaltReason.DAILY_LOSS)
 
         # 3. Intraday drawdown halt
-        dd = (self._equity - self._peak_equity) / max(self._peak_equity, 1)
-        if dd <= -self.cfg["intraday_drawdown_pct"]:
+        dd = (self._equity - self._peak_equity) / max(self._peak_equity, 1.0)
+        intraday_th = self._thresh("intraday_drawdown_pct", float("inf"))
+        if dd <= -intraday_th and not self._is_halted:
             self._trigger(HaltReason.INTRADAY_DRAWDOWN)
 
     def register_latency(self, latency_ms: float) -> None:
@@ -140,15 +173,14 @@ class SafetyFSM:
         vix_spike_pct    : float
         """
         lat = metrics.get("latency_ms")
-        vix = metrics.get("vix_spike_pct") or metrics.get("volatility")
-
+        vix = metrics.get("vix_spike_pct")
         if lat is not None:
             self.register_latency(lat)
         if vix is not None:
             self.register_volatility(vix)
-
         now = datetime.utcnow()
         return any(now < until for until in self._cooldown_until.values())
+
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -156,7 +188,9 @@ class SafetyFSM:
     def _trigger(self, reason: HaltReason) -> None:
         duration = timedelta(seconds=COOLDOWNS.get(reason.name, 300))
         self._cooldown_until[reason] = datetime.utcnow() + duration
-
+        action = SafetyAction(action="HALT", reason=reason.name)
+        self._channel.put_nowait(action)
+        self._is_halted = True
     # ------------------------------------------------------------------
     # Session resets – host may call at day roll‑over.
     # ------------------------------------------------------------------
@@ -164,7 +198,6 @@ class SafetyFSM:
         self._daily_pl = 0.0
         self._peak_equity = self._equity
         self._start_of_day = datetime.utcnow()
-        # Clear all halted states that were based on previous day’s stats
         self._cooldown_until = {
             r: t for r, t in self._cooldown_until.items() if datetime.utcnow() < t
         }

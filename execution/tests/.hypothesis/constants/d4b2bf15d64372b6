@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\weight_optimization.py
+# hypothesis_version: 6.135.17
+
+[1e-09, 0.1, 0.2, 0.5, 0.8, 120, 128, 'artifacts/weights', 'curve_params.json', 'exp', 'family', 'file', 'global', 'linear', 'maximize', 'nt', 'params', 'range', 'shape', 'sigmoid', 'tail_len', 'test', 'test_sharpe', 'train', 'train_sharpe', 'trend', 'utf-8', 'valid', 'valid_sharpe', 'volatile']

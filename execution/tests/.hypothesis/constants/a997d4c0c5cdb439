@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\execution\manager.py
+# hypothesis_version: 6.135.17
+
+[0.0, 0.05, 0.15, 0.5, 1.0, 100.0, 200, 5000, '.', 'ATR must be positive', 'BUY', 'FINAL', 'HALT', 'RESUME', 'SIZE_DOWN', 'TP', 'TradeSignal', '_count', '_safety_task', '_sigma_hist', '_sum', 'a', 'adv', 'asyncio.Queue[str]', 'atr', 'cluster', 'day_pl', 'drawdown', 'drift_ckpt_path', 'ema_fast_dist', 'execution_bar', 'exp_ret', 'features', 'last_loss', 'market_regime', 'max_queue', 'mean', 'orderflow_delta', 'outcome_probs', 'pred_prob', 'price', 'qty', 'reduced_size_factor', 'regime_profiles', 'safety', 'signal_writer', 'size_mult', 'sym', 'symbol', 'trade_id', 'ts', 'type', 'var', 'vix_spike_pct', 'vwap_dist']

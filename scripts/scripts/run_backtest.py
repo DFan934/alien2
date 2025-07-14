@@ -23,7 +23,7 @@ import pandas as pd
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel        # NEW
-from prediction_engine.execution.risk_manager import RiskManager
+from execution.risk_manager import RiskManager
 from prediction_engine.testing_validation.backtester import BrokerStub #NEW
 from scripts.scripts.rebuild_artefacts import rebuild_if_needed   #  NEW
 

@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\execution\core\contracts.py
+# hypothesis_version: 6.135.17
+
+[0.0, 1.0, '0.2.0', 'BUY', 'HALT', 'LMT', 'MKT', 'RESUME', 'SELL', 'SIZE_DOWN', 'range', 'side', 'trend', 'unknown', 'volatile']

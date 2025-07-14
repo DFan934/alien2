@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\market_regime.py
+# hypothesis_version: 6.135.17
+
+[0.0, 1e-09, 0.05, 0.95, 1.0, 2.5, 25.0, 100, 900, '1d', '1y', 'CHOPPY', 'SPY', 'TRENDING', 'VOLATILE', '__main__', 'adx', 'atr', 'atr_mean', 'atr_std', 'close', 'deque', 'high', 'last_label', 'low', 'object', 'price', 'state', 'ts', 'wb']

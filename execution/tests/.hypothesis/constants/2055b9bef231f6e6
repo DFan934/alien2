@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\retraining_manager.py
+# hypothesis_version: 6.135.17
+
+['.bak', 'MLFLOW_TRACKING_URI', 'centroid_artifacts', 'centroid_retrain', 'drift', 'n_clusters', 'n_features', 'n_rows', 'regime', 'regime_change', 'seconds', 'timestamp', 'tmp_retrain_']

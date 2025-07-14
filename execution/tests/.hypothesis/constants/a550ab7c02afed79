@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\drift_monitor.py
+# hypothesis_version: 6.135.17
+
+[0.0, 1e-09, 0.1, 0.15, 0.4, 0.5, 1.0, 200, 500, 1000, 'After drift', 'Baseline', 'CLEAR', 'DriftMonitor', 'DriftStatus', 'RETRAIN_SIGNAL', 'WARNING', '__main__', 'acc_drop', 'hist', 'kl', 'ref_acc', 'updates', 'w']

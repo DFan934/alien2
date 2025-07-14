@@ -8,6 +8,16 @@ from collections import deque
 
 import pandas as pd
 
+from execution.latency import latency_monitor
+from execution.latency import timeit
+
+
+from prediction_engine.utils.latency import timeit
+# + new lines
+from execution.position_store import PositionStore
+from execution.core.contracts import TradeSignal
+
+
 """Execution Manager
 ====================
 Coordinates signal generation → risk sizing → safety gating → order
@@ -30,13 +40,18 @@ import numpy as np
 
 from prediction_engine.utils.latency import timeit
 from prediction_engine.ev_engine import EVEngine
-from .risk_manager import RiskManager
-from .safety import SafetyFSM, HaltReason
+from execution.risk_manager import RiskManager
+from execution.safety import SafetyFSM, HaltReason
 
 from prediction_engine.market_regime import RegimeDetector, MarketRegime
 from prediction_engine.drift_monitor import DriftMonitor, DriftStatus
 from prediction_engine.retraining_manager import RetrainingManager
 from prediction_engine.models import ModelManager
+from execution.core.contracts import SafetyAction
+#from execution.stop_manager import StopManager
+#from execution.exit_manager import ExitManager
+from execution.stop_manager import StopManager
+from execution.exit_manager import ExitManager
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +61,40 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
     def __init__(
         self,
-        ev: EVEngine,
-        risk_mgr: RiskManager,
-        lat_monitor: Any,  # expects .mean attr (ms); keep loose for extensibility
-        config: Dict[str, Any],
-        log_path: str | Path,
+        ev: Any | None = None,
+        risk_mgr: RiskManager | None = None,
+        lat_monitor: Any = None,
+        config: Dict[str, Any] | None = None,
+        log_path: str | Path | None = None,
+        *,
+        equity: float | None = None,
     ) -> None:
+        # allow M0 tests to call ExecutionManager(equity=…)
+
+        if equity is not None:
+
+            from execution.risk_manager import RiskManager
+
+            from execution.latency import latency_monitor
+
+            ev = None
+            risk_mgr = RiskManager(account_equity=equity)
+            lat_monitor = latency_monitor
+            config = {}
+            log_path = Path(".")
+
+        # sanity check
+        #if ev is None or risk_mgr is None or lat_monitor is None or config is None or log_path is None:
+         #   raise ValueError("ExecutionManager needs either equity=… or full (ev, risk_mgr, lat_monitor, config, log_path)")
+        else:
+            # sanity check only in the “full” path
+            if ev is None or risk_mgr is None or lat_monitor is None or config is None or log_path is None:
+                raise ValueError(
+                    "ExecutionManager needs either equity=… or all of (ev, risk_mgr, lat_monitor, config, log_path)"
+                    )
+
+
+        # now the existing init… everything below is unchanged
         self.ev = ev
         self.risk_mgr = risk_mgr
         self.lat_monitor = lat_monitor
@@ -67,16 +110,33 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self._open_trades: Dict[str, Dict] = {}  # Keyed by a unique trade ID
         self._bar_history: Deque[Dict[str, Any]] = deque(maxlen=200)  # For regime detection
 
+        self.cfg = config  # add near top of __init__
 
         self._sig_q: "asyncio.Queue[str]" = asyncio.Queue(maxsize=config.get("max_queue", 5000))
         self._writer_task: Optional[asyncio.Task] = None
         self._log_path = Path(log_path)
         self._numeric_keys: Optional[list[str]] = None
+        self.store = PositionStore()
+        #self.stop_mgr = StopManager(self.store)
+        #self.exit_mgr = ExitManager(self.store)
+        self._risk_mult = 1.0
+        self._halt_active = False
+        self._safety_q: "asyncio.Queue[SafetyAction]" = asyncio.Queue()
+        self.stop_mgr = StopManager(self.store)
+        self.exit_mgr = ExitManager(self.store)
+        # re‑instantiate SafetyFSM with channel
+        self.safety = SafetyFSM(config.get("safety", {}), channel=self._safety_q)
+        # background watcher
+        self._safety_task = asyncio.create_task(self._safety_watcher())
+        self.regime_profiles: dict = config.get("regime_profiles", {})
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
         """Launch background writer."""
         self._writer_task = asyncio.create_task(self._signal_writer())
+        self._safety_task = asyncio.create_task(self._safety_watcher())
+
+
 
     async def stop(self) -> None:
         """Flush queue & stop writer."""
@@ -85,6 +145,10 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             self._writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._writer_task
+        if hasattr(self, "_safety_task") and self._safety_task:
+            self._safety_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._safety_task
 
     # ------------------------------------------------------------------
     @timeit("execution_bar")
@@ -156,18 +220,28 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             logger.info("Safety halt active (%s); skipping bar for %s", self.safety.active_reason.name, sym)
             return
 
+        # 4. entry gate in on_bar()  (immediately after latency / safety check block)
+        if self._halt_active:
+            # manage existing positions only
+            self._process_stop_and_exit(sym, price, feats)
+            return
+
         # 1) Update ATR for post‑trade risk calculations --------------
         if atr > 0:
             self.risk_mgr.update_atr(sym, atr)
 
-        # 2) Base position sizing -------------------------------------
-        base_qty = self.risk_mgr.desired_size(sym, price)
-        if base_qty <= 0:
-            return
-
-         ## Detect Market Regime and check for Drift
+        ## Detect Market Regime and check for Drift
         bar_df = pd.DataFrame.from_records(list(self._bar_history))
         current_regime = self.regime_detector.update(bar_df)
+
+        prof = self.regime_profiles.get(current_regime.name, {})
+        size_mult = prof.get("size_mult", 1.0)
+
+        # 2) Base position sizing -------------------------------------
+        base_qty = int(self._risk_mult * size_mult *
+                       self.risk_mgr.desired_size(sym, price))
+        if base_qty <= 0:
+            return
 
         drift_status, metrics = self.drift_monitor.status()
         if drift_status == DriftStatus.RETRAIN_SIGNAL:
@@ -231,6 +305,49 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         # Store the initial prediction probability to compare against the actual outcome later
         self._open_trades[trade_id] = {"pred_prob": ev_res.mu}
 
+        # --- Staged Exits and Trailing Stop Logic (M2) ---
+
+        row = self.store.get_open_symbol(sym)
+        if row is not None:
+            _, _, side, _, _, stop_px, tp_remaining, _ = row
+            ema_fast_dist = feats.get("ema_fast_dist", 0.0)
+            vwap_dist = feats.get("vwap_dist", 0.0)
+            atr_now = feats.get("atr", 0.0)
+            # Update stop (tighten/widen if needed)
+            # after
+            new_stop = self.stop_mgr.update(sym, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+            if new_stop is not None:
+                # TODO: Submit OrderEvent to broker to modify stop (fill this in if live)
+                logger.info(f"Stop updated for {sym}: {stop_px} → {new_stop}")
+
+            # Check for staged exits
+            orderflow_delta = feats.get("orderflow_delta", 0.0)
+            reversal = False  # Fill in your candlestick reversal logic here if available
+            actions = self.exit_mgr.on_tick(sym, price, orderflow_delta,
+                                            reversal, profile=prof)
+            for act in actions:
+                if act["type"] == "TP":
+                    logger.info(f"Partial exit for {sym}: closed {act['qty']} at {price}")
+                    # TODO: Submit partial close order to broker here if needed
+                elif act["type"] == "FINAL":
+                    logger.info(f"Final exit for {sym}: closed at {price} ({act['reason']})")
+                    # TODO: Submit final close order to broker here if needed
+
+    def _process_stop_and_exit(self, sym: str, price: float, feats: dict) -> None:
+        row = self.store.get_open_symbol(sym)
+        if not row:
+            return
+        _, _, side, _, _, stop_px, _tp, _ = row
+        ema_fast_dist = feats.get("ema_fast_dist", 0.0)
+        vwap_dist = feats.get("vwap_dist", 0.0)
+        atr_now = feats.get("atr", 0.0)
+        prof = self.regime_profiles.get(self.regime_detector.current().name, {})
+
+        # after
+        new_stop = self.stop_mgr.update(sym, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+        orderflow_delta = feats.get("orderflow_delta", 0.0)
+        actions = self.exit_mgr.on_tick(sym, price, orderflow_delta, False, profile=prof)
+
     # ------------------------------------------------------------------
     async def on_fill(self, fill: Dict[str, Any]) -> None:
         """Pass fill info to risk & safety modules."""
@@ -254,6 +371,83 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         #symbol_vol = self.risk_mgr.atr(fill["symbol"])  # type: ignore[arg-type]
         #self.safety.register_fill(trade_loss=-pnl, symbol_volatility=symbol_vol)
 
+
+
+    # ------------------------------------------------------------------
+    async def handle_signal(self, signal: "TradeSignal") -> None:
+        """
+        Convenience entry-point for unit-tests and any caller that already
+        has a TradeSignal.  It converts the signal to a minimal *bar* dict
+        and re-uses the existing on_bar() pipeline so we don’t duplicate
+        logic.
+
+        It also records the position in self.store so tests (and the Safety
+        FSM) can inspect stop-loss levels and open quantities.
+        """
+
+        # ---- 0. sanity checks for M0 edge cases --------------------
+        if signal.atr <= 0:
+            raise ValueError("ATR must be positive")
+
+        # ---- 1. build synthetic bar ---------------------------------
+        bar = {
+            "symbol": signal.symbol,
+            "price": signal.price,
+            "adv": 1.0,                 # fallback – not used by RiskMgr
+            "features": {
+                "atr": signal.atr,
+                # add other numeric feats here if EVEngine expects them
+            },
+        }
+
+        # ---- 2. invoke existing logic -------------------------------
+        await self.on_bar(bar)
+
+        # ---- 3. replicate OrderBuilder logic for tests --------------
+        stop_dist = signal.atr * self.risk_mgr.atr_multiplier
+        stop_px = signal.price - stop_dist if signal.side == "BUY" else signal.price + stop_dist
+        qty = self.risk_mgr.desired_size(signal.symbol, signal.price)
+
+        # Guard against non-positive qty (e.g. equity=0 test case)
+        if qty <= 0:
+            raise ValueError("Position size computed as zero (check equity or ATR).")
+
+        tp2_price = (
+            signal.price * (1 + ExitManager.TP2_PCT)
+            if signal.side == "BUY"
+                else signal.price * (1 - ExitManager.TP2_PCT))
+        # ---- 4. persist position in PositionStore -------------------
+        self.store.add_position(
+            signal.id,
+            signal.symbol,
+            signal.side,
+            qty,
+            entry_px=signal.price,
+            stop_px=stop_px,
+            tp_remaining=tp2_price,          # placeholder – will shrink in M2
+        )
+
+        # Register entry ATR for stop logic
+        self.stop_mgr.register_position(signal.symbol, signal.atr)
+
+
+    # ------------------------------------------------------------------
+    async def _safety_watcher(self):
+        while True:
+            action = await self._safety_q.get()
+            # log to store + blotter
+            self.store.add_safety(action)
+            with self._log_path.open("a", buffering=1) as fp:
+                fp.write(f"SAFETY,{action.action},{action.reason},{action.timestamp.isoformat()}\n")
+            if action.action == "HALT":
+                self._halt_active = True
+            elif action.action == "RESUME":
+                self._halt_active = False
+                self._risk_mult = self.cfg.get("reduced_size_factor", 0.5)
+            elif action.action == "SIZE_DOWN":
+                self._risk_mult *= 0.5
+            self._safety_q.task_done()
+
     # ------------------------------------------------------------------
     @timeit("signal_writer")
     async def _signal_writer(self) -> None:
@@ -261,5 +455,10 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         with self._log_path.open("a", buffering=1) as fp:
             while True:
                 line = await self._sig_q.get()
-                fp.write(line + "\n")
+                lat_ms = latency_monitor.mean("execution_bar")
+                fp.write(f"{line},{lat_ms:.3f}\n")
+
                 self._sig_q.task_done()
+
+
+

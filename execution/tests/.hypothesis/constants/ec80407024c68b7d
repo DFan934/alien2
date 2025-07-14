@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\path_cluster_engine.py
+# hypothesis_version: 6.135.17
+
+[0.1, 1.0, 300, '.', 'ANY', 'PathClusterEngine', 'U', 'U10', 'auto', 'centers.npy', 'cluster_stats.npz', 'features', 'h', 'mean', 'meta.json', 'mu', 'n_clusters', 'r', 'regime', 'sha', 'sklearn_version', 'utf-8', 'var', 'var_down', 'w', '|']

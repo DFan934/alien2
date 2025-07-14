@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\tx_cost\__init__.py
+# hypothesis_version: 6.135.17
+
+[1e-06, 9e-05, 0.002, 0.01, 1.0, 2.0, 100.0, 'BaseCostModel', 'BasicCostModel', 'estimate']

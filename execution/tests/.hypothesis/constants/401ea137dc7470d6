@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\execution\safety.py
+# hypothesis_version: 6.135.17
+
+[0.0, 10.0, 250.0, 300, 900, 7200, 28800, 'DAILY_LOSS', 'HALT', 'HaltReason', 'INTRADAY_DRAWDOWN', 'MICRO_HALT', 'SINGLE_TRADE_LOSS', 'SIZE_DOWN', 'SafetyFSM', 'VOLATILITY_HALT', 'account_equity', 'daily_loss_pct', 'latency_ms', 'vix_spike_pct', 'volatility']

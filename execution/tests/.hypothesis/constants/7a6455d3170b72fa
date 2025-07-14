@@ -1,0 +1,4 @@
+# file: C:\Users\donav\Downloads\TheFinalProject5\prediction_engine\distance_calculator.py
+# hypothesis_version: 6.135.17
+
+[1e-12, 128, 'DistanceCalculator', 'Invalid k value', 'Q must be 2-D', '_ann_backend', '_index', '_inv_cov', '_metric', '_ref', '_rf_w', 'euclidean', 'mahalanobis', 'r', 'rf_weighted', 'sklearn', 'weights.npy']
