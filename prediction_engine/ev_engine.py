@@ -154,7 +154,7 @@ class EVEngine:
         regime_curves: Dict[str, CurveParams] | None = None,
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
-        residual_threshold: float = 1e-3,  # NEW: max acceptable synth residual
+        residual_threshold: float = 0.001,  # NEW: max acceptable synth residual
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
 
             cov_inv: np.ndarray | None = None,
@@ -298,9 +298,20 @@ class EVEngine:
         """NEW: Generate recency weights based on the current market regime."""
         #curve = self.regime_curves.get(regime.name.lower())
         # Allow either lower- or upper-case keys ("trend" / "TREND")
-        curve = (self.regime_curves.get(regime.name.lower())
-                or self.regime_curves.get(regime.name.upper())
-                or self.regime_curves.get(regime.name.capitalize()))
+
+        # ─── If no regime filtering, use uniform recency weights ───
+        if regime is None:
+            # uniform weights when skipping regime curves
+            return np.ones(n_points, dtype=np.float32)
+
+        curve = (
+             self.regime_curves.get(regime.name.lower())
+            or self.regime_curves.get("all")
+                )
+
+        #curve = (self.regime_curves.get(regime.name.lower())
+        #        or self.regime_curves.get(regime.name.upper())
+        #        or self.regime_curves.get(regime.name.capitalize()))
         if not curve:
             return np.ones(n_points)  # Fallback to uniform weights
 
@@ -310,7 +321,11 @@ class EVEngine:
     # Core API
     # ------------------------------------------------------------------
 
-    def evaluate(self, x: NDArray[np.float32], adv_percentile: float | None = None, *, half_spread: float | None = None, regime: MarketRegime = MarketRegime.RANGE) -> EVResult:  # noqa: N802
+    def evaluate(self, x: NDArray[np.float32],
+                 adv_percentile: float | None = None,
+                 *,
+                 half_spread: float | None = None,
+                 regime: MarketRegime | None = None) -> EVResult:  # noqa: N802
         """Return expected‑value statistics for one live feature vector."""
         x = np.ascontiguousarray(x, dtype=np.float32)
         if x.ndim != 1:
@@ -434,10 +449,13 @@ class EVEngine:
         sig2_down = alpha ** 2 * var_down_syn + (1 - alpha) ** 2 * var_down_k
 
 
-        if adv_percentile is None:
-            liquidity_mult = 1.0
-        else:  # piece‑wise linear: 1× below 5 % ADV  → 1.5× at 20 %
-            liquidity_mult = 1.0 + 0.5 * min(max((adv_percentile - 5) / 15, 0.0), 1.0)
+        #if adv_percentile is None:
+        #    liquidity_mult = 1.0
+        #else:  # piece‑wise linear: 1× below 5 % ADV  → 1.5× at 20 %
+        #    liquidity_mult = 1.0 + 0.5 * min(max((adv_percentile - 5) / 15, 0.0), 1.0)
+
+        # Always use flat volatility during debugging
+        liquidity_mult = 1.0
 
         sig2 *= liquidity_mult
         sig2_down *= liquidity_mult

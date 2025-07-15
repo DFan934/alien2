@@ -168,6 +168,3 @@ class PositionStore:
         return self._conn.execute(
             "SELECT signal_id, symbol, side, qty, entry_px, stop_px, tp_remaining, opened_at FROM positions"
         ).fetchall()
-
-
-

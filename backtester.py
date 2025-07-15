@@ -69,12 +69,22 @@ class Backtester:
 
             # 5.3 Generate signal for NEXT bar
             x_vec = row[self.pc_cols].to_numpy(dtype=np.float32)
-            ev_res = ev.evaluate(x_vec, adv_percentile=10.0)
+            ev_res = ev.evaluate(x_vec, adv_percentile=10.0, regime=None, half_spread=None)
 
             # Simplified sizing for this example
-            qty = risk.desired_size(cfg["symbol"], row["open"])
+            #qty = risk.desired_size(cfg["symbol"], row["open"])
 
-            if qty != 0:
+            #if qty != 0:
+            #    broker.queue_order(cfg["symbol"], qty)
+
+            # Use the EVEngine’s Kelly‐fraction to size the trade:
+            # Allocate position_size × (current equity) in dollars,
+            # then convert to a share quantity at next‐bar open.
+            current_cap = risk.account_equity + mtm
+            dollar_allocation = ev_res.position_size * current_cap
+            qty = int(dollar_allocation // row["open"])
+
+            if qty > 0:
                 broker.queue_order(cfg["symbol"], qty)
 
             # --- 3. Record Equity ---
@@ -86,7 +96,12 @@ class Backtester:
                 "unrealised_pnl": mtm,
                 "qty_next_bar": qty,
                 "mu": ev_res.mu,
-                "sigma_sq": ev_res.sigma
+                "sigma_sq": ev_res.sigma,
+                "residual": ev_res.residual,
+                "position_size": ev_res.position_size,
+                "open": row["open"],
+                "close": row["close"],
+                "cluster_id": ev_res.cluster_id,
             })
 
         log.info("Backtest loop finished.")
