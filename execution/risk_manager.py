@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 
 @dataclass
@@ -17,12 +17,26 @@ class RiskManager:
     atr_multiplier: float = 1.5
     safety_fsm: "Optional[object]" = None  # lazy import
 
+    # ── for process_fill PnL bookkeeping ────────────────────────────────────
+    position_size: float = field(default=0.0, init=False)
+    avg_entry_price: float = field(default=0.0, init=False)
+    max_drawdown: float = field(default=0.0, init=False)
+
     _symbol_atr: Dict[str, float] = field(default_factory=dict, init=False)
     _peak_equity: float = field(init=False)
+
+
+
+    _open_positions: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False)
+
 
     # --------------------- lifecycle ----------------------------------------
     def __post_init__(self):
         self._peak_equity = self.account_equity
+        # track live PnL state
+        self.position_size: float = 0.0
+        self.avg_entry_price: float = 0.0
+        self.max_drawdown: float = 0.0
 
     # --------------------- real‑time updates ---------------------------------
     def update_atr(self, symbol: str, atr: float):
@@ -76,6 +90,71 @@ class RiskManager:
     def position_value_at_risk(self, entry_px: float, stop_px: float, qty: int) -> float:
         """Absolute dollar risk of an open position."""
         return abs(entry_px - stop_px) * qty
+
+
+
+
+
+    def process_fill(
+        self,
+        fill: dict | float,
+        fill_size: float | None = None,
+        fill_side: str | None = None,
+        trade_id: str | None = None,
+    ) -> tuple[bool, float, str]:
+        """
+        Handle a fill event and update position, PnL, equity & drawdown.
+
+        Accept either:
+          • fill dict with keys 'price','size','side','trade_id'
+          • legacy args (fill_price, fill_size, fill_side[, trade_id])
+
+        Returns:
+          (is_trade_closed, realized_pnl, trade_id)
+        """
+        # unpack dict vs. positional
+        if isinstance(fill, dict):
+            data = fill
+            price = float(data["price"])
+            size  = float(data["size"])
+            side  = data["side"]
+            tid   = data.get("trade_id", "")
+        else:
+            price = float(fill)
+            size  = float(fill_size or 0.0)
+            side  = fill_side or ""
+            tid   = trade_id or ""
+
+        realized_pnl = 0.0
+        # BUY increases position
+        if side.lower() == "buy":
+            total_cost = self.avg_entry_price * self.position_size + price * size
+            self.position_size += size
+            self.avg_entry_price = total_cost / self.position_size
+        # SELL closes position
+        elif side.lower() == "sell":
+            if self.position_size <= 0:
+                raise ValueError("No position to sell")
+            realized_pnl = (price - self.avg_entry_price) * size
+            self.position_size -= size
+            if self.position_size <= 0:
+                self.position_size    = 0.0
+                self.avg_entry_price = 0.0
+        else:
+            raise ValueError(f"Unknown fill_side: {side!r}")
+
+        # update equity & drawdown
+        self.account_equity += realized_pnl
+        self._peak_equity = max(self._peak_equity, self.account_equity)
+        drawdown = self._peak_equity - self.account_equity
+        self.max_drawdown = max(self.max_drawdown, drawdown)
+
+        # in process_fill, after you compute `realized_pnl`:
+        self.last_loss = max(0.0, -realized_pnl)
+        self.day_pl = getattr(self, "day_pl", 0.0) + realized_pnl
+
+        is_closed = (self.position_size == 0.0)
+        return is_closed, realized_pnl, tid
 
 
 

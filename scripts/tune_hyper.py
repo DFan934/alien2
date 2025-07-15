@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# FILE: scripts/tune_hyper.py
+# FILE: scripts2/tune_hyper.py
 # ---------------------------------------------------------------------------
 """
 Bayesian search for EVEngine hyper-parameters (k, h, α).

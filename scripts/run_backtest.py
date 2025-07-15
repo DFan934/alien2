@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# FILE: prediction_engine/scripts/run_backtest.py
+# FILE: prediction_engine/scripts2/run_backtest.py
 # ---------------------------------------------------------------------------
 """
 Event-driven batch back-test of EVEngine on historical OHLCV bars.
@@ -15,9 +15,8 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-import numpy as np
 import pandas as pd
 
 from feature_engineering.pipelines.core import CoreFeaturePipeline
@@ -25,8 +24,8 @@ from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel        # NEW
 from execution.risk_manager import RiskManager
 from prediction_engine.testing_validation.backtester import BrokerStub #NEW
-from scripts.scripts.rebuild_artefacts import rebuild_if_needed   #  NEW
-
+from scripts.rebuild_artefacts import rebuild_if_needed   #  NEW
+from backtester import Backtester
 
 # Keep only PCA feature columns (produced by CoreFeaturePipeline)
 def _pca_cols(df: pd.DataFrame) -> list[str]:
@@ -39,6 +38,7 @@ def _pca_cols(df: pd.DataFrame) -> list[str]:
 CONFIG: Dict[str, Any] = {
     # raw minute-bar CSV (Date, Time, Open, High, Low, Close, Volume)
     "csv": "raw_data/RRC.csv",
+    "parquet_root":"parquet",
     "symbol": "RRC",
     "start": "1998-08-26",
     "end":   "1998-11-26",
@@ -61,17 +61,23 @@ CONFIG: Dict[str, Any] = {
 
 def _resolve_path(path_like: str | Path) -> Path:
     """Resolve path relative to project root if not absolute."""
-    p = Path(path_like).expanduser().resolve()
+    # 1) absolute or cwd-relative
+    p = Path(path_like).expanduser()
     if p.exists():
-        return p
-    raise FileNotFoundError(path_like)
+        return p.resolve()
+    # 2) try relative to the repository root (two levels up)
+    repo_root = Path(__file__).parents[1]
+    alt = (repo_root / path_like).expanduser()
+    if alt.exists():
+        return alt.resolve()
+    raise FileNotFoundError(f"Could not find {path_like!r} in CWD or under {repo_root!s}")
 
 
 
 # ────────────────────────────────────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────────────────────────────────────
-def run(cfg: Dict[str, Any]) -> None:
+def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(
         level=logging.INFO, format="[%(@levelname)s] %(message)s", stream=sys.stdout
     )
@@ -129,14 +135,29 @@ def run(cfg: Dict[str, Any]) -> None:
     # 3 ─ Load EVEngine artefacts
     art_dir = _resolve_path(cfg["artefacts"])
 
+    # resolve parquet directory (same repo root logic)
+    pq_root = _resolve_path(cfg.get("parquet_root", "parquet"))
+
+    # if it contains a "symbol=…" subfolder, use that (so we don't include schema.json)
+    sym_dir = pq_root / f"symbol={cfg['symbol']}"
+    if sym_dir.exists() and sym_dir.is_dir():
+        pq_root = sym_dir
+
+    # ── convert start/end to real Timestamps for Parquet filtering ─────
+    from pandas import to_datetime
+    start_ts = to_datetime(cfg["start"])
+    end_ts = to_datetime(cfg["end"])
+
+
     rebuild_if_needed(
         artefact_dir=cfg["artefacts"],
-        parquet_root="parquet/minute_bars",  # <-- adjust to your dataset root
+        parquet_root = str(pq_root),  # ← pass the resolved path, not the literal key
         symbols=[cfg["symbol"]],
-        start=cfg["start"],
-        end=cfg["end"],
+        start = start_ts,
+        end = end_ts,
         n_clusters=64,
     )
+
 
 
     ev = EVEngine.from_artifacts(art_dir)
@@ -200,7 +221,24 @@ def run(cfg: Dict[str, Any]) -> None:
     #)
 
     # 5 ─ Event loop
-    rows_out: List[Dict[str, Any]] = []
+    bt = Backtester(feats, cfg)  # Pass the prepared DataFrame
+
+    eq_curve = bt.run()
+
+    # Save
+    out_path = Path(cfg["out"])
+    eq_curve.to_csv(out_path, index=False)
+
+    # ** Print a nice summary before returning **
+    final_eq = float(eq_curve["equity"].iloc[-1])
+    total_ret = 100 * (final_eq / cfg["equity"] - 1)
+    log.info("Backtest complete.  Equity curve → %s", out_path)
+    log.info("  Final equity: $%.2f   Total return: %.2f%%   Bars: %d",
+             final_eq, total_ret, len(eq_curve))
+
+    return eq_curve
+
+    '''rows_out: List[Dict[str, Any]] = []
 
     for i, row in feats.iterrows():
         bar = {
@@ -263,7 +301,10 @@ def run(cfg: Dict[str, Any]) -> None:
         out_df["equity"].iloc[-1],
         (out_df["equity"].iloc[-1] / cfg["equity"] - 1) * 100,
         len(out_df),
-    )
+    )'''
+
+
+__all__ = ["run", "CONFIG"]
 
 
 if __name__ == "__main__":

@@ -1,15 +1,15 @@
 # ---------------------------------------------------------------------------
-# FILE: scripts/run_scanner.py
+# FILE: scripts2/run_scanner.py
 # ---------------------------------------------------------------------------
 """Command‑line entry‑point to run the scanner in *live* or *backtest* mode.
 
 Example invocations:
     # Live (bars fed by another process)
-    python -m scripts.run_scanner --mode live --redis redis://localhost:6379/0 \
+    python -m scripts2.run_scanner --mode live --redis redis://localhost:6379/0 \
         --parquet-root parquet/scanner_events
 
     # Back‑test from already engineered minute Parquet
-    python -m scripts.run_scanner --mode backtest --parquet parquet/minute/AAPL_2023.parquet \
+    python -m scripts2.run_scanner --mode backtest --parquet parquet/minute/AAPL_2023.parquet \
         --symbol AAPL
 """
 from __future__ import annotations

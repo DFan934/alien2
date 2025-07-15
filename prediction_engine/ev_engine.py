@@ -65,12 +65,15 @@ class EVResult:
     sigma: float  # full variance (σ²)
     variance_down: float  # downside variance for Sortino / Kelly denom
     beta: NDArray[np.float32] = field(repr=False)
+    residual: float
+
     cluster_id: int  # closest centroid index
     outcome_probs: Dict[str, float] = field(default_factory=dict)   # flat dict
     #regime_curves: Dict[str, CurveParams] | None = None,
     position_size: float = 0.0
     drift_ticket: int = -1            # NEW – link to DriftMonitor
     # NEW – Kelly size
+
 
 
 
@@ -151,8 +154,10 @@ class EVEngine:
         regime_curves: Dict[str, CurveParams] | None = None,
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
+        residual_threshold: float = 1e-3,  # NEW: max acceptable synth residual
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
-        cov_inv: np.ndarray | None = None,
+
+            cov_inv: np.ndarray | None = None,
         rf_weights: np.ndarray | None = None,
         k: int | None = None,
         cost_model: BasicCostModel | None = None,
@@ -166,6 +171,9 @@ class EVEngine:
         self.h = float(h)
         self.alpha = float(blend_alpha)
         self.lambda_reg = float(lambda_reg)  # NEW
+        # NEW: threshold for acceptable synth residual
+        self.residual_threshold = float(residual_threshold)
+
         self.k_max = k or 32  # fair default; will be density‑capped later
         self.metric = metric
         # Build distance helper – no external cov_inv needed (DistanceCalculator
@@ -365,15 +373,49 @@ class EVEngine:
         # 3. Synthetic analogue via inverse‑difference weights
         # ------------------------------------------------------------
         delta_mat = self.centers[idx] - x  # (k, d)
-        beta = AnalogueSynth.weights(delta_mat, -x)
+        # compute inverse-difference weights plus fit residual
+        beta, residual = AnalogueSynth.weights(
+            delta_mat,
+            -x,
+            var_nn=self.var[idx],
+            lambda_ridge=self.lambda_reg,
+        )
+
+        import logging
+        # If fit residual is too high, fallback to pure kernel EV
+        if residual > self.residual_threshold:
+            logging.getLogger(__name__).warning(
+                "[EVEngine] high synth residual %.3g > %.3g; using kernel-only EV",
+                residual, self.residual_threshold
+            )
+            # degenerate β: pick nearest neighbour only
+            beta = np.zeros_like(beta)
+            beta[0] = 1.0
+            mu_syn = mu_k
+            var_syn = var_k
+            var_down_syn = var_down_k
+        else:
+            # standard synthetic‐analogue path
+            mu_syn = float(beta @ self.mu[idx])
+            mu_syn = (1.0 - self.lambda_reg) * mu_syn + self.lambda_reg * float(self.mu.mean())
+
+            # ensemble meta-model override
+            if hasattr(self, "_meta_model") and self._meta_model is not None:
+                feat_meta = np.array([[mu_syn, mu_k, var_syn := float(beta @ self.var[idx]), var_k]])
+                mu_meta = float(self._meta_model.predict(feat_meta))
+                mu_syn = 0.3 * mu_meta + 0.7 * mu_syn
+
+            var_syn = float(beta @ self.var[idx])
+            var_down_syn = float(beta @ self.var_down[idx])
+
 
         # ▶ NEW: variance‑weighted β – favour low‑risk neighbours ◀
-        var_arr = np.maximum(self.var[idx], 1e-12)
+        '''var_arr = np.maximum(self.var[idx], 1e-12)
         beta /= var_arr  # down‑weight high‑variance clusters
         beta = np.maximum(beta, 0.0)
-        beta /= beta.sum()  # renormalise to Σβ = 1
+        beta /= beta.sum()  # renormalise to Σβ = 1'''
 
-        mu_syn = float(beta @ self.mu[idx])
+        '''mu_syn = float(beta @ self.mu[idx])
         mu_syn = (1.0 - self.lambda_reg) * mu_syn + self.lambda_reg * float(self.mu.mean()) #NEW
 
         # ---- ensemble meta-model override ----------------------------------
@@ -384,7 +426,7 @@ class EVEngine:
 
 
         var_syn = float(beta @ self.var[idx])  # <— one-liner
-        var_down_syn = float(beta @ self.var_down[idx])
+        var_down_syn = float(beta @ self.var_down[idx])'''
 
         alpha = self.alpha
         mu = alpha * mu_syn + (1 - alpha) * mu_k
@@ -456,7 +498,17 @@ class EVEngine:
             from threading import Thread
             Thread(target=_kickoff_retrain, daemon=True).start()
 
-        return EVResult(mu_net, sig2, sig2_down, beta, int(idx[0]), blended_probs, pos_size, ticket_id)
+        return EVResult(
+            mu_net,  # mu
+            sig2,  # sigma
+            sig2_down,  # variance_down
+            beta,  # beta array
+            residual,  # residual
+            int(idx[0]),  # cluster_id
+            blended_probs,  # outcome_probs
+            pos_size,  # position_size
+            ticket_id  # drift_ticket
+        )
 
 
 # ---------------------------------------------------------------------------

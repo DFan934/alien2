@@ -1,11 +1,11 @@
 # -------------------------------------------------------------
-# File: scripts/run_live_pipeline.py  (UPDATED)
+# File: scripts2/run_live_pipeline.py  (UPDATED)
 # -------------------------------------------------------------
 """End‑to‑end live pipeline launcher.
 
 With sensible defaults bundled in, you can simply run:
 
-    python scripts/run_live_pipeline.py
+    python scripts2/run_live_pipeline.py
 
 and the script will spin up:
   • ScannerLoop (gap + RVOL + momentum detectors)

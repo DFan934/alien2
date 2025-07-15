@@ -15,7 +15,7 @@ from scanner.recorder import DataGroupBuilder
 from scanner.utils import time_align_minute
 
 # ────────────────────────────────────────────────────────────────────────
-# CONFIG  –  EDIT HERE ONCE, THEN  python scripts/parallel_backtest.py
+# CONFIG  –  EDIT HERE ONCE, THEN  python scripts2/parallel_backtest.py
 # ────────────────────────────────────────────────────────────────────────
 CONFIG: Dict[str, object] = {
     # Raw hive-partitioned minute parquet dataset (symbol=…/year=…/month=…)

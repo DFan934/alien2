@@ -20,7 +20,7 @@ def test_nightly_calibrate_smoke(monkeypatch):
         pnl.to_csv(tmp / "data/pnl_by_regime" / f"{reg}.csv")
 
     monkeypatch.chdir(tmp)
-    mod = importlib.import_module("scripts.nightly_calibrate")
+    mod = importlib.import_module("scripts2.nightly_calibrate")
     mod.main()
 
     for reg in ("trend", "range", "volatile", "global"):

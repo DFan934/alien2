@@ -354,18 +354,19 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         """MODIFIED: Pass fill info and update drift monitor on closed trades."""
         # This assumes a more complex risk_manager that tracks trades
         # and tells us when a trade is closed and what its PnL is.
+        """Pass fill info to risk & safety modules, and update drift monitor."""
+        # process the fill through RiskManager → (closed_flag, pnl, trade_id)
         is_trade_closed, pnl, trade_id = self.risk_mgr.process_fill(fill)
 
+          # register the realized PnL with the Safety FSM
         self.safety.register_trade(pnl)
 
-        # NEW: Update drift monitor with the outcome of the closed trade
+          # on full-close, update the DriftMonitor with predicted vs actual outcome
+
         if is_trade_closed and trade_id in self._open_trades:
             trade_info = self._open_trades.pop(trade_id)
             outcome = pnl > 0
             self.drift_monitor.update(trade_info["pred_prob"], outcome)
-
-
-
         #is_trade_closed, pnl, trade_id = self.risk_mgr.process_fill(fill)
         #pnl = self.risk_mgr.process_fill(fill)  # returns trade P&L (could be 0 for partial)
         #symbol_vol = self.risk_mgr.atr(fill["symbol"])  # type: ignore[arg-type]

@@ -10,8 +10,8 @@ from typing import Dict, List
 import pandas as pd
 import numpy as np
 
-from scripts.scripts import run_backtest
-from scripts.scripts.run_backtest import run as run_bt
+from scripts import run_backtest
+from scripts.run_backtest import run as run_bt
 
 # ────────────────────────────────────────────────────────────────────────
 # Define your parameter grid  ⬇︎  (edit here)

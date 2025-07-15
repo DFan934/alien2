@@ -13,7 +13,7 @@
 #       recorder.py        # DataGroupBuilder – persists snapshots
 #       live_loop.py       # asyncio live runner
 #       backtest_loop.py   # historical iterator
-#   scripts/run_scanner.py # CLI entry‑point (live / backtest)
+#   scripts2/run_scanner.py # CLI entry‑point (live / backtest)
 # =============================================================
 
 # ---------------------------------------------------------------------------

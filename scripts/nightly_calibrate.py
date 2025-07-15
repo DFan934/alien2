@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# FILE: scripts/nightly_calibrate.py
+# FILE: scripts2/nightly_calibrate.py
 # ---------------------------------------------------------------------------
 """Run one WeightOptimizer per market-regime in parallel.
 

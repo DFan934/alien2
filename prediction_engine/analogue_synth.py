@@ -29,7 +29,7 @@ Place this file in  ``prediction_engine/analogue_synth.py``.
 from typing import Tuple
 
 import numpy as np
-from numpy.linalg import lstsq, LinAlgError
+from numpy.linalg import lstsq, LinAlgError, norm
 
 try:
     from scipy.optimize import nnls  # type: ignore
@@ -49,7 +49,7 @@ class AnalogueSynth:
             *,
             var_nn: np.ndarray | None = None,
             lambda_ridge: float = 0.0,
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, float]:
         """Compute non‑negative weights that make ΔXᵀ·β ≈ target.
 
         Parameters
@@ -69,15 +69,22 @@ class AnalogueSynth:
         k, d = delta_mat.shape
         assert target_delta.shape == (d,), "target_delta dim mismatch"
 
+        # Quick uniform fallback when every delta and target is zero
+        if np.allclose(delta_mat, 0.0) and np.allclose(target_delta, 0.0):
+            beta = np.full(k, 1.0 / k, dtype=float)
+            return beta.astype(np.float32, copy=False), 0.0
+
+
         # --------------------------------------------------------------
         # 1. Clamp neighbour count if k > d (avoids singular ΔXᵀ matrix)
         # --------------------------------------------------------------
-        if k > d and lambda_ridge == 0.0:  # ridge also cures singularity
+        # 1. Clamp neighbour count only when no SciPy (avoids singular ΔXᵀ for lstsq fallback)
+        '''if k > d and lambda_ridge == 0.0 and not _HAS_SCIPY:
             keep = d
             delta_mat = delta_mat[:keep, :]
             if var_nn is not None:
                 var_nn = var_nn[:keep]
-            k = keep
+            k = keep'''
 
 
 
@@ -89,8 +96,9 @@ class AnalogueSynth:
             if var_nn.shape != (k,):
                 raise ValueError("var_nn shape mismatch – expected (k,)")
             W = np.diag(1.0 / np.sqrt(var_nn + 1e-12))
-            A_aug = W @ A_aug
-            b_aug = W @ b_aug
+            # Weight neighbour‐columns by 1/σ before solving
+            A_aug = A_aug @ W
+            # leave b_aug unchanged
 
         # Optional ridge (adds √λ·I_k rows)
         if lambda_ridge > 0.0:
@@ -107,14 +115,39 @@ class AnalogueSynth:
                 β = np.full(k, 1.0 / k, dtype=float)  # last-ditch uniform
             β = np.maximum(β, 0.0)
 
-        β_sum = β.sum()
+        '''β_sum = β.sum()
         if β_sum > 0:
             β /= β_sum
 
         if β_sum < 1e-8 or np.isnan(β_sum):
             β = np.full(k, 1.0 / k, dtype=float)
 
-        return β.astype(np.float32, copy=False)
+        return β.astype(np.float32, copy=False)'''
+
+        total = β.sum()
+        if total > 0:
+            β /= total
+        else:
+            β = np.full(k, 1.0 / k, dtype=float)
+
+        # compute fit residual in original Δ-space
+        residual = float(norm(delta_mat.T.dot(β) - target_delta))
+
+        # If variances provided, re-weight to favor low-variance neighbours
+        if var_nn is not None:
+            if var_nn.shape != (k,):
+                raise ValueError("var_nn shape mismatch – expected (k,)")
+        # Divide by neighbour variance, then re-normalize
+            β = β / (var_nn + 1e-12)
+            β = np.maximum(β, 0.0)
+            total2 = β.sum()
+
+            if total2 > 0:
+                β /= total2
+            else:
+                β = np.full(k, 1.0 / k, dtype=float)
+
+        return β.astype(np.float32, copy=False), residual
 
     @staticmethod
     def synthesize(
