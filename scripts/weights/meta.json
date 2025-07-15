@@ -1,0 +1,12 @@
+{
+  "n_clusters": 64,
+  "features": [
+    "pca_1",
+    "pca_2",
+    "pca_3",
+    "pca_4",
+    "pca_5"
+  ],
+  "sha": "e233bd83d31e",
+  "sklearn_version": "sklearn cluster"
+}

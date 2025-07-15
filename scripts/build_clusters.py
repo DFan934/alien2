@@ -74,7 +74,15 @@ def main() -> None:
 
     # ─── Build a helper “date” column in feats_df ───
     # (this avoids any in‐place timezone gymnastics on your real timestamp)
-    feats_df['date'] = pd.to_datetime(feats_df['timestamp']).dt.normalize()
+    #feats_df['date'] = pd.to_datetime(feats_df['timestamp']).dt.normalize()
+
+    # ─── Drop any UTC tzinfo on timestamp so mapping to naive daily index works ───
+    if feats_df['timestamp'].dt.tz is not None:
+        feats_df['timestamp'] = feats_df['timestamp'].dt.tz_localize(None)
+    # ─── Build a helper “date” column in feats_df ───
+    # (normalize to midnight, matching daily_regimes.index)
+    feats_df['date'] = feats_df['timestamp'].dt.normalize()
+
 
     # ─── Now map from that date to the regime Series ───
     feats_df['regime'] = feats_df['date'].map(daily_regimes)

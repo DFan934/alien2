@@ -37,9 +37,21 @@ def rebuild_if_needed(
     artefact_dir = Path(artefact_dir)
     meta = _load_meta(artefact_dir / "meta.json")
 
+    #if meta:
+    #    LOG.info("[artefacts] Artefacts exist. Skipping rebuild.")
+    #    return
+    # Only skip if meta.json exactly matches our request params
     if meta:
-        LOG.info("[artefacts] Artefacts exist. Skipping rebuild.")
-        return
+        if (
+            meta.get("start") == str(start)
+            and meta.get("end") == str(end)
+            and meta.get("symbols") == list(symbols)
+            and meta.get("n_clusters") == n_clusters
+        ):
+            LOG.info("[artefacts] Artefacts up-to-date. Skipping rebuild.")
+            return
+        LOG.info("[artefacts] Artefacts outdated (range/symbols changed). Rebuilding…")
+
 
     LOG.warning("[artefacts] Artefacts missing — rebuilding artefacts …")
 
@@ -65,10 +77,23 @@ def rebuild_if_needed(
     daily_regimes = label_days(daily_df, RegimeParams())
 
     # Map daily regimes back to each minute bar in the features dataframe
-    feats_indexed = feats.set_index('timestamp')
-    minute_regimes = feats_indexed.index.normalize().map(daily_regimes)
+    #feats_indexed = feats.set_index('timestamp')
+    #minute_regimes = feats_indexed.index.normalize().map(daily_regimes)
 
-    y_categorical = minute_regimes.ffill().bfill()
+    #y_categorical = minute_regimes.ffill().bfill()
+
+    # Map daily regimes back to each minute bar in the features dataframe
+    feats_indexed = feats.set_index('timestamp')
+    normalized_dates = feats_indexed.index.normalize()
+
+    # Build a Series indexed by the minute timestamps
+    regime_series = pd.Series(
+        normalized_dates.map(daily_regimes).values,
+        index = feats_indexed.index,
+        name = 'regime'
+    )
+    # Forward/backward fill to eliminate any NaNs
+    y_categorical = regime_series.ffill().bfill()
 
     # 4) Identify the PCA columns from the result
     pca_cols = [c for c in feats.columns if c.startswith("pca_")]
