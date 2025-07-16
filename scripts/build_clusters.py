@@ -14,7 +14,6 @@ from prediction_engine.market_regime import label_days, RegimeParams
 # ----------------------------------------------------------------------
 # Resolve paths relative to the project root
 ROOT = Path(__file__).resolve().parents[1]
-# --- FIX: Point to the ROOT of the parquet data, not a subfolder ---
 RAW_PARQUET_DIR = ROOT / "parquet"
 WEIGHTS_DIR = ROOT / "weights"
 WEIGHTS_DIR.mkdir(exist_ok=True, parents=True)
@@ -22,27 +21,35 @@ WEIGHTS_DIR.mkdir(exist_ok=True, parents=True)
 SYMBOL = "RRC"
 RANDOM_STATE = 42
 MAX_ROWS = 25_000
+
+
 # ----------------------------------------------------------------------
 
-# ------------------------------------------------------------------
-# Replace load_raw_data in scripts/build_clusters.py
-# ------------------------------------------------------------------
 def load_raw_data(symbol: str) -> pd.DataFrame:
     """Load all raw minute bars for one symbol from partitioned Parquet."""
-    # Point directly at the symbol partition to avoid schema.json
     symbol_path = RAW_PARQUET_DIR / f"symbol={symbol}"
     if not symbol_path.exists():
         raise FileNotFoundError(f"No Parquet data found at {symbol_path}")
 
-    df = pd.read_parquet(symbol_path)          # recurse into year=/month=/
+    df = pd.read_parquet(symbol_path)
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
-
 
 
 def main() -> None:
     print(f"• Loading RAW minute-bar data for {SYMBOL}…")
     raw_df = load_raw_data(SYMBOL)
+
+    # --- FIX STARTS HERE ---
+    # The feature pipeline requires 'trigger_ts' and 'volume_spike_pct'.
+    # We must create them before calling the pipeline.
+    print("• Pre-processing data for feature pipeline...")
+    raw_df["trigger_ts"] = raw_df["timestamp"]
+
+    volume_ma = raw_df['volume'].rolling(window=20, min_periods=1).mean()
+    raw_df['volume_spike_pct'] = (raw_df['volume'] / volume_ma) - 1.0
+    raw_df['volume_spike_pct'] = raw_df['volume_spike_pct'].fillna(0.0)
+    # --- FIX ENDS HERE ---
 
     # ------------------------------------------------------------------
     # 1. Run the full feature engineering pipeline
@@ -58,7 +65,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Generate Regime Labels from Daily Resampled Data
     # ------------------------------------------------------------------
-    # 2. Generate daily regimes (unchanged)
+    print("• Generating and mapping market regime labels...")
     daily_df = (
         raw_df
         .set_index('timestamp')
@@ -68,46 +75,27 @@ def main() -> None:
     )
     daily_regimes = label_days(daily_df, RegimeParams())
 
-    # ─── Convert the regime‐index to plain, naive Timestamps ───
+    # Ensure timezone-naive timestamps for mapping
     if daily_regimes.index.tz is not None:
         daily_regimes.index = daily_regimes.index.tz_localize(None)
-
-    # ─── Build a helper “date” column in feats_df ───
-    # (this avoids any in‐place timezone gymnastics on your real timestamp)
-    #feats_df['date'] = pd.to_datetime(feats_df['timestamp']).dt.normalize()
-
-    # ─── Drop any UTC tzinfo on timestamp so mapping to naive daily index works ───
     if feats_df['timestamp'].dt.tz is not None:
         feats_df['timestamp'] = feats_df['timestamp'].dt.tz_localize(None)
-    # ─── Build a helper “date” column in feats_df ───
-    # (normalize to midnight, matching daily_regimes.index)
+
+    # Map daily regimes to each minute bar
     feats_df['date'] = feats_df['timestamp'].dt.normalize()
-
-
-    # ─── Now map from that date to the regime Series ───
     feats_df['regime'] = feats_df['date'].map(daily_regimes)
-
-    # ─── Fill through any holes ───
-    feats_df['regime'].ffill(inplace=True)
-    feats_df['regime'].bfill(inplace=True)
-
-    print(f"  → {feats_df['regime'].isna().sum()} missing regimes (should be 0)")
-
-    # ─── (Optionally) drop the helper column when you’re done ───
+    feats_df['regime'] = feats_df['regime'].ffill().bfill()
     feats_df.drop(columns=['date'], inplace=True)
-
-    print("  → Regime labels generated and mapped.")
+    print(f"  → {feats_df['regime'].isna().sum()} missing regimes (should be 0)")
 
     # ------------------------------------------------------------------
     # 3. Compute forward return and prepare final data for clustering
     # ------------------------------------------------------------------
-
-    # Ensure both timestamp columns are timezone‐naive, so merge will work
-    feats_df['timestamp'] = feats_df['timestamp'].dt.tz_localize(None)
-    raw_df['timestamp'] = raw_df['timestamp'].dt.tz_localize(None)
-
+    print("• Preparing final data for clustering...")
     # The feature pipeline might drop the 'close' column, so we merge it back
     if 'close' not in feats_df.columns:
+        if raw_df['timestamp'].dt.tz is not None:
+            raw_df['timestamp'] = raw_df['timestamp'].dt.tz_localize(None)
         feats_df = feats_df.merge(raw_df[['timestamp', 'close']], on='timestamp', how='left')
 
     feats_df["future_return"] = np.log(feats_df["close"].shift(-1) / feats_df["close"])
@@ -131,7 +119,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Build clusters & save artefacts
     # ------------------------------------------------------------------
-    k = max(3, min(15, len(X) // 2))
+    k = max(8, min(64, len(X) // 100))  # Adjusted k-selection logic
     print(f"• Building {k} clusters into {WEIGHTS_DIR}…")
 
     PathClusterEngine.build(

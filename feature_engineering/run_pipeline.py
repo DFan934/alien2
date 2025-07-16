@@ -20,7 +20,7 @@ from typing import List
 import pandas as pd
 import pyarrow.dataset as ds
 import pyarrow as pa
-
+from scanner.schema import FEATURE_ORDER
 from feature_engineering.output_writer import write_feature_dataset
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from feature_engineering.pipelines.dask_pipeline import DaskFeaturePipeline
@@ -89,6 +89,10 @@ def main() -> None:
     unnamed = [c for c in df.select_dtypes("number").columns if isinstance(c, int) or c == ""]
     for i, col in enumerate(unnamed, 1):
         df.rename(columns={col: f"feat_{i}"}, inplace=True)
+
+    # Reorder dataframe columns to canonical FEATURE_ORDER before writing
+    df = df[list(FEATURE_ORDER)]
+
 
     write_feature_dataset(df, output_root)
     logger.info("Saved features → %s", output_root)

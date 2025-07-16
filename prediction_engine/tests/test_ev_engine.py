@@ -41,3 +41,7 @@ def test_spread_penalty():
     wide  = ev.evaluate(np.array([1, 1], dtype=np.float32),
                         half_spread=0.05).mu
     assert wide < tight
+
+
+
+

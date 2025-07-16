@@ -10,14 +10,14 @@ Outputs
 • Console summary of cumulative P&L + risk metrics
 """
 from __future__ import annotations
-
+import pandas as pd
 import json
 import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
-import pandas as pd
+#import pandas as pd
 
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.ev_engine import EVEngine
@@ -47,7 +47,7 @@ CONFIG: Dict[str, Any] = {
     "end": "1998-11-26",
 
     # artefacts created by PathClusterEngine.build()
-    "artefacts": "weights",
+    "artefacts": "../weights",
 
     # capital & trading costs
     "equity": 100_000.0,
@@ -93,7 +93,7 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # logging.getLogger("prediction_engine.ev_engine").setLevel(logging.ERROR)
 
     log = logging.getLogger("backtest")
-
+    import pandas as pd
     # 1 ─ Load raw CSV
     csv_path = _resolve_path(cfg["csv"])
     df_raw = pd.read_csv(csv_path)
@@ -120,9 +120,28 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     if df_raw.empty:
         raise ValueError("Date filter returned zero rows")
 
+    # ------------------------------------------------------------------
+    #  Solution: Add the missing 'trigger_ts' column here
+    # ------------------------------------------------------------------
+    df_raw["trigger_ts"] = df_raw["timestamp"]
+
+    # ------------------------------------------------------------------
+    #  Solution: Calculate and add the 'volume_spike_pct' column
+    # ------------------------------------------------------------------
+    # Calculate a 20-period moving average of volume
+    volume_ma = df_raw['volume'].rolling(window=20, min_periods=1).mean()
+    # Calculate the spike as a percentage change from the moving average
+    df_raw['volume_spike_pct'] = (df_raw['volume'] / volume_ma) - 1.0
+    # Fill any initial NaN values (from the rolling window) with 0.0
+    #df_raw['volume_spike_pct'].fillna(0.0, inplace=True)
+    # Fill any initial NaN values (from the rolling window) with 0.0
+    df_raw['volume_spike_pct'] = df_raw['volume_spike_pct'].fillna(0.0)
+
     # 2 ─ Feature engineering
     pipe = CoreFeaturePipeline(parquet_root=Path(""))  # in-mem
     feats, _ = pipe.run_mem(df_raw)
+
+
 
     # ------------------------------------------------------------------
     # keep only PCA columns (+ ids)  ────────────
@@ -139,10 +158,10 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     if ATR_COL not in feats.columns:
         feats[ATR_COL] = (
                 df_raw["high"]
-                .rolling(cfg["atr_period"])
+                .rolling(cfg['atr_period'])
                 .max()
-                - df_raw["low"].rolling(cfg["atr_period"]).min()
-        ).fillna(method="bfill")
+                - df_raw["low"].rolling(cfg['atr_period']).min()
+        ).bfill()
 
     # 3 ─ Load EVEngine artefacts
     art_dir = _resolve_path(cfg["artefacts"])
@@ -281,6 +300,16 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # average return *of the trades you actually took*:
     avg_ret = signals.loc[trade_mask, "ret1m"].mean()
     print("  Avg ret:    ", avg_ret)
+
+
+    from scripts.diagnostics import BacktestDiagnostics
+
+    diag = BacktestDiagnostics(
+        df=eq_curve,
+        raw=df_raw,
+        cfg=cfg
+    )
+    diag.run_all()
 
     plt.figure()
     plt.scatter(signals.mu, signals.ret1m, s=5, alpha=0.3)

@@ -46,6 +46,8 @@ class DataGroupBuilder:
             self._redis = redis.from_url(redis_url, decode_responses=False)
         self._buf = []                # buffer for snapshots
         self._buffer_size = buffer_size
+        # track first-seen trigger timestamp per symbol
+        self.active_events: dict[str, pd.Timestamp] = {}
 
 
     # --------------------------------------------------
@@ -62,6 +64,13 @@ class DataGroupBuilder:
         snap = snapshot.copy()
         snap["symbol"] = symbol
         snap["timestamp"] = ts
+
+        # pull through any detector-computed context fields
+        # (detectors must set these on the snapshot Series)
+        snap["trigger_ts"] = snapshot.get("trigger_ts", ts)
+        snap["trigger_type"] = snapshot.get("trigger_type", None)
+        snap["volume_spike_pct"] = snapshot.get("volume_spike_pct", None)
+
         self._buf.append(snap)
         if len(self._buf) >= self._buffer_size:
             self._flush()
@@ -94,7 +103,11 @@ class DataGroupBuilder:
         df = pd.DataFrame(self._buf)
         # For demo, write a single Parquet file (real code could partition by symbol/month)
         out_file = self.parquet_root / "scanner_events.parquet"
-        df.to_parquet(out_file, append=True)
+
+        # write buffered snapshots to disk (overwrite or create new)
+        df.to_parquet(out_file, index=False)
+
+        #df.to_parquet(out_file, append=True)
         self._buf.clear()
 
     def flush(self):

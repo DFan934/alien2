@@ -61,6 +61,7 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         "_ann_backend",
         "_index",
         "_rf_w",
+        "_recency_w",
     )
 
     def __init__(
@@ -72,6 +73,7 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         ann_backend: str = "sklearn",
         eps: float = 1e-12,
         backend_kwargs: dict[str, Any] | None = None,
+        recency_weights: NDArray[np.float32] | None = None,
     ) -> None:
         if ref.ndim != 2:
             raise ValueError("ref must be a 2‑D array [n_reference, n_features]")
@@ -117,6 +119,9 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             # NOTE: self._ref stays *unchanged*  (no double-weighting)
         else:
             self._rf_w = None
+            # optional recency curve weights (same length as n_features)
+        self._recency_w = np.asarray(recency_weights,
+        dtype=np.float32) if recency_weights is not None else None
 
     # ------------------------------------------------------------------
     # Public API
@@ -157,9 +162,13 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             diff = Q[:, None, :] - self._ref[None, :, :]
             dist2 = np.sum(diff * diff * self._rf_w, axis=2, dtype=np.float32)
         else:  # Default to Euclidean if no indexer is used
+            #diff = Q[:, None, :] - self._ref[None, :, :]
+            #dist2 = np.sum(diff * diff, axis=2, dtype=np.float32)
             diff = Q[:, None, :] - self._ref[None, :, :]
+            # apply recency weights if provided
+            if self._recency_w is not None:
+                diff = diff * self._recency_w  # broadcast across rows
             dist2 = np.sum(diff * diff, axis=2, dtype=np.float32)
-
         # Partition and sort to get the top k results
         idx = np.argpartition(dist2, kth=k - 1, axis=1)[:, :k]
         part = np.take_along_axis(dist2, idx, axis=1)

@@ -44,6 +44,9 @@ _CALCULATORS = [
 _PREDICT_COLS = [
     "vwap_delta", "rvol_20d", "ema_9_dist", "ema_20_dist", "roc_10",
     "atr_14", "adx_14",
+    # trigger-context features:
+    "time_since_trigger_min",
+    "volume_spike_pct",
 ]
 
 class CoreFeaturePipeline:
@@ -81,6 +84,14 @@ class CoreFeaturePipeline:
             df = calc(df)
 
         df = df.ffill().bfill()
+
+        # ─── compute trigger context features ──────────────────────────────
+        # assumes snapshot had 'trigger_ts' and 'volume_spike_pct'
+        df["time_since_trigger_min"] = (
+            df["timestamp"] - df["trigger_ts"]
+        ).dt.total_seconds().div(60)
+        df["volume_spike_pct"] = df["volume_spike_pct"]
+
 
         # Select only the features to use for PCA
         features = df[_PREDICT_COLS].astype(np.float32)
@@ -155,6 +166,13 @@ class CoreFeaturePipeline:
             df = calc(df)
             logger.info("After %-12s %d rows", calc.__class__.__name__, len(df))
         df = df.ffill().bfill()
+
+        # ─── compute trigger context features ──────────────────────────────
+        df["time_since_trigger_min"] = (
+            df["timestamp"] - df["trigger_ts"]
+        ).dt.total_seconds().div(60)
+        df["volume_spike_pct"] = df["volume_spike_pct"]
+
         logger.info("After ffill/bfill: %d rows", len(df))
 
         features = df[_PREDICT_COLS].astype(np.float32)

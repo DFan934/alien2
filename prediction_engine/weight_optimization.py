@@ -8,7 +8,7 @@ ageing weights dynamically.  A curve is accepted only if
 ``test_sharpe >= 0.8 * train_sharpe`` to curb over‑fitting.
 """
 from __future__ import annotations
-
+#from .weight_optimization import CurveParams
 import concurrent.futures as cf
 import json
 import os
@@ -20,10 +20,38 @@ import numpy as np
 import optuna
 import pandas as pd
 from optuna.exceptions import TrialPruned
+from typing import Union
 
 
 
 RegimeT = Literal["trend", "range", "volatile", "global"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# In prediction_engine/weight_optimization.py, after the imports:
+# ──────────────────────────────────────────────────────────────────────────────
+
+from pathlib import Path
+import json
+
+def load_all_regime_curves(artefact_root: str | Path) -> dict[str, CurveParams]:
+    """
+    Scan artefact_root/regime=<name>/curve_params.json for every regime and
+    return a mapping { regime_name: CurveParams(...) }.
+    """
+    root = Path(artefact_root)
+    curves: dict[str, CurveParams] = {}
+    for regime_dir in root.glob("regime=*"):
+        name = regime_dir.name.split("=", 1)[1]  # “trend”, “range”, …
+        params_file = regime_dir / "curve_params.json"
+        if not params_file.is_file():
+            continue
+        data = json.loads(params_file.read_text(encoding="utf-8"))
+        # JSON layout: {"params": {family, tail_len, shape}, ...}
+        cp = CurveParams(**data["params"])
+        curves[name.lower()] = cp
+    return curves
+
 
 
 @dataclass(slots=True)
@@ -139,6 +167,25 @@ class WeightOptimizer:
             "test": sharpe_test,
         }
 
+    def load_weight_curves(
+        artefact_root: Union[str, Path],
+    ) -> Dict[RegimeT, CurveParams]:
+        """
+        Read all regime=<name>/curve_params.json under artefact_root and return
+        a dict mapping regime names to CurveParams.
+        """
+        root = Path(artefact_root)
+        curves: dict[RegimeT, CurveParams] = {}
+        for sub in root.glob("regime=*"):
+            regime = sub.name.split("=", 1)[1]
+            js = sub / "curve_params.json"
+            if not js.exists():
+                continue
+            data = json.loads(js.read_text(encoding="utf-8"))
+            params = CurveParams(**data["params"])
+            curves[regime] = params
+        return curves
+
     # ================= helpers ======================================
     def _score(self, p: CurveParams, pnl: pd.Series) -> Tuple[CurveParams, float]:
         """Sharpe ratio of *pnl* when weighted by curve *p*."""
@@ -150,6 +197,9 @@ class WeightOptimizer:
         ret = float(w @ pnl_slice.values)
         risk = float(np.sqrt(w @ (pnl_slice.values - ret) ** 2)) + 1e-9
         return p, ret / risk
+
+
+
 
     @staticmethod
     def _weights(n: int, p: CurveParams):
@@ -179,3 +229,31 @@ class WeightOptimizer:
             for shape in (0.5, 1, 2, 5)
         ]
 
+    def list_regimes(artefact_root: Path | str) -> list[str]:
+        """
+        +    Return the list of regime names for which
+        +    artefact_root/regime=<name>/curve_params.json exists.
+        +    """
+        root = Path(artefact_root)
+        return [
+            d.name.split("=", 1)[1]
+            for d in root.glob("regime=*")
+            if (d / "curve_params.json").exists()
+        ]
+
+
+def load_regime_curves(artefact_root: Path | str) -> dict[str, CurveParams]:
+    """
+    Load all CurveParams from
+    artefact_root/regime=<name>/curve_params.json
+    and return a mapping { name: CurveParams(...) }.
+    """
+    root = Path(artefact_root)
+    curves: dict[str, CurveParams] = {}
+    for d in root.glob("regime=*"):
+        f = d / "curve_params.json"
+        if not f.exists():
+            continue
+        payload = json.loads(f.read_text())
+        curves[d.name.split("=", 1)[1]] = CurveParams(**payload["params"])
+    return curves

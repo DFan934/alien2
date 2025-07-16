@@ -14,6 +14,7 @@ from typing import Any, Optional
 import mlflow  # noqa: F401 – only active if env-vars are set
 import numpy as np
 import pandas as pd
+from prediction_engine.weight_optimization import WeightOptimizer as wo
 
 from .models import ModelManager
 from .path_cluster_engine import PathClusterEngine
@@ -29,6 +30,16 @@ class RetrainingManager:
     def __init__(self, mm: ModelManager, drift_thresh: float):
         self.mm = mm
         self.drift_thresh = float(drift_thresh)
+        # ─── load recency curves on startup ────────────────────────
+        # assume weights were written to mm’s artefact directory
+        artefact_root = Path(mm.artefact_dir)  # if you track that path
+        self.recency_curves = wo.load_weight_curves(artefact_root / "weights")
+
+    def reload_curves(self):
+        """Re-load the JSON weight curves (e.g. after nightly run finishes)."""
+        artefact_root = Path(self.mm.artefact_dir) / "weights"
+        self.recency_curves = wo.load_weight_curves(artefact_root)
+
 
     # ------------------------------------------------------------------ #
     # Public API                                                          #

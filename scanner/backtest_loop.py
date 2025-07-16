@@ -14,6 +14,7 @@ import pandas as pd
 from .detectors import CompositeDetector
 from .recorder import DataGroupBuilder
 from .utils import time_align_minute
+from scanner.schema import FEATURE_ORDER
 
 __all__ = ["BacktestScannerLoop"]
 
@@ -39,6 +40,8 @@ class BacktestScannerLoop:
             if not mask.any():
                 continue
             for _, row in slice_df[mask].iterrows():
+                # Enforce canonical feature order for downstream pipelines
+                row = row.loc[list(FEATURE_ORDER)]
                 sym = row["symbol"]
                 self.builder.log_sync(ts, sym, row)  # <-- sync write
                 yield ts, sym, row
