@@ -15,18 +15,31 @@ class KellySizer:
     All sizing is *fraction of notional capital* (1 = 100 %).
     """
 
-    def __init__(self, f_max: float = 0.40, adv_cap_pct: float = 20.0) -> None:
+    def __init__(self,
+                 f_max: float = 0.40,
+                 adv_cap_pct: float | None = None) -> None:
         self.f_max      = float(f_max)
+        #self.adv_cap_pct = float(adv_cap_pct)
+        # allow YAML override; fall back to config defaults
+        from scanner.config import load as _load_cfg
+        cfg_liq = _load_cfg().get("liquidity", {})
+        adv_cap_pct = adv_cap_pct if adv_cap_pct is not None else cfg_liq.get("adv_cap_pct", 20.0)
         self.adv_cap_pct = float(adv_cap_pct)
-
     # ----------------------------------------------------------------
     def size(self, mu: float, var_down: float, adv_percentile: float | None) -> float:
         """Return recommended position size ∈ [0, f_max]."""
-        if mu <= 0.0 or var_down <= 0.0:
+        #if mu <= 0.0 or var_down <= 0.0:
+        #    return 0.0
+
+        # allow both long (µ>0) and short (µ<0)
+        if var_down <= 0.0:
             return 0.0
 
         f_raw = mu / (var_down + 1e-12)
-        f_raw = max(f_raw, 0.0)
+        #f_raw = max(f_raw, 0.0)
+
+        # clip raw fraction to [-f_max, +f_max]
+        f_raw = float(np.sign(f_raw) * min(abs(f_raw), self.f_max))
 
         # Hard Kelly clip
         f_kelly = min(f_raw, self.f_max)

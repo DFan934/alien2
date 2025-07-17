@@ -7,12 +7,18 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
-
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Any
+from prediction_engine.tx_cost import BasicCostModel
 
 @dataclass
 class RiskManager:
     account_equity: float
-    max_leverage: float = 2.0
+    # ─── RE‑ENABLED BRAKES ───────────────────────────────────────────    max_leverage: float = 2.0
+    max_leverage: float = 2.0 # notional / equity cap
+    max_kelly: float = 0.5 # Kelly fraction hard‑cap
+    adv_cap_pct: float = 0.20 # %‑of‑ADV liquidity cap
+    cost_model: Optional[BasicCostModel] = None
     risk_per_trade: float = 0.001  # 0.1 %
     atr_multiplier: float = 1.5
     safety_fsm: "Optional[object]" = None  # lazy import
@@ -56,13 +62,54 @@ class RiskManager:
         max_qty = math.floor(self.account_equity * self.max_leverage / price)
         return max(0, min(qty, max_qty))
 
-    def kelly_position(self, mu: float, variance_down: float, price: float, kelly_cap: float = 1.0) -> int:
-        if price <= 0 or variance_down <= 0 or mu <= 0:
+    def kelly_position(self,
+                       mu: float,
+                       variance_down: float,
+                       price: float,
+                       adv: float | None = None,) -> int:
+        # --- 1. SAFEGUARDS FIRST ---
+        # Exit immediately if any inputs are invalid for the formula.
+        # A non-positive mu means no expected profit.
+        # A near-zero variance is mathematically invalid for this formula.
+        # ── 1) SAFEGUARDS FIRST ────────────────────────────────────────────
+        import math, logging
+        # never size if equity is already corrupted
+        if not math.isfinite(self.account_equity) or self.account_equity <= 0:
+            logging.warning("kelly_position bail: bad account_equity=%r", self.account_equity)
             return 0
-        kelly_f = min(mu / (2 * variance_down), kelly_cap)
+        #if price <= 0 or variance_down <= 1e-9 or mu <= 0:
+        #    return 0
+
+        # Bail only on truly invalid inputs.  Tiny variance is *expected* now that
+        # labels are 1-bar log returns; floor it instead of zero-sizing.
+        if price <= 0 or not math.isfinite(variance_down):
+            return 0
+        var_eff = max(variance_down, 1e-8)  # <-- safety floor (tune)
+        kelly_f = min(mu / (2 * var_eff), self.max_kelly)
+
+        # --- 2. CALCULATIONS (only if inputs are safe) ---
+        # Now that inputs are validated, proceed with the Kelly formula.
+        #kelly_f = min(mu / (2 * variance_down), self.max_kelly)
         dollar_notional = kelly_f * self.account_equity
         max_notional = self.account_equity * self.max_leverage
-        qty = math.floor(min(dollar_notional, max_notional) / price)
+
+        #qty = math.floor(min(dollar_notional, max_notional) / price)
+
+        raw_qty = min(dollar_notional, max_notional) / price
+        # guard against any non‐finite result
+        if not math.isfinite(raw_qty):
+            logging.warning(
+            "kelly raw_qty non‐finite: %r (dollar_notional=%r, max_notional=%r, price=%r)",
+            raw_qty, dollar_notional, max_notional, price
+            )
+            return 0
+        qty = math.floor(raw_qty)
+
+        # --- 3. APPLY LIQUIDITY BRAKE ---
+        if adv is not None and adv > 0:
+            qty = min(qty, math.floor(adv * self.adv_cap_pct))
+
+        # Ensure final quantity is not negative
         return max(qty, 0)
 
     # --------------------- drawdown tracking ---------------------------------
@@ -144,7 +191,10 @@ class RiskManager:
             raise ValueError(f"Unknown fill_side: {side!r}")
 
         # update equity & drawdown
-        self.account_equity += realized_pnl
+        #self.account_equity += realized_pnl
+        # --- deduct cost ----------------------------------------------------
+        trade_cost = self.cost_model.cost(qty=size) if self.cost_model else 0.0
+        self.account_equity += realized_pnl - trade_cost
         self._peak_equity = max(self._peak_equity, self.account_equity)
         drawdown = self._peak_equity - self.account_equity
         self.max_drawdown = max(self.max_drawdown, drawdown)

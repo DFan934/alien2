@@ -1,0 +1,9 @@
+gap:
+  pct: 0.02           # 2 % gap up / down
+
+rvol:
+  thresh: 2.0         # ≥ 2× 20‑day average volume
+  lookback: 20
+
+liquidity:
+  adv_cap_pct: 20.0   # max 20 % ADV position

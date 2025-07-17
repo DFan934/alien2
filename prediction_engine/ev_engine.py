@@ -156,7 +156,8 @@ class EVEngine:
         regime_curves: Dict[str, CurveParams] | None = None,
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
-        residual_threshold: float = 0.001,  # NEW: max acceptable synth residual
+        #residual_threshold: float = 0.001,  # NEW: max acceptable synth residual
+        residual_threshold: float = 0.75,
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
 
             cov_inv: np.ndarray | None = None,

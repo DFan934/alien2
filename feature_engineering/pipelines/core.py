@@ -7,7 +7,8 @@ from __future__ import annotations
 import datetime as _dt
 from pathlib import Path
 from typing import List, Tuple
-
+from pathlib import Path
+import joblib
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -128,6 +129,39 @@ class CoreFeaturePipeline:
 
         return df_pca, pca_meta
 
+    @classmethod
+    def from_artifact_dir(cls, artefact_dir: Path) -> "CoreFeaturePipeline":
+        """
+        Reload the StandardScaler and PCA that were saved by
+        PathClusterEngine.build().
+        """
+        artefact_dir = Path(artefact_dir)
+        scaler = joblib.load(artefact_dir / "scaler.pkl")
+        pca = joblib.load(artefact_dir / "pca.pkl")
+        inst = cls(parquet_root=Path(""))  # dummy root
+        inst._scaler = scaler  # type: ignore[attr-defined]
+        inst._pca = pca  # type: ignore[attr-defined]
+        return inst
+
+    # -----------------------------------------------------------------------
+    # 🔄 Transform in‑memory DataFrame without re‑fitting
+    # -----------------------------------------------------------------------
+    def transform_mem(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply the saved scaler+PCA _without_ refitting.
+        """
+        X_raw = df[self.raw_feature_cols].to_numpy(dtype=np.float32)
+        X_scaled = self._scaler.transform(X_raw)  # type: ignore[attr-defined]
+        X_pca = self._pca.transform(X_scaled)  # type: ignore[attr-defined]
+        feats = pd.DataFrame(
+            X_pca,
+            columns=[f"pca_{i + 1}" for i in range(X_pca.shape[1])],
+            index=df.index,
+        )
+        feats["symbol"] = df["symbol"].values
+        feats["timestamp"] = df["timestamp"].values
+        return feats
+
     # ---------------------------------------------------------------------
     @timeit("pipeline‑run")
     def run(
@@ -213,4 +247,12 @@ class CoreFeaturePipeline:
         out["close"] = df["close"].values  # keep close so cluster builder can create y
 
         return out, pca_meta
+
+    # ---------------------------------------------------------------------------
+    # 💡 NEW: factory that loads the *frozen* preprocessing from an artefact dir
+    # ---------------------------------------------------------------------------
+
+
+
+
 

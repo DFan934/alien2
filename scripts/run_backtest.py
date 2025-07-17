@@ -10,6 +10,10 @@ Outputs
 • Console summary of cumulative P&L + risk metrics
 """
 from __future__ import annotations
+
+import asyncio
+
+import numpy as np
 import pandas as pd
 import json
 import logging
@@ -25,10 +29,13 @@ from prediction_engine.tx_cost import BasicCostModel  # NEW
 from execution.risk_manager import RiskManager
 from prediction_engine.testing_validation.backtester import BrokerStub  # NEW
 from scripts.rebuild_artefacts import rebuild_if_needed  # NEW
+from scanner.detectors import build_detectors        # ‹— add scanner import
 from backtester import Backtester
 from execution.manager import ExecutionManager
 from execution.metrics.report import load_blotter, pnl_curve, latency_summary
-
+from execution.manager import ExecutionManager
+from execution.risk_manager import RiskManager            # NEW
+from prediction_engine.tx_cost import BasicCostModel
 
 # Keep only PCA feature columns (produced by CoreFeaturePipeline)
 def _pca_cols(df: pd.DataFrame) -> list[str]:
@@ -54,7 +61,8 @@ CONFIG: Dict[str, Any] = {
     # "spread_bp": 2.0,          # half-spread in basis points
     # "commission": 0.002,       # $/share
     # "slippage_bp": 0.0,        # BrokerStub additional bp slippage
-
+    "max_kelly": 0.5,
+    "adv_cap_pct": 0.20,
     "spread_bp": 0.0,  # half-spread in basis points
     "commission": 0.0,  # $/share
     "slippage_bp": 0.0,  # BrokerStub additional bp slippage
@@ -85,7 +93,7 @@ def _resolve_path(path_like: str | Path) -> Path:
 # ────────────────────────────────────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────────────────────────────────────
-def run(cfg: Dict[str, Any]) -> pd.DataFrame:
+async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(
         level=logging.INFO, format="[%(@levelname)s] %(message)s", stream=sys.stdout
     )
@@ -120,6 +128,7 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     if df_raw.empty:
         raise ValueError("Date filter returned zero rows")
 
+
     # ------------------------------------------------------------------
     #  Solution: Add the missing 'trigger_ts' column here
     # ------------------------------------------------------------------
@@ -137,11 +146,33 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # Fill any initial NaN values (from the rolling window) with 0.0
     df_raw['volume_spike_pct'] = df_raw['volume_spike_pct'].fillna(0.0)
 
+    # ─── P2 Step 2: KPI sanity‑check & scan‑first pass-through ──────────
+    # prepare the prev_close column for gap detection
+    df_raw['prev_close'] = df_raw['close'].shift(1)
+
+    detector = build_detectors()
+
+    # This is the asynchronous call that needs 'await'
+    mask = await detector(df_raw)
+
+    pass_rate = mask.mean() * 100
+    print(f"[Scanner KPI] Bars passing filters: {mask.sum()} / {len(mask)} = {pass_rate:.2f}%")
+
+    # now only keep the bars that passed
+    df_raw = df_raw.loc[mask].reset_index(drop=True)
+    # ──────────────────────────────────────────────────────
+
+
+
     # 2 ─ Feature engineering
-    pipe = CoreFeaturePipeline(parquet_root=Path(""))  # in-mem
+    #pipe = CoreFeaturePipeline(parquet_root=Path(""))  # in-mem
+    #feats, _ = pipe.run_mem(df_raw)
+
+    # 2 ─ Feature engineering in‑memory (no external pickles needed)
+    from pathlib import Path
+    # instantiate the pure‑pandas pipeline & fit‐transform on this df
+    pipe = CoreFeaturePipeline(parquet_root=Path(""))
     feats, _ = pipe.run_mem(df_raw)
-
-
 
     # ------------------------------------------------------------------
     # keep only PCA columns (+ ids)  ────────────
@@ -152,6 +183,8 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     feats = feats[pc_cols + ["symbol", "timestamp"]]
     feats["open"] = df_raw["open"].values  # Attach open for execution logic
     feats["close"] = df_raw["close"].values
+
+
 
     # sanity: ensure ATR exists
     ATR_COL = f"atr{cfg['atr_period']}"
@@ -187,8 +220,63 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         end=end_ts,
         n_clusters=64,
     )
+    cost_model = BasicCostModel()
 
-    ev = EVEngine.from_artifacts(art_dir)
+    ev = EVEngine.from_artifacts(art_dir, cost_model=cost_model)
+    numeric_idx = pc_cols  # only PCA features go to EVEngine
+
+    #import numpy as np
+    #from pathlib import Path
+
+    # SANITY CHECK
+    all_mu = [ev.evaluate(row, adv_percentile=10.0).mu
+              for row in feats[pc_cols].to_numpy(dtype=np.float32)]
+    print(f"[Sanity-full] µ>0 on full tape: {sum(m > 0 for m in all_mu)} / {len(all_mu)}")
+
+    # ─── Quick mu sanity BEFORE scan ───────────────────────────────────
+    import numpy as _np
+    all_X = feats[numeric_idx].to_numpy(dtype=_np.float32)
+    all_mu = _np.array([ev.evaluate(x, adv_percentile=10.0).mu for x in all_X])
+    print(f"[Sanity-full] μ>0: {(all_mu > 0).sum()} / {len(all_mu)}")
+    # (optionally plot a histogram)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ─── P2 Sanity Check: full‑period µ distribution (unfiltered) ────────
+    import numpy as _np
+    import matplotlib.pyplot as _plt
+    # turn your PCA features into a matrix
+    mus = feats[numeric_idx].to_numpy(dtype=_np.float32)
+    # evaluate µ for every bar
+    ev_res = [ev.evaluate(x,
+                          adv_percentile=10.0,
+                          regime=None,
+                          half_spread=0) for x in mus]
+    mu_vals = _np.array([r.mu for r in ev_res], dtype=_np.float32)
+
+    print(f"[Sanity] Unfiltered µ>0: {(mu_vals > 0).sum()} / {len(mu_vals)}")
+    _plt.hist(mu_vals, bins=30)
+    _plt.title("Full-period µ distribution")
+    _plt.show()
+    # ──────────────────────────────────────────────────────────────────────
+
+    stats_path = Path(cfg["artefacts"]) / "cluster_stats.npz"
+    stats = np.load(stats_path, allow_pickle=True)
+    mu = stats["mu"]
+    mu_by_cluster = stats["mu"]  # array of length n_clusters
+    good_clusters = set(np.where(mu_by_cluster > 0)[0])
+    print("CLUSTER µ summary:  mean =", mu.mean(),
+          " min =", mu.min(),
+          " max =", mu.max())
+    print("first 10 µ:", mu[:10])
+
+    #stats = np.load(Path(cfg["artefacts"]) / "cluster_stats.npz", allow_pickle=True)
+    #mu = stats["mu"]
+    #good_clusters = set(np.where(mu_by_cluster > 0)[0])
+
+
+    print("[DEBUG clusters] µ summary: ",
+          f"mean={mu.mean():.8f}, min={mu.min():.8f}, max={mu.max():.8f}")
+    print("[DEBUG clusters] first 10 µ:", mu[:10])
 
     # schema guard – compare EXACT list of pca_* columns in order
     with open(art_dir / "meta.json", "r", encoding="utf-8") as mf:
@@ -204,7 +292,6 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             f"\n[ERROR] Feature list mismatch.\n  Artefacts: {expected}\n  Runtime : {pc_cols}"
         )
 
-    numeric_idx = pc_cols  # only PCA features go to EVEngine
 
     '''sha_actual = hashlib.sha1(sha_actual.encode()).hexdigest()[:12]
     if sha_actual != sha_expected:
@@ -221,6 +308,12 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             f"Feature SHA mismatch – artefact built for {sha_expected}, got {sha_actual}"
         )'''
 
+    # --- sanity: compare first row *before* + *after* the PCA re‑fit ----------
+    live_vec = feats.loc[0, pc_cols].to_numpy()
+    train_vec = np.load("weights/centers.npy")[0]  # first centroid
+    print("first live PCA vector : ", live_vec[:6])
+    print("first centroid vector : ", train_vec[:6])
+
     # feature_cols = [
     #    c for c in feats.columns if c not in ("symbol", "timestamp")
     # ]  # order preserved
@@ -229,16 +322,27 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # 4 ─ Instantiate Broker, Cost model & RiskManager
 
     cost_model = BasicCostModel()
-    cost_model.spread_bp = float(cfg["spread_bp"])
-    cost_model.commission = float(cfg["commission"])
+
+    cost_model._DEFAULT_SPREAD_CENTS = float(cfg["spread_bp"])
+    cost_model._COMMISSION = float(cfg["commission"])
     broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
+    risk = RiskManager(
+        account_equity = float(cfg["equity"]),
+        cost_model = cost_model,
+        max_kelly = float(cfg.get("max_kelly", 0.5)),
+        adv_cap_pct = float(cfg.get("adv_cap_pct", 0.20)),
+        )
+
+    #cost_model.spread_bp = float(cfg["spread_bp"])
+    #cost_model.commission = float(cfg["commission"])
+    #broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
     # risk = RiskManager(
     #    account_equity=float(cfg["equity"]), cost_model=cost_model, max_kelly=0.5
     # )
 
     # RiskManager now only takes initial equity and max_kelly; drop cost_model
-    risk = RiskManager(
-        float(cfg["equity"]))
+    #risk = RiskManager(
+    #    float(cfg["equity"]))
 
     # cost_model = BasicCostModel(
     #    spread_bp=float(cfg["spread_bp"]), commission=float(cfg["commission"])
@@ -249,9 +353,26 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # )
 
     # 5 ─ Event loop
-    bt = Backtester(feats, cfg)  # Pass the prepared DataFrame
+    #bt = Backtester(feats, cfg)  # Pass the prepared DataFrame
+    # 5 ─ Event loop
+    # Pass all the required components into the Backtester
+    bt = Backtester(
+        features_df=feats,
+        cfg=cfg,
+        ev=ev,
+        risk=risk,
+        broker=broker,
+        cost_model=cost_model,
+        good_clusters=good_clusters,
+    )
+
+    #eq_curve = bt.run()
 
     eq_curve = bt.run()
+    #signals = eq_curve.copy()
+
+    leverage_peak = (eq_curve["notional_abs"] / eq_curve["equity"]).max()
+    print(f"[Risk] peak_leverage = {leverage_peak:.2f}×")
 
     csv_path = _resolve_path(cfg["csv"])
     df_raw = pd.read_csv(csv_path)
@@ -274,19 +395,22 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     daily_regimes = label_days(daily_df, RegimeParams())
 
     # Save
-    out_path = Path(cfg["out"])
-    eq_curve.to_csv(out_path, index=False)
+    #out_path = Path(cfg["out"])
+    #eq_curve.to_csv(out_path, index=False)
 
     import matplotlib.pyplot as plt
 
     # After eq_curve.to_csv(...)
-    df = pd.read_csv(out_path)
+    #df = pd.read_csv(out_path)
 
     # equity‐based cumulative return
-    df["cum_return"] = df["equity"] / cfg["equity"] - 1.0
+    #df["cum_return"] = df["equity"] / cfg["equity"] - 1.0
 
     # --- A) Add one‑bar forward return and win/loss stats ---
-    signals = df.copy()
+    #signals = df.copy()
+    signals = eq_curve.copy()
+    signals["cum_return"] = signals["equity"] / cfg["equity"] - 1.0
+
     signals["ret1m"] = signals["open"].shift(-1) / signals["open"] - 1.0
 
     # mask for all trades you took:
@@ -320,7 +444,7 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     plt.show()
 
     # --- C) Cluster‑level summary ---
-    cluster_stats = df.groupby("cluster_id").apply(
+    cluster_stats = signals.groupby("cluster_id").apply(
         lambda g: pd.Series({
             "n": len(g),
             "mean_µ": g["mu"].mean(),
@@ -332,11 +456,11 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # buy‐and‐hold using raw data (df_raw) rather than the signals CSV
     buy_hold = df_raw["close"].iloc[-1] / df_raw["open"].iloc[0] - 1.0
     print(f"Buy‑and‑Hold over period: {buy_hold * 100:.2f}%")
-    df["regime"] = pd.to_datetime(df["timestamp"]).dt.normalize().map(daily_regimes)
-    print(df.groupby("regime")["cum_return"].agg(["min", "max", "mean"]))
+    signals["regime"] = pd.to_datetime(signals["timestamp"]).dt.normalize().map(daily_regimes)
+    print(signals.groupby("regime")["cum_return"].agg(["min", "max", "mean"]))
 
     plt.figure()
-    plt.plot(df["timestamp"], df["cum_return"], lw=1)
+    plt.plot(signals["timestamp"], signals["cum_return"], lw=1)
     plt.title("Cumulative Return Over Time")
     plt.xlabel("Time")
     plt.ylabel("Return")
@@ -345,23 +469,40 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # 1. Print statistical summary
     print("\nDiagnostic summary:")
-    print(df[["mu", "residual", "position_size"]].describe())
+    print(signals[["mu", "residual", "position_size"]].describe())
 
     # ** Print a nice summary before returning **
     final_eq = float(eq_curve["equity"].iloc[-1])
     total_ret = 100 * (final_eq / cfg["equity"] - 1)
-    log.info("Backtest complete.  Equity curve → %s", out_path)
+    log.info("Backtest complete.  Equity curve → %s", csv_path)
     log.info("  Final equity: $%.2f   Total return: %.2f%%   Bars: %d",
              final_eq, total_ret, len(eq_curve))
 
     # 2. Plot histograms (one per figure)
     for col in ("mu", "residual", "position_size"):
         plt.figure()
-        df[col].hist(bins=50)
+        signals[col].hist(bins=50)
         plt.title(f"Histogram of {col}")
         plt.xlabel(col)
         plt.ylabel("Count")
         plt.show()
+
+    # after running, in notebook / REPL:
+    #signals = pd.read_csv("backtest_signals.csv")
+    signals["ret1m"] = signals["open"].shift(-1) / signals["open"] - 1.0
+    pearson_r = signals["mu"].corr(signals["ret1m"])
+    print("Pearson r =", pearson_r)
+
+    print("Residual summary:")
+    print(signals["residual"].describe())
+
+    pct_below = (signals["residual"] < 0.75).mean()
+    print("Pct residual < 0.75:", pct_below)
+
+    print("Bars after scan:", len(signals))
+    print("µ distribution on those bars:\n", signals["mu"].describe())
+    print("Count µ>0:", (signals["mu"] > 0).sum())
+
 
     return eq_curve
 
@@ -369,7 +510,7 @@ def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 __all__ = ["run", "CONFIG"]
 
 if __name__ == "__main__":
-    run(CONFIG)
+    asyncio.run(run(CONFIG))
 
 
 

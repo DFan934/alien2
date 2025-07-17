@@ -55,7 +55,8 @@ class ScannerLoop:
         while True:
             batch: Iterable[Mapping] = await self.bar_q.get()
             df = pd.DataFrame(batch).set_index("timestamp")
-            mask = self.detectors(df)
+            # CompositeDetector is *async* ‑‑ need to await
+            mask = await self.detectors(df)
             if mask.any():
                 snaps = df[mask]
                 for ts, row in snaps.iterrows():

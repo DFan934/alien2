@@ -12,9 +12,9 @@ Only the *SectorMomentumDetector* section changed – rest of file is unchanged.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Awaitable
 import pandas as pd
-
+from .config import load as _load_cfg
 from .sector_feed import CACHE  # <-- new dependency
 
 __all__ = [
@@ -36,13 +36,13 @@ def _rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
 
 @dataclass(slots=True)
 class GapDetector:
-    pct: float = 0.02
+    pct: float = 0.001
     def __call__(self, df: pd.DataFrame) -> pd.Series:
         return _pct_gap(df).abs() >= self.pct
 
 @dataclass(slots=True)
 class HighRVOLDetector:
-    thresh: float = 2.0
+    thresh: float = 1.0
     lookback: int = 20
     def __call__(self, df: pd.DataFrame) -> pd.Series:
         return _rvol(df, self.lookback) >= self.thresh
@@ -99,12 +99,38 @@ class CompositeDetector:
 
     async def __call__(self, df: pd.DataFrame) -> pd.Series:  # noqa: C901
         import inspect, asyncio
-        mask = pd.Series(True, index=df.index)
+        #mask = pd.Series(True, index=df.index)
+
+        mask = pd.Series(False, index=df.index)
         for det in self.sub:
             res = det(df)  # may be coroutine
             if inspect.iscoroutine(res):
                 res = await res  # type: ignore[assignment]
-            mask &= res
+            #mask &= res
+            mask |= res
             if not mask.any():
                 break  # early‑exit
         return mask
+
+
+# ---------------------------------------------------------------------------
+# Factory – build a CompositeDetector from YAML
+# ---------------------------------------------------------------------------
+def build_from_yaml(path: str | None = None) -> "CompositeDetector":
+    cfg = _load_cfg(path)
+    detectors: list[Callable[[pd.DataFrame],
+                             "pd.Series | Awaitable[pd.Series]"]] = []
+
+    detectors.append(GapDetector(**cfg["gap"]))
+    detectors.append(HighRVOLDetector(**cfg["rvol"]))
+
+    # add any extra rule you like here – order matters (cheapest first)
+    return CompositeDetector(detectors)
+
+
+def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
+    cfg = _load_cfg(cfg_path)
+    return CompositeDetector([
+        GapDetector(**cfg["gap"]),
+        HighRVOLDetector(**cfg["rvol"]),
+    ])

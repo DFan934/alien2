@@ -8,7 +8,8 @@ import pandas as pd
 from prediction_engine.path_cluster_engine import PathClusterEngine
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.market_regime import label_days, RegimeParams
-
+from feature_engineering.labels.labeler import one_bar_ahead          # NEW
+import hashlib                                                        # NEW
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
@@ -98,13 +99,19 @@ def main() -> None:
             raw_df['timestamp'] = raw_df['timestamp'].dt.tz_localize(None)
         feats_df = feats_df.merge(raw_df[['timestamp', 'close']], on='timestamp', how='left')
 
-    feats_df["future_return"] = np.log(feats_df["close"].shift(-1) / feats_df["close"])
+    #feats_df["future_return"] = np.log(feats_df["close"].shift(-1) / feats_df["close"])
 
-    cols_needed = pca_cols + ["future_return", "regime"]
-    df_clean = feats_df[cols_needed].dropna()
+    #cols_needed = pca_cols + ["future_return", "regime"]
 
+    # --- correct one‑bar‑ahead label ---------------------------------
+    y_series = one_bar_ahead(raw_df, horizon=1).reindex(feats_df.index)
+    cols_needed = pca_cols + ["regime"]
+    #df_clean = feats_df[cols_needed].dropna()
+    df_clean = feats_df[cols_needed].join(y_series).dropna()
+    #X = df_clean[pca_cols].to_numpy(dtype=np.float32)
     X = df_clean[pca_cols].to_numpy(dtype=np.float32)
-    y_numeric = df_clean["future_return"].to_numpy(dtype=np.float32)
+    #y_numeric = df_clean["future_return"].to_numpy(dtype=np.float32)
+    y_numeric = df_clean["ret_fwd"].to_numpy(dtype=np.float32)
     y_categorical = df_clean["regime"]
 
     print(f"  → Final dataset size for clustering: {len(X)} samples.")

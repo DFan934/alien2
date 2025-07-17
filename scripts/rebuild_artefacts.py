@@ -12,7 +12,7 @@ import numpy as np
 from prediction_engine.market_regime import label_days, RegimeParams
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.path_cluster_engine import PathClusterEngine
-
+from feature_engineering.labels.labeler import one_bar_ahead      # NEW
 LOG = logging.getLogger(__name__)
 
 
@@ -104,16 +104,78 @@ def rebuild_if_needed(
     if not pca_cols:
         raise RuntimeError("CoreFeaturePipeline did not produce any pca_* columns.")
 
-    # 5) Build centroids using the PCA features and correct regime labels
-    LOG.info("Building clusters with regime labels...")
+    # 5) Prepare final aligned data for clustering
+    LOG.info("Preparing and aligning data for clustering...")
+
+    # --- FIX: Synchronize timezones before mapping and joining ---
+    LOG.info("Normalizing timezones for data alignment...")
+
+    # Ensure both the feature DataFrame and regime Series use timezone-naive indexes
+    if 'timestamp' in feats.columns:
+        feats = feats.set_index('timestamp')
+    if feats.index.tz is not None:
+        feats.index = feats.index.tz_localize(None)
+    if daily_regimes.index.tz is not None:
+        daily_regimes.index = daily_regimes.index.tz_localize(None)
+
+    # Now that timezones are aligned, create the categorical labels
+    y_categorical = pd.Series(
+        feats.index.normalize().map(daily_regimes),  # Map daily regimes to minute-bar dates
+        index=feats.index,
+        name='regime'
+    ).ffill().bfill()  # Fill any gaps
+
+    # --- FIX: Generate numeric labels with the correct DatetimeIndex ---
+    y_numeric_series = pd.Series(
+        one_bar_ahead(raw).values,
+        index=pd.to_datetime(raw['timestamp']),  # Use the timestamp column for the index
+        name="ret_fwd"
+    )
+
+    # Also normalize this index to ensure it matches `feats`
+    if y_numeric_series.index.tz is not None:
+        y_numeric_series.index = y_numeric_series.index.tz_localize(None)
+
+    # Now all three components (feats, y_numeric_series, y_categorical) have a
+    # matching, timezone-naive DatetimeIndex, and the join will work.
+    df_combined = feats.join(y_numeric_series).join(y_categorical)
+
+    # Drop any row that has a NaN in the required features or labels
+    required_cols = pca_cols + ["ret_fwd", "regime"]
+    df_clean = df_combined[required_cols].dropna()
+
+    # 6) Build centroids from the cleaned, aligned data
+    LOG.info("Building clusters with data shape: %s", df_clean.shape)
+
+    # Add a check to provide a better error if the dataframe is still empty
+    if df_clean.empty:
+        raise RuntimeError(
+            "Data alignment resulted in an empty DataFrame. "
+            "Check for issues with NaNs or index mismatches in the source data."
+        )
+
+    print("DIAGNOSTIC ret_fwd\n", df_clean["ret_fwd"].describe())
+    print("DIAGNOSTIC A:\n", df_clean["ret_fwd"].head(), df_clean["ret_fwd"].tail())
+
     PathClusterEngine.build(
+        # --- FIX: Create X from the 'df_clean' DataFrame, not 'feats' ---
+        X=df_clean[pca_cols].to_numpy(dtype=np.float32),
+
+        y_numeric=df_clean["ret_fwd"].to_numpy(dtype=np.float32),
+        y_categorical=df_clean["regime"],
+        feature_names=pca_cols,
+        n_clusters=n_clusters,
+        out_dir=artefact_dir,
+    )
+
+    '''PathClusterEngine.build(
         X=feats[pca_cols].to_numpy(),
         y_numeric=feats[pca_cols[0]].to_numpy(),
         y_categorical=y_categorical,
         feature_names=pca_cols,
         n_clusters=n_clusters,
         out_dir=artefact_dir,
-    )
+    )'''
 
     # 6) Manually create and save the metadata file after building artefacts
     LOG.info("Saving metadata file...")
