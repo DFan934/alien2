@@ -59,6 +59,8 @@ class CurveParams:
     family: Literal["linear", "exp", "sigmoid"]
     tail_len: int      # days
     shape: float       # decay / slope
+    blend_alpha: float = 0.5 # [0–1] mix synthetic vs cluster EV
+    lambda_reg: float  = 1.0 # L2 regularization weight on cluster EV
 
     def to_dict(self):
         return asdict(self)
@@ -196,6 +198,8 @@ class WeightOptimizer:
         w /= w.sum()
         ret = float(w @ pnl_slice.values)
         risk = float(np.sqrt(w @ (pnl_slice.values - ret) ** 2)) + 1e-9
+        #now also build EV predictions with blend_alpha & lambda_reg:
+        #ev_res = ev.evaluate(x, blend_alpha=p.blend_alpha, lambda_reg=p.lambda_reg, …)
         return p, ret / risk
 
 
@@ -222,11 +226,18 @@ class WeightOptimizer:
             "exp",
             "sigmoid",
         )
+        tails = (10, 20, 40, 60, 90, 120)
+        shapes = (0.5, 1, 2, 5)
+        alphas = (0.0, 0.25, 0.5)
+        regs = (0.0, 0.1, 1.0)
+
         return [
-            CurveParams(fam, tail, shape)
+            CurveParams(fam, tail, shape,alpha,lam)
             for fam in families
-            for tail in (10, 20, 40, 60, 90, 120)
-            for shape in (0.5, 1, 2, 5)
+            for tail in tails
+            for shape in shapes
+            for alpha in alphas
+            for lam in regs
         ]
 
     def list_regimes(artefact_root: Path | str) -> list[str]:

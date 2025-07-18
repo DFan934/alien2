@@ -3,15 +3,23 @@ import numpy as np
 from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel
 
-art = Path("weights")                   # <— your artefact dir
-free_cost = BasicCostModel()
-ev = EVEngine.from_artifacts(art, cost_model=free_cost)
+art   = Path("weights")
+cost  = BasicCostModel()
+ev    = EVEngine.from_artifacts(art, cost_model=cost)
 
+# load the “ground‑truth” cluster means
+stats = np.load(art/"cluster_stats.npz", allow_pickle=True)
 centers = np.load(art/"centers.npy")
-mus_centroid = []
-for c in centers[:20]:                    # first 20 clusters is enough
-    r = ev.evaluate(c, half_spread=0)     # tell it cost is zero
-    mus_centroid.append(r.mu)
 
-
-print("share of μ>0:", np.mean(np.array(mus_centroid) > 0))
+print("cluster_id  µ_cluster   µ_kernel   µ_synth   residual")
+for c in centers[:20]:
+    r = ev.evaluate(c, half_spread=0)
+    true_mu   = stats["mu"][r.cluster_id]
+    # if your EVResult has attributes named mu_kernel and mu_synth:
+    kern_mu   = getattr(r, "mu_kernel", float("nan"))
+    synth_mu  = getattr(r, "mu_synth",  float("nan"))
+    print(f"{r.cluster_id:>10d}   "
+          f"{true_mu:>8.5f}   "
+          f"{kern_mu:>8.5f}   "
+          f"{synth_mu:>8.5f}   "
+          f"{r.residual:>7.3f}")

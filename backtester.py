@@ -36,6 +36,7 @@ class Backtester:
                  risk: RiskManager,
                  broker: Any,
                  cost_model: BasicCostModel,
+                 calibrator,
                  good_clusters: set[int],
                  ):
         """
@@ -51,6 +52,8 @@ class Backtester:
         self.broker = broker
         self.cost = cost_model
         self.good_clusters = good_clusters
+        self.cal = calibrator
+
 
 
     def run(self) -> pd.DataFrame:
@@ -103,6 +106,10 @@ class Backtester:
                                   e, fill_dict, bar["ts"])
                     raise
 
+                #risk.position_size = tr["qty"] + risk.position_size
+
+
+
                 # right here—catch any non‑finite P&L or equity
                 # right after you compute pnl via process_fill(...)
                 if not math.isfinite(pnl):
@@ -125,7 +132,115 @@ class Backtester:
 
             # 5.3 Generate signal for NEXT bar
             x_vec = row[self.pc_cols].to_numpy(dtype=np.float32)
-            ev_res = ev.evaluate(x_vec, adv_percentile=10.0, regime=None, half_spread=0)
+
+            # -------- EV evaluation ---------------------------------
+            adv_pct = row.get("adv_pct", 10.0)
+            half_spread = row.get("half_spread", 0.01)
+
+            ev_raw = ev.evaluate(
+                x_vec,
+                half_spread = 0.0,
+                adv_percentile = adv_pct,
+                regime = None,
+            )
+
+            # skip permanently bad clusters
+            #if ev_raw.cluster_id not in self.good_clusters:
+            #    continue
+
+            #mu_cal = (
+            #    float(self.cal.predict([[ev_raw.mu]])[0])
+            #    if self.cal is not None else ev_raw.mu
+            #    )
+
+
+
+
+            '''ev_res = ev_raw.__class__(
+                mu = mu_cal,
+                sigma = ev_raw.sigma,
+                variance_down = ev_raw.variance_down,
+                beta = ev_raw.beta,
+                residual = ev_raw.residual,
+                cluster_id = ev_raw.cluster_id,
+                outcome_probs = ev_raw.outcome_probs,
+                position_size = ev_raw.position_size,
+                drift_ticket = ev_raw.drift_ticket,
+                        )'''
+
+            ev_res = ev_raw
+
+            # -------- Kelly sizing ----------------------------------
+            adv_today = row.get("adv", None)
+
+            if _ := ev_res.mu > 0:
+                print(f"[DBG] bar {bar['ts']} µ={ev_res.mu:.5f}  cost_ps="
+                      f"{risk.cost_model.estimate():.4f}  cluster={ev_res.cluster_id}")
+
+
+
+            '''if ev_res.mu > 0:  # only long on positive µ
+                qty = risk.kelly_position(
+                mu = ev_res.mu,
+                variance_down = ev_res.variance_down,
+                price = row["open"],
+                adv = adv_today,
+                )
+            else:
+                qty = 0'''
+
+            # ── C: Gate on calibrated probability, not just sign ─────────────
+            if self.cal is not None:
+                p_win = float(self.cal.predict([[ev_res.mu]])[0])
+            else:
+                p_win = 0.0
+            # only take a position when confidence > 55%
+            if p_win > 0.55:
+                qty = risk.kelly_position(
+                    mu = ev_res.mu,
+                    variance_down = ev_res.variance_down,
+                    price = row["open"],
+                    adv = adv_today,
+                )
+            else:
+                qty = 0
+
+
+            '''#ev_res = ev.evaluate(x_vec, adv_percentile=10.0, regime=None, half_spread=0)
+
+            adv_pct = row.get("adv_pct", 10.0)
+            half_spread = row.get("half_spread", 0.01)  # $0.01 fallback
+
+            ev_raw = ev.evaluate(
+                x_vec,
+                half_spread = half_spread,
+                adv_percentile = adv_pct,
+                regime = None,
+            )
+
+              # skip clusters that systematically lose money
+
+            if ev_raw.cluster_id not in self.good_clusters:
+                continue
+            mu_cal = self.cal.predict([[ev_raw.mu]])[0] if self.cal else ev_raw.mu
+
+            ev_res = ev_raw.__class__(
+                mu = mu_cal,
+                sigma = ev_raw.sigma,
+                variance_down = ev_raw.variance_down,
+                beta = ev_raw.beta,
+                residual = ev_raw.residual,
+                cluster_id = ev_raw.cluster_id,
+                outcome_probs = ev_raw.outcome_probs,
+                position_size = ev_raw.position_size,
+                drift_ticket = ev_raw.drift_ticket,
+                )
+
+
+            qty = risk.kelly_position(
+            qty = risk.kelly_position(
+                mu=ev_res.mu,
+
             cid = ev_res.cluster_id
             adv_today = row.get("adv", None)  # avg daily volume if present
 
@@ -138,7 +253,9 @@ class Backtester:
                     adv=adv_today,
                 )
             else:
-                qty = 0
+                qty = 0'''
+
+
             # Simplified sizing for this example
             #qty = risk.desired_size(cfg["symbol"], row["open"])
 
@@ -223,6 +340,9 @@ class Backtester:
                 "cluster_id": ev_res.cluster_id,
                 "notional_abs": abs(risk.position_size * row["open"]),  #New
             })
+
+
+
 
         log.info("Backtest loop finished.")
         return pd.DataFrame(equity_curve)

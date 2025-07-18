@@ -36,7 +36,7 @@ from execution.metrics.report import load_blotter, pnl_curve, latency_summary
 from execution.manager import ExecutionManager
 from execution.risk_manager import RiskManager            # NEW
 from prediction_engine.tx_cost import BasicCostModel
-
+from prediction_engine.calibration import load_calibrator, calibrate_isotonic  # NEW – iso µ‑cal
 # Keep only PCA feature columns (produced by CoreFeaturePipeline)
 def _pca_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c.startswith("pca_")]
@@ -222,8 +222,64 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     )
     cost_model = BasicCostModel()
 
-    ev = EVEngine.from_artifacts(art_dir, cost_model=cost_model)
+    # --- load the µ‑calibration mapping ----------------------------
+    #calibrator = load_calibrator(Path(cfg["artefacts"]) / "calibration")
+
+    # we still load it for later use, but we won’t stomp µ in the engine
+    calibrator = load_calibrator(Path(cfg["artefacts"]) / "calibration")
+
+    #ev = EVEngine.from_artifacts(art_dir, cost_model=cost_model,calibrator=calibrator)
+    # by passing None here, EVEngine.evaluate() will leave µ untouched
+    ev = EVEngine.from_artifacts(
+           art_dir,
+           cost_model = cost_model,
+           #calibrator = calibrator,
+        #residual_threshold=cfg["residual_threshold"]
+       )
+
+    ev.residual_threshold = 2.0
     numeric_idx = pc_cols  # only PCA features go to EVEngine
+
+    import numpy as _np, pandas as _pd
+
+    # 1) cluster‐level µ stats
+    stats = _np.load(art_dir / "cluster_stats.npz", allow_pickle=True)
+    mu_by_cl = stats["mu"]
+    print("cluster μ summary:\n", _pd.Series(mu_by_cl).describe())
+    print("fraction μ>0:", (mu_by_cl > 0).mean())
+
+    # 2) how many of the first 20 centers your live engine thinks are positive?
+    centers = _np.load(art_dir / "centers.npy")
+    mus_centroid = [ev.evaluate(c, half_spread=0).mu for c in centers[:20]]
+    print("share of μ>0 on first 20 centroids:", _np.mean(_np.array(mus_centroid) > 0))
+
+    # 3) residual distribution on centroids
+    res = [ev.evaluate(c, half_spread=0).residual for c in centers]
+    print("Residual summary:\n", _pd.Series(res).describe())
+    print("Frac residual < 0.75:", (_np.array(res) < ev.residual_threshold).mean())
+
+
+
+    # ─── SANITY CHECK #1: “cluster_stats.npz” summary ───────────────
+    import numpy as _np, pandas as _pd
+    stats     = _np.load(art_dir/"cluster_stats.npz", allow_pickle=True)
+    mu_by_cl  = stats["mu"]
+    print("cluster μ summary:\n", _pd.Series(mu_by_cl).describe())
+    print("fraction μ>0:", (mu_by_cl > 0).mean())
+
+    # ─── SANITY CHECK #2: first‐20 centers through the live engine ───
+    centers       = _np.load(art_dir/"centers.npy")
+
+    mus_centroid  = [_float := ev.evaluate(c, half_spread=0).mu
+                     for c in centers[:20]]
+    print("share of μ>0 on first 20 centroids:",
+          _np.mean(_np.array(mus_centroid) > 0))
+
+    centers = np.load(art_dir / "centers.npy")
+    res = [ev.evaluate(c, half_spread=0).residual for c in centers]
+    import numpy as _np, pandas as _pd
+    print("Residual summary:\n", _pd.Series(res).describe())
+    print("Frac residual < 0.75:", (_np.array(res) < 0.75).mean())
 
     #import numpy as np
     #from pathlib import Path
@@ -251,7 +307,14 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                           adv_percentile=10.0,
                           regime=None,
                           half_spread=0) for x in mus]
+
+
+
+
     mu_vals = _np.array([r.mu for r in ev_res], dtype=_np.float32)
+
+    sample_mu = np.linspace(mu_vals.min(), mu_vals.max(), 10)
+    #print("Calibrated p’s:", calibrator.predict(sample_mu))
 
     print(f"[Sanity] Unfiltered µ>0: {(mu_vals > 0).sum()} / {len(mu_vals)}")
     _plt.hist(mu_vals, bins=30)
@@ -261,9 +324,31 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     stats_path = Path(cfg["artefacts"]) / "cluster_stats.npz"
     stats = np.load(stats_path, allow_pickle=True)
+
+
+    #print("Calibrator thresholds:", calibrator.X_thresholds_)
+    #print("Calibrator y:", calibrator.y_min, calibrator.y_max)
+
+    #for x in np.linspace(mu_vals.min(), mu_vals.max(), 5):
+    #    print("map", x, "→", calibrator.predict([[x]])[0])
+
     mu = stats["mu"]
-    mu_by_cluster = stats["mu"]  # array of length n_clusters
-    good_clusters = set(np.where(mu_by_cluster > 0)[0])
+    #mu_by_cluster = stats["mu"]  # array of length n_clusters
+    #mean_ret1m_by_cl = stats["mean_ret1m"]
+    #good_clusters = set(np.where(mu_by_cluster > 0)[0])
+    #good_clusters = set(np.where(mean_ret1m_by_cl > 0)[0])
+
+    # ─── Good‑cluster filter – favour clusters that actually made money ───
+    if "mean_ret1m" in stats.files:  # produced by PathClusterEngine ≥ 0 .4
+        mean_ret1m_by_cl = stats["mean_ret1m"].astype(float)
+        good_clusters = set(np.where(mean_ret1m_by_cl > 0)[0])
+    else:  # legacy fallback
+        mu_by_cluster = stats["mu"]
+        good_clusters = set(np.where(mu_by_cluster > 0)[0])
+
+    print("µ by cluster  ➜ ", np.round(mu[:10], 6), " …")
+    print("# good_clusters =", len(good_clusters))
+
     print("CLUSTER µ summary:  mean =", mu.mean(),
           " min =", mu.min(),
           " max =", mu.max())
@@ -363,6 +448,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         risk=risk,
         broker=broker,
         cost_model=cost_model,
+        calibrator=calibrator,
         good_clusters=good_clusters,
     )
 
@@ -412,6 +498,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     signals["cum_return"] = signals["equity"] / cfg["equity"] - 1.0
 
     signals["ret1m"] = signals["open"].shift(-1) / signals["open"] - 1.0
+
+    assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
+    assert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
 
     # mask for all trades you took:
     trade_mask = signals.qty_next_bar > 0
@@ -503,6 +592,13 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print("µ distribution on those bars:\n", signals["mu"].describe())
     print("Count µ>0:", (signals["mu"] > 0).sum())
 
+    # ------------- persist signals ----------
+    OUT_DIR = Path("backtests")
+    OUT_DIR.mkdir(exist_ok=True)
+    ts_tag = signals["timestamp"].iloc[0].strftime("%Y%m%d")
+    out_file = OUT_DIR / f"signals_{cfg['symbol']}_{ts_tag}.csv"
+    signals.to_csv(out_file, index=False)
+    print("Saved run to", out_file)
 
     return eq_curve
 

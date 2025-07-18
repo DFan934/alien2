@@ -62,6 +62,7 @@ class BasicCostModel(BaseCostModel):
     _IMPACT_COEFF: float = 9e-5          # κ
     _DEFAULT_SPREAD_CENTS: float = 2.0   # ½-spread when no quote supplied
     _COMMISSION: float = 0.002           # $/share
+    _VOL_COEFF = 0.5  # tune later
 
     # ------------------------------------------------------------------ #
     # Core                                                               #
@@ -72,6 +73,7 @@ class BasicCostModel(BaseCostModel):
         *,
         half_spread: float | None = None,
         adv_pct: float | None = None,
+        volatility: float | None = None,    # NEW: σ of 1‑min returns
     ) -> float:
         """
         Parameters
@@ -88,6 +90,11 @@ class BasicCostModel(BaseCostModel):
         hs = half_spread if half_spread is not None else self._DEFAULT_SPREAD_CENTS * 0.01
         commission = self._COMMISSION
 
+        # --- add volatility‐based slippage term ---------------- #
+        # caller may optionally pass `volatility` (std‐dev of returns) in adv_pct kw
+        #vol = adv_pct if isinstance(adv_pct, float) and vol_kwarg_provided else 0.0
+        #vol_slippage = getattr(self, "_VOL_COEFF", 0.5) * vol
+
         # --- market-impact (square-root) ----------------------------- #
         if adv_pct is None:
             frac = 1.0  # assume 1 × ADV normalisation (unit share cost)
@@ -97,7 +104,14 @@ class BasicCostModel(BaseCostModel):
 
         impact = self._IMPACT_COEFF * np.sqrt(frac)
 
-        return float(hs + commission + impact)
+        # --- volatility‑scaled queue slippage --------------------- #
+        vol_slippage = 0.0
+
+        if volatility is not None and np.isfinite(volatility):
+                        vol_slippage = self._VOL_COEFF * volatility
+
+
+        return float(hs + commission + impact + vol_slippage)
 
     # ------------------------------------------------------------------ #
     # Convenience alias (back-compat with old code)                      #
@@ -113,6 +127,7 @@ class BasicCostModel(BaseCostModel):
             1.0,
             half_spread=half_spread,
             adv_pct=adv_percentile,
+            volatility=None,
         )
 
 

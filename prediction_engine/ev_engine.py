@@ -6,6 +6,9 @@ from __future__ import annotations
 import hashlib
 
 from hypothesis.extra.numpy import NDArray
+from sklearn.isotonic import IsotonicRegression
+
+from .calibration import calibrate_isotonic
 
 """Expected‑Value Engine
 ========================
@@ -28,7 +31,7 @@ old module.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Tuple, Dict
+from typing import Iterable, Literal, Tuple, Dict, Any
 import joblib
 from prediction_engine.position_sizer import KellySizer        # NEW
 from .drift_monitor import get_monitor, DriftStatus        # NEW
@@ -157,6 +160,7 @@ class EVEngine:
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
         #residual_threshold: float = 0.001,  # NEW: max acceptable synth residual
+        calibrator: Any | None=None,
         residual_threshold: float = 0.75,
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
 
@@ -176,7 +180,7 @@ class EVEngine:
         self.lambda_reg = float(lambda_reg)  # NEW
         # NEW: threshold for acceptable synth residual
         self.residual_threshold = float(residual_threshold)
-
+        self._calibrator = calibrator
         self.k_max = k or 32  # fair default; will be density‑capped later
         self.metric = metric
         '''# Build distance helper – no external cov_inv needed (DistanceCalculator
@@ -236,6 +240,8 @@ class EVEngine:
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
         k: int | None = None,
         cost_model: object | None = None,
+        calibrator: Any | None=None,
+        residual_threshold: float = 0.75,
     ) -> "EVEngine":
         artefact_dir = Path(artefact_dir)
         centers = np.load(artefact_dir / "centers.npy")
@@ -371,6 +377,8 @@ class EVEngine:
             #regime_curves=regime_curves,
             regime_curves={**regime_curves, **curves},
             cost_model=cost_model,
+            calibrator=calibrator,
+            residual_threshold=residual_threshold,
             cluster_regime=regime_arr,
         )
 
@@ -544,8 +552,31 @@ class EVEngine:
         # 4. Subtract transaction cost
         # ------------------------------------------------------------
         cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
+
+        # 5. ISO‑CALIBRATION  (post‑cost, pre‑return)
+        '''mu_cal = (
+            self._calibrator.predict([[mu]])[0]  # shape (N,1) expected
+            if self._calibrator is not None
+            else mu
+        )'''
+
+        # 5. ISO‑CALIBRATION  (pre‑cost): map raw µ → calibrated µ
+        #mu_cal = (
+        #    self._calibrator.predict([[mu]])[0]
+        #    if self._calibrator is not None
+        #    else mu
+               # )
+        # ── A: override raw µ with calibrated µ ─────────────────
+        #mu = mu_cal
         mu_net = mu - cost_ps
 
+        #mu_net = mu - cost_ps
+        #mu = mu_cal  # use calibrated value
+        #mu_net = mu - cost_ps
+
+        # 6. if you want P(win), _compute it here_ but keep µ_net pure:
+        p_win = (self._calibrator.predict([[mu]])[0]
+                 if self._calibrator else None)
 
         #5. NEW: Calculate blended probabilistic outcomes
         blended_probs = {}
