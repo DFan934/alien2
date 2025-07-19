@@ -253,12 +253,19 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
         # 3) Numeric feature vector -----------------------------------
         if self._numeric_keys is None:
-            self._numeric_keys = [k for k, v in feats.items() if isinstance(v, (int, float)) and not math.isnan(v)]
+            '''self._numeric_keys = [k for k, v in feats.items() if isinstance(v, (int, float)) and not math.isnan(v)]
             self._numeric_keys.sort()
             exp_dim = self.ev.centers.shape[1]
             if len(self._numeric_keys) > exp_dim:
                 logger.warning("%d numeric cols > EVEngine dim %d; truncating", len(self._numeric_keys), exp_dim)
-                self._numeric_keys = self._numeric_keys[:exp_dim]
+                self._numeric_keys = self._numeric_keys[:exp_dim]'''
+            # Preserve the *incoming* order and strictly respect the schema
+            # defined in EVEngine (feature_schema.json).  We no longer sort or
+            # truncate – any mismatch must be treated as a hard error.
+            self._numeric_keys = [
+                k for k, v in feats.items()
+                if isinstance(v, (int, float)) and not math.isnan(v)
+            ]
 
         exp_dim = self.ev.centers.shape[1]
         if len(self._numeric_keys) != exp_dim:

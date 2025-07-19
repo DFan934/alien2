@@ -35,7 +35,8 @@ from typing import Iterable, Literal, Tuple, Dict, Any
 import joblib
 from prediction_engine.position_sizer import KellySizer        # NEW
 from .drift_monitor import get_monitor, DriftStatus        # NEW
-
+from typing import Iterable, Literal, Tuple, Dict, Any
+from functools import lru_cache
 import json
 import numpy as np
 from numpy.typing import NDArray
@@ -160,6 +161,8 @@ class EVEngine:
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
         #residual_threshold: float = 0.001,  # NEW: max acceptable synth residual
+        tau_dist: float = float("inf"),
+        max_cached: int = 1024,
         calibrator: Any | None=None,
         residual_threshold: float = 0.75,
         metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
@@ -169,6 +172,8 @@ class EVEngine:
         k: int | None = None,
         cost_model: BasicCostModel | None = None,
         cluster_regime: np.ndarray | None = None,
+        _scale_vec: np.ndarray | None = None,  # internal
+        _n_feat_schema: int | None = None,  # internal
 
     ) -> None:
         self.centers = np.ascontiguousarray(centers, dtype=np.float32)
@@ -179,6 +184,10 @@ class EVEngine:
         self.alpha = float(blend_alpha)
         self.lambda_reg = float(lambda_reg)  # NEW
         # NEW: threshold for acceptable synth residual
+        self.tau_dist = float(tau_dist)
+        self._synth_cache = lru_cache(max_cached)(self._synth_ev)
+        self._scale_vec: np.ndarray | None = None
+        self._n_feat_schema: int | None = None
         self.residual_threshold = float(residual_threshold)
         self._calibrator = calibrator
         self.k_max = k or 32  # fair default; will be density‑capped later
@@ -216,6 +225,13 @@ class EVEngine:
         # Kelly-sizer helper (singleton inside engine)
         self._sizer = KellySizer()
 
+        # --- feature‑contract info ---------------------------------
+        self._scale_vec = (
+            np.ascontiguousarray(_scale_vec, dtype=np.float32)
+            if _scale_vec is not None else None
+        )
+        self._n_feat_schema = int(_n_feat_schema) if _n_feat_schema else None
+
 
 
         #NEW: Loading the meta boost model
@@ -231,6 +247,44 @@ class EVEngine:
     # ------------------------------------------------------------------
     # Factory – load from artefact directory written by PathClusterEngine
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # helper – compute synthetic μ/σ² once and cache via lru_cache
+    # ------------------------------------------------------------------
+    def _synth_ev(
+            self,
+            x_tup: Tuple[float, ...],
+            idx_tup: Tuple[int, ...],
+            mu_k: float,
+            var_k: float,
+            var_down_k: float,
+            ) -> tuple[float, float, float, np.ndarray, float]:
+            """Heavy analogue‑synthesis math (ex‑`evaluate` body)."""
+
+            x = np.array(x_tup, dtype=np.float32)  # Convert tuple back to array
+
+            idx = np.fromiter(idx_tup, dtype=np.intp)
+
+            delta_mat = self.centers[idx] - x  # (k,d)
+            beta, residual = AnalogueSynth.weights(
+                delta_mat,
+                -x,
+                var_nn = self.var[idx],
+                lambda_ridge = self.lambda_reg,
+            )
+
+
+            if residual > self.residual_threshold:  # kernel fallback
+                beta[:] = 0.0
+                beta[0] = 1.0
+                mu_syn, var_syn, var_down_syn = mu_k, var_k, var_down_k
+            else:
+                mu_syn = float(beta @ self.mu[idx])
+                var_syn = float(beta @ self.var[idx])
+                var_down_syn = float(beta @ self.var_down[idx])
+
+
+            return mu_syn, var_syn, var_down_syn, beta.astype(np.float32, copy=False), residual
 
     @classmethod
     def from_artifacts(
@@ -291,7 +345,28 @@ class EVEngine:
                 "Feature schema drift detected – retrain PathClusterEngine before loading EVEngine."
             )
 
+        #kernel_cfg = json.loads((artefact_dir / "kernel_bandwidth.json").read_text())
+
+
+        # ------------------------------------------------------------------
+        # NEW ▼ load feature_schema.json and validate                       |
+        # ------------------------------------------------------------------
+        schema_file = artefact_dir / "feature_schema.json"
+        if not schema_file.exists():
+            raise RuntimeError("feature_schema.json missing – rebuild centroids.")
+        schema = json.loads(schema_file.read_text())
+        expected_sha = schema["sha"]
+        live_sha = _sha1_list(stats["feature_list"].tolist())
+        if expected_sha != live_sha:
+            raise RuntimeError(
+                f"Feature schema drift!  artefact sha={expected_sha}, "
+                 f"live sha={live_sha}"
+                )
+
+        scale_vec = np.asarray(schema.get("scales", []), dtype=np.float32)
+        n_feat_schema = len(schema["features"])
         kernel_cfg = json.loads((artefact_dir / "kernel_bandwidth.json").read_text())
+
         blend_alpha = kernel_cfg.get("blend_alpha", 0.5)
         h = float(kernel_cfg["h"])
 
@@ -379,6 +454,8 @@ class EVEngine:
             cost_model=cost_model,
             calibrator=calibrator,
             residual_threshold=residual_threshold,
+            _scale_vec=scale_vec,
+            _n_feat_schema=n_feat_schema,
             cluster_regime=regime_arr,
         )
 
@@ -416,6 +493,15 @@ class EVEngine:
                  regime: MarketRegime | None = None) -> EVResult:  # noqa: N802
         """Return expected‑value statistics for one live feature vector."""
         x = np.ascontiguousarray(x, dtype=np.float32)
+
+        # ---- feature‑length / scale guard --------------------------
+        if (self._n_feat_schema is not None) and (x.size != self._n_feat_schema):
+            raise ValueError(
+                f"Feature length {x.size} ≠ schema length {self._n_feat_schema}"
+                )
+        if self._scale_vec is not None:
+            x = x * self._scale_vec  # element‑wise rescale
+
         if x.ndim != 1:
             raise ValueError("x must be 1‑D vector")
 
@@ -472,7 +558,23 @@ class EVEngine:
         var_k = float(np.dot(w, self.var[idx]))
         var_down_k = float(np.dot(w, self.var_down[idx]))
 
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------------
+        # NEW · decide whether to call analogue_synth
+        # -----------------------------------------------------------------
+        nearest_d2 = float(dist2.min())
+        use_synth = nearest_d2 > self.tau_dist
+        if use_synth:
+            (mu_syn, var_syn, var_down_syn,
+            beta, residual) = self._synth_cache(
+            tuple(x), tuple(idx.tolist()), mu_k, var_k, var_down_k
+                                                                       )
+        else:
+            beta = np.zeros_like(idx, dtype=np.float32)
+            beta[0] = 1.0
+            #residual = np.inf
+            residual = 0
+            mu_syn, var_syn, var_down_syn = mu_k, var_k, var_down_k
+        '''# ------------------------------------------------------------
         # 3. Synthetic analogue via inverse‑difference weights
         # ------------------------------------------------------------
         delta_mat = self.centers[idx] - x  # (k, d)
@@ -509,7 +611,7 @@ class EVEngine:
                 mu_syn = 0.3 * mu_meta + 0.7 * mu_syn
 
             var_syn = float(beta @ self.var[idx])
-            var_down_syn = float(beta @ self.var_down[idx])
+            var_down_syn = float(beta @ self.var_down[idx])'''
 
 
         # ▶ NEW: variance‑weighted β – favour low‑risk neighbours ◀

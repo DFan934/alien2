@@ -195,6 +195,25 @@ class PathClusterEngine:
         with open(out_dir / "meta.json", "w", encoding="utf-8") as mf:
             json.dump(meta, mf, indent=2)
 
+        # ------------------------------------------------------------------
+        # 6. NEW  – feature_schema.json  (ordering + per‑feature scale) -----
+        # ------------------------------------------------------------------
+        # If X has been standardised (mean‑zero / unit‑σ) upstream, store σ
+        # per column; otherwise store 1.0 so the downstream check still works.
+        if hasattr(imputer, "statistics_"):
+            # crude std‑dev estimate post‑imputation
+            scale_vec = X.std(axis=0).astype(float).tolist()
+        else:
+            scale_vec = [1.0] * len(feature_names)
+        schema = {
+            "sha": sha,
+            "features": feature_names,
+            "scales": scale_vec,
+            }
+        with open(out_dir / "feature_schema.json", "w", encoding="utf-8") as sf:
+            json.dump(schema, sf, indent=2)
+
+
         return cls(centers, mu, var, var_down, h_val, feature_names, sha, cluster_regime, outcome_probs)
 
     @classmethod
