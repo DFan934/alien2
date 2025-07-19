@@ -62,11 +62,13 @@ class RiskManager:
         max_qty = math.floor(self.account_equity * self.max_leverage / price)
         return max(0, min(qty, max_qty))
 
-    def kelly_position(self,
+    '''def kelly_position(self,
                        mu: float,
                        variance_down: float,
                        price: float,
-                       adv: float | None = None,) -> int:
+                       adv: float | None = None,
+                       override_frac: float | None = None,
+                       ) -> int:
         # --- 1. SAFEGUARDS FIRST ---
         # Exit immediately if any inputs are invalid for the formula.
         # A non-positive mu means no expected profit.
@@ -110,7 +112,71 @@ class RiskManager:
             qty = min(qty, math.floor(adv * self.adv_cap_pct))
 
         # Ensure final quantity is not negative
-        return max(qty, 0)
+        return max(qty, 0)'''
+
+    # ░░░░░░░░░░  PATCH  ‑‑ replace ENTIRE kelly_position method ░░░░░░░░░░
+    # === delete the current def kelly_position(...) and paste this version ===
+
+    def kelly_position(
+            self,
+            mu: float,
+            variance_down: float,
+            price: float,
+            adv: float | None = None,
+            override_frac: float | None = None,
+            ) -> int:
+            """
+            Position sizing via Kelly, with an optional manual equity fraction.
+
+            Parameters
+            ----------
+            mu : float
+                Expected next‑bar return (already calibrated).
+            variance_down : float
+                Down‑side variance estimate.
+            price : float
+                Fill price you expect at next‑bar open.
+            adv : float, optional
+                Average daily volume, used for the ADV liquidity cap.
+            override_frac : float, optional
+                If provided (0‑1), use *this* equity fraction instead of the
+                analytic Kelly fraction.  Still capped by ``max_kelly``.
+            """
+            import math, logging
+
+            # ── 1.  Guard rails ------------------------------------------------
+            if (not math.isfinite(self.account_equity) or self.account_equity <= 0
+                    or price <= 0 or not math.isfinite(variance_down)):
+                return 0
+            var_eff = max(variance_down, 1e-8)  # numerical floor
+
+            # ── 2.  Choose Kelly fraction --------------------------
+            if override_frac is not None:
+                kelly_f = min(max(override_frac, 0.0), self.max_kelly)
+            else:
+                kelly_f = min(mu / (2 * var_eff), self.max_kelly)
+
+            if kelly_f <= 0:
+                return 0
+
+            # ── 3.  Convert to share quantity ----------------------
+            dollar_notional = kelly_f * self.account_equity
+            max_notional = self.account_equity * self.max_leverage
+            raw_qty = min(dollar_notional, max_notional) / price
+
+            if not math.isfinite(raw_qty):
+                logging.warning("kelly raw_qty non‑finite: %r", raw_qty)
+                return 0
+
+            qty = math.floor(raw_qty)
+
+            # ── 4.  Liquidity brake (ADV) --------------------------
+            if adv is not None and adv > 0:
+                qty = min(qty, math.floor(adv * self.adv_cap_pct))
+
+            return max(qty, 0)
+
+    # ░░░░░░░░░░  END PATCH  ░░░░░░░░░░
 
     # --------------------- drawdown tracking ---------------------------------
     def on_closed_trade(self, pnl: float):

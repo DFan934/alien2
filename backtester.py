@@ -151,9 +151,36 @@ class Backtester:
             if ev_raw.cluster_id not in self.good_clusters:
                 continue
 
+            #if ev_raw.residual > self.ev.residual_threshold:
+            #    continue
+
+            # ░░░░░░░░░░  PATCH 1  ░░ Residual gate + size ∝ μ ░░░░░░░░░░
+            # === paste AFTER the line that builds `ev_raw` (look for:  ev_raw = ev.evaluate(...)) ===
+
+            # ── 1. Skip high‑residual analogues ────────────────────────
             if ev_raw.residual > self.ev.residual_threshold:
+                # “too far” from any centroid; ignore this bar
                 continue
 
+            # ── 2. Continuous μ → expected return (already calibrated) ─
+            exp_ret = float(self.cal.predict([[ev_raw.mu]])[0]) if self.cal else ev_raw.mu
+
+            # ── 3. Position sizing proportional to expected return ─────
+            #     min_cap_kelly ≈ 0.30 prevents tiny noisy trades
+            min_cap_kelly = 0.30
+            pos_fraction = max(0.0, exp_ret / 0.01)  # 1 % exp ret ⇒ full Kelly
+            pos_fraction = np.clip(pos_fraction, 0.0, 1.0)  # cap at 100 %
+            pos_fraction = max(pos_fraction, min_cap_kelly) if pos_fraction > 0 else 0.0
+
+            qty = risk.kelly_position(
+                mu=exp_ret,
+                variance_down=ev_raw.variance_down,
+                price=row["open"],
+                adv=row.get("adv", None),
+                override_frac=pos_fraction,  # <── NEW ARG your RiskManager already supports
+            )
+
+            # =====================================================================
 
             mu_cal = (
                 float(self.cal.predict([[ev_raw.mu]])[0])
@@ -328,6 +355,24 @@ class Backtester:
                     qty_exit = 0
             else:
                 qty_exit = 0
+
+            # ░░░░░░░░░░  PATCH 2  ░░ 1‑bar stop‑loss / take‑profit ░░░░░░░░░░
+            # === paste RIGHT BEFORE the section that queues `qty_exit` / `qty` orders ===
+            #     (search for the comment "# queue orders for next bar --------------------------------------------")
+
+            # --- intrabar risk control (executed on NEXT bar open) -----------------
+            if risk.position_size > 0:
+                #entry_px = broker.average_entry_price(cfg["symbol"])
+                entry_px = risk.avg_entry_price
+
+                stop_px = entry_px * (1 - 0.003)  # 30 bp stop‑loss
+                tp_px = entry_px * (1 + 0.006)  # 60 bp take‑profit
+
+                if row["open"] <= stop_px or row["open"] >= tp_px:
+                    qty_exit = -risk.position_size
+            else:
+                qty_exit = 0
+            # ──────────────────────────────────────────────────────────────────────────
 
             # queue orders for next bar --------------------------------------------
             # queue orders for next bar --------------------------------------------

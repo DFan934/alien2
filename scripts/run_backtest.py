@@ -383,13 +383,27 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #good_clusters = set(np.where(mu_by_cluster > 0)[0])
     #good_clusters = set(np.where(mean_ret1m_by_cl > 0)[0])
 
-    # ─── Good‑cluster filter – favour clusters that actually made money ───
-    if "mean_ret1m" in stats.files:  # produced by PathClusterEngine ≥ 0 .4
+    # ─── Good‑cluster filter – favour clusters that actually made money ───
+    if "mean_ret1m" in stats.files:  # produced by PathClusterEngine ≥ 0.4
         mean_ret1m_by_cl = stats["mean_ret1m"].astype(float)
-        good_clusters = set(np.where(mean_ret1m_by_cl > 0)[0])
+
+        # ░░░░░░░░░░  PATCH 4  ░░ top‑quartile good_clusters ░░░░░░░░░░
+        # This logic now correctly sits inside the if-block.
+        # keep only clusters whose mean_ret1m is in the top quartile
+        q75 = np.percentile(mean_ret1m_by_cl, 75)
+        good_clusters = set(np.where(mean_ret1m_by_cl >= q75)[0])
+        print(f"[Filter] good_clusters tightened to top‑quartile (n={len(good_clusters)})")
+        # =====================================================================
+
     else:  # legacy fallback
         mu_by_cluster = stats["mu"]
         good_clusters = set(np.where(mu_by_cluster > 0)[0])
+
+    # print("µ by cluster  ➜ ", np.round(mu[:10], 6), " …") # This line and below are unchanged
+    print("# good_clusters =", len(good_clusters))
+
+    print(f"[Filter] good_clusters tightened to top‑quartile (n={len(good_clusters)})")
+    # =====================================================================
 
     print("µ by cluster  ➜ ", np.round(mu[:10], 6), " …")
     print("# good_clusters =", len(good_clusters))
