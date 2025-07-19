@@ -162,7 +162,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     df_raw = df_raw.loc[mask].reset_index(drop=True)
     # ──────────────────────────────────────────────────────
 
+    # 20‑day rolling ADV in *shares*
+    df_raw["adv_shares"] = df_raw["volume"].rolling(20, min_periods=1).mean()
 
+    # dollar ADV (needed if your RiskManager uses notional)
+    df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
 
     # 2 ─ Feature engineering
     #pipe = CoreFeaturePipeline(parquet_root=Path(""))  # in-mem
@@ -183,8 +187,10 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     feats = feats[pc_cols + ["symbol", "timestamp"]]
     feats["open"] = df_raw["open"].values  # Attach open for execution logic
     feats["close"] = df_raw["close"].values
-
-
+    feats["high"] = df_raw["high"].values  # <— needed for stop‑loss check
+    feats["low"] = df_raw["low"].values
+    feats["adv_shares"] = df_raw["adv_shares"].values
+    feats["adv_dollars"] = df_raw["adv_dollars"].values
 
     # sanity: ensure ATR exists
     ATR_COL = f"atr{cfg['atr_period']}"
@@ -261,7 +267,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     calibrator = calibrate_isotonic(all_mu.reshape(-1, 1), ret1m)'''
 
     # ─── Instead of the on‑disk calibrator, fit one in‑memory ─────────
-    from sklearn.isotonic import IsotonicRegression
+    '''from sklearn.isotonic import IsotonicRegression
     # 1) compute μ for each bar
     all_X = feats[pc_cols].to_numpy(dtype=np.float32)
     all_mu = np.array(
@@ -274,6 +280,22 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # 3) fit in‑memory isotonic μ→P(up)
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     iso.fit(all_mu, labels)
+    calibrator = iso'''
+
+    from sklearn.isotonic import IsotonicRegression
+
+    # 1) compute µ for each bar
+    all_X = feats[pc_cols].to_numpy(dtype=np.float32)
+    all_mu = np.array([ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu
+                       for x in all_X])
+
+    # 2) compute *continuous* next‐bar return as our target
+    target = (feats["close"].shift(-1) / feats["open"] - 1.0).fillna(0.0)
+
+    # 3) fit in‑memory isotonic μ→E[ret1m]
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(all_mu, target)
+
     calibrator = iso
 
     #ev.residual_threshold = 2.0
@@ -473,7 +495,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     risk = RiskManager(
         account_equity = float(cfg["equity"]),
         cost_model = cost_model,
-        max_kelly = float(cfg.get("max_kelly", 0.5)),
+        max_kelly = float(cfg.get("max_kelly", 0.25)),
         adv_cap_pct = float(cfg.get("adv_cap_pct", 0.20)),
         )
 
@@ -500,6 +522,19 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #bt = Backtester(feats, cfg)  # Pass the prepared DataFrame
     # 5 ─ Event loop
     # Pass all the required components into the Backtester
+    # ─── Recompute daily regimes for later breakdown ───
+    from prediction_engine.market_regime import label_days, RegimeParams
+    df_raw["timestamp"] = pd.to_datetime(df_raw["Date"] + " " + df_raw["Time"])
+    daily_df = (
+        df_raw
+        .set_index("timestamp")
+        .resample("D")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+    daily_regimes = label_days(daily_df, RegimeParams())
+
+
     bt = Backtester(
         features_df=feats,
         cfg=cfg,
@@ -509,6 +544,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         cost_model=cost_model,
         calibrator=calibrator,
         good_clusters=good_clusters,
+        regimes=daily_regimes,
     )
 
     #eq_curve = bt.run()
@@ -527,7 +563,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         inplace=True,
     )
 
-    # ─── Recompute daily regimes for later breakdown ───
+
+
+    '''# ─── Recompute daily regimes for later breakdown ───
     from prediction_engine.market_regime import label_days, RegimeParams
     df_raw["timestamp"] = pd.to_datetime(df_raw["Date"] + " " + df_raw["Time"])
     daily_df = (
@@ -537,7 +575,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
         .dropna()
     )
-    daily_regimes = label_days(daily_df, RegimeParams())
+    daily_regimes = label_days(daily_df, RegimeParams())'''
 
     # Save
     #out_path = Path(cfg["out"])

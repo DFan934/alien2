@@ -161,7 +161,8 @@ class EVEngine:
         blend_alpha: float = 0.5,  # weight on synthetic analogue (α)
         lambda_reg: float = 0.05,  # NEW: ridge shrinkage weight (0 = none)
         #residual_threshold: float = 0.001,  # NEW: max acceptable synth residual
-        tau_dist: float = float("inf"),
+        #tau_dist: float = float("inf"),
+        tau_dist: float | None = None,
         max_cached: int = 1024,
         calibrator: Any | None=None,
         residual_threshold: float = 0.75,
@@ -184,7 +185,13 @@ class EVEngine:
         self.alpha = float(blend_alpha)
         self.lambda_reg = float(lambda_reg)  # NEW
         # NEW: threshold for acceptable synth residual
-        self.tau_dist = float(tau_dist)
+        #self.tau_dist = float(tau_dist)
+        # ─── sensible fallback for τ² if caller left it None ─────────────
+        if tau_dist is None:
+            self.tau_dist = (2.0 * self.h) ** 2     # ≈ kernel cut‑off radius
+        else:
+            self.tau_dist = float(tau_dist)
+
         self._synth_cache = lru_cache(max_cached)(self._synth_ev)
         self._scale_vec: np.ndarray | None = None
         self._n_feat_schema: int | None = None
@@ -299,6 +306,11 @@ class EVEngine:
     ) -> "EVEngine":
         artefact_dir = Path(artefact_dir)
         centers = np.load(artefact_dir / "centers.npy")
+
+        # ── Compute τ² as the 75‑th‑percentile of inter‑centroid distances ──
+        pair_d2 = ((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1).ravel()
+        tau_sq_p75 = float(np.percentile(pair_d2, 75))
+
         stats_path = artefact_dir / "cluster_stats.npz"
         stats = np.load(stats_path, allow_pickle=True)
         regime_arr = stats["regime"] if "regime" in stats.files else np.full(len(stats["mu"]), "ANY", dtype="U10")
@@ -453,7 +465,9 @@ class EVEngine:
             regime_curves={**regime_curves, **curves},
             cost_model=cost_model,
             calibrator=calibrator,
-            residual_threshold=residual_threshold,
+            #residual_threshold=residual_threshold,
+            residual_threshold=tau_sq_p75,
+
             _scale_vec=scale_vec,
             _n_feat_schema=n_feat_schema,
             cluster_regime=regime_arr,
@@ -572,7 +586,10 @@ class EVEngine:
             beta = np.zeros_like(idx, dtype=np.float32)
             beta[0] = 1.0
             #residual = np.inf
-            residual = 0
+            #residual = 0
+            # ── FIX: keep a usable residual even without synth ──────────
+            residual = nearest_d2  # <<<<<<<<< was always 0
+
             mu_syn, var_syn, var_down_syn = mu_k, var_k, var_down_k
         '''# ------------------------------------------------------------
         # 3. Synthetic analogue via inverse‑difference weights

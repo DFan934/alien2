@@ -7,6 +7,7 @@ saves a pickled `IsotonicRegression` object.
 """
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Tuple
 
 import joblib
@@ -22,7 +23,7 @@ __all__ = ("calibrate_isotonic", "load_calibrator")
 def calibrate_isotonic(
     mu_vals: np.ndarray,
     labels: np.ndarray,
-    out_dir: Path,
+    out_dir: Path | None = None,
     *,
     y_min: float = 0.0,
     y_max: float = 1.0,
@@ -40,7 +41,8 @@ def calibrate_isotonic(
     out_dir.mkdir(parents=True, exist_ok=True)
     iso = IsotonicRegression(out_of_bounds="clip", y_min=y_min, y_max=y_max)
     iso.fit(mu_vals.astype(float), labels.astype(float))
-
+    if out_dir is None:
+        out_dir = Path(TemporaryDirectory().name)
     # --- sanity: mapping must not collapse to a constant -------------------
     if np.ptp(iso.predict(mu_vals)) < 1e-4:
         raise RuntimeError(

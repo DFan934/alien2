@@ -27,6 +27,11 @@ class Backtester:
     """
     Runs an event-driven backtest loop using pre-computed features.
     """
+    # ─── strategy knobs (tune here) ────────────────────────────────
+    STOP_LOSS_PCT   = 0.01   # 1 % below entry
+    TAKE_PROFIT_PCT = 0.015  # 1.5 % above entry
+    MAX_KELLY_PROB  = 0.60   # minimum calibrated edge to size up
+
 
     def __init__(self,
                  features_df: pd.DataFrame,
@@ -38,6 +43,7 @@ class Backtester:
                  cost_model: BasicCostModel,
                  calibrator,
                  good_clusters: set[int],
+                 regimes: pd.Series,
                  ):
         """
         Initializes the Backtester with a DataFrame that already contains
@@ -53,6 +59,7 @@ class Backtester:
         self.cost = cost_model
         self.good_clusters = good_clusters
         self.cal = calibrator
+        self.regimes = regimes
 
 
 
@@ -81,6 +88,15 @@ class Backtester:
                 "symbol": row["symbol"],
                 "price": row["open"],  # Fills at NEXT bar's open
             }
+
+            # --- proactive stop‑loss / take‑profit -----------------
+            # --- proactive stop‑loss / take‑profit (flag only!) -------------
+            sl_hit = False
+            if risk.position_size > 0:
+                entry_px = risk.avg_entry_price
+                if (row["low"] <= entry_px * (1 - self.STOP_LOSS_PCT) or
+                        row["high"] >= entry_px * (1 + self.TAKE_PROFIT_PCT)):
+                    sl_hit = True  # we’ll flatten later
 
             # 5.1 Execute any queued orders (from previous bar)
             # 5.1 Execute any queued orders (from previous bar)
@@ -136,13 +152,19 @@ class Backtester:
             # -------- EV evaluation ---------------------------------
             adv_pct = row.get("adv_pct", 10.0)
             half_spread = row.get("half_spread", 0.01)
+            #  ─ determine today's regime (may return NaN / None) ─
+            reg = self.regimes.get(row["timestamp"].normalize(), None)
+            if pd.isna(reg):
+                reg = None  # keep evaluate() happy
 
             ev_raw = ev.evaluate(
                 x_vec,
                 half_spread = 0.0,
                 adv_percentile = adv_pct,
-                regime = None,
+                regime = reg,
             )
+
+            print("[DBG] residual=", ev_raw.residual)
 
             # skip permanently bad clusters
             #if ev_raw.cluster_id not in self.good_clusters:
@@ -165,7 +187,7 @@ class Backtester:
             # ── 2. Continuous μ → expected return (already calibrated) ─
             exp_ret = float(self.cal.predict([[ev_raw.mu]])[0]) if self.cal else ev_raw.mu
 
-            # ── 3. Position sizing proportional to expected return ─────
+            '''# ── 3. Position sizing proportional to expected return ─────
             #     min_cap_kelly ≈ 0.30 prevents tiny noisy trades
             min_cap_kelly = 0.30
             pos_fraction = max(0.0, exp_ret / 0.01)  # 1 % exp ret ⇒ full Kelly
@@ -178,6 +200,20 @@ class Backtester:
                 price=row["open"],
                 adv=row.get("adv", None),
                 override_frac=pos_fraction,  # <── NEW ARG your RiskManager already supports
+            )'''
+
+            # ── 3.  Probability‑weighted Kelly fraction ──────────────────────
+            #     Edge = P(up)‑0.55 ; full size once edge ≥ 20 %
+            p_up = float(self.cal.predict([[ev_raw.mu]])[0]) if self.cal else 0.5
+            edge = max(0.0, p_up - 0.55)  # need > 55 % to trade
+            pos_fraction = np.clip(edge / 0.20, 0.0, 1.0)  # full Kelly at 75 %
+
+            qty = risk.kelly_position(
+                mu=exp_ret,
+                variance_down=ev_raw.variance_down,
+                price=row["open"],
+                adv=row.get("adv", None),
+                override_frac=pos_fraction,
             )
 
             # =====================================================================
@@ -242,7 +278,7 @@ class Backtester:
                 qty = 0'''
 
             # ── SIMPLIFIED: Gate purely on raw µ>0 ──────────────────────────
-            if ev_res.mu > 0:
+            '''if ev_res.mu > 0:
                 qty = risk.kelly_position(
                     mu = ev_res.mu,
                     variance_down = ev_res.variance_down,
@@ -250,7 +286,28 @@ class Backtester:
                     adv = adv_today,
                 )
             else:
+                qty = 0'''
+            # -- gate out bad analogues EARLY -----------------------
+            if ev_raw.residual > self.ev.residual_threshold:
+                continue
+
+            # ------------------------------------------------------------------
+            # Use regression calibrator:  μ → expected 1‑bar return (E[r₁])
+            # ------------------------------------------------------------------
+            exp_ret = (float(self.cal.predict([[ev_raw.mu]])[0])
+                       if self.cal is not None else ev_raw.mu)
+
+            if exp_ret <= 0:          # no positive edge
                 qty = 0
+            else:
+                qty = risk.kelly_position(
+                          mu             = exp_ret,
+                          variance_down  = ev_raw.variance_down,
+                          price          = row["open"],
+                          adv            = adv_today,
+                          #override_frac  = pos_fraction
+                       )
+
 
             '''#ev_res = ev.evaluate(x_vec, adv_percentile=10.0, regime=None, half_spread=0)
 
@@ -345,14 +402,13 @@ class Backtester:
             #    qty_exit = -risk.position_size  # flatten
 
             # ─── size exit (1‑bar hold) ───────────────────────────────────────
-            if risk.position_size > 0:
+            # ─── exit sizing (1‑bar hold *or* stop‑loss) ───────────────────
+            if sl_hit and risk.position_size > 0:
+                # stop‑loss or take‑profit just triggered
                 qty_exit = -risk.position_size
-                if not math.isfinite(qty_exit):
-                    logging.error(
-                    "Bad qty_exit=%r on bar %s (position_size=%r)",
-                    qty_exit, bar["ts"], risk.position_size
-                    )
-                    qty_exit = 0
+            elif risk.position_size > 0:
+                # 1‑bar hold rule (optional – comment out to let winners run)
+                qty_exit = -risk.position_size
             else:
                 qty_exit = 0
 
@@ -361,7 +417,7 @@ class Backtester:
             #     (search for the comment "# queue orders for next bar --------------------------------------------")
 
             # --- intrabar risk control (executed on NEXT bar open) -----------------
-            if risk.position_size > 0:
+            '''if risk.position_size > 0:
                 #entry_px = broker.average_entry_price(cfg["symbol"])
                 entry_px = risk.avg_entry_price
 
@@ -371,7 +427,7 @@ class Backtester:
                 if row["open"] <= stop_px or row["open"] >= tp_px:
                     qty_exit = -risk.position_size
             else:
-                qty_exit = 0
+                qty_exit = 0'''
             # ──────────────────────────────────────────────────────────────────────────
 
             # queue orders for next bar --------------------------------------------
@@ -403,6 +459,8 @@ class Backtester:
                 "close": row["close"],
                 "cluster_id": ev_res.cluster_id,
                 "notional_abs": abs(risk.position_size * row["open"]),  #New
+                "adv_used": adv_today,
+
             })
 
 

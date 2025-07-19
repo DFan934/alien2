@@ -174,6 +174,9 @@ class RiskManager:
             if adv is not None and adv > 0:
                 qty = min(qty, math.floor(adv * self.adv_cap_pct))
 
+            if override_frac is not None:
+                return max(int(override_frac), 0)
+
             return max(qty, 0)
 
     # ░░░░░░░░░░  END PATCH  ░░░░░░░░░░
