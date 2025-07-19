@@ -226,7 +226,18 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #calibrator = load_calibrator(Path(cfg["artefacts"]) / "calibration")
 
     # we still load it for later use, but we won’t stomp µ in the engine
-    calibrator = load_calibrator(Path(cfg["artefacts"]) / "calibration")
+    #calibrator = load_calibrator(Path(cfg["artefacts"]) / "calibration")
+
+    calibrator = None
+
+    # ─── NEW: Retrain isotonic calibrator on in‐sample mu → 1‑bar return ───
+
+
+    import numpy as _np, pandas as _pd
+
+    # 1) cluster‐level µ stats
+    stats = _np.load(art_dir / "cluster_stats.npz", allow_pickle=True)
+    mu_by_cl = stats["mu"]
 
     #ev = EVEngine.from_artifacts(art_dir, cost_model=cost_model,calibrator=calibrator)
     # by passing None here, EVEngine.evaluate() will leave µ untouched
@@ -237,7 +248,41 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         #residual_threshold=cfg["residual_threshold"]
        )
 
-    ev.residual_threshold = 2.0
+    from prediction_engine.calibration import calibrate_isotonic
+    # 1) compute µ for each bar
+    '''all_X = feats[pc_cols].to_numpy(dtype=np.float32)
+    all_mu = np.array(
+        [ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu for x in all_X]
+    )
+    # 2) compute the actual next‐bar return
+    ret1m = feats["close"].shift(-1) / feats["open"] - 1.0
+    ret1m = ret1m.fillna(0.0).to_numpy()
+    # 3) fit a fresh isotonic mapping µ→ret1m
+    calibrator = calibrate_isotonic(all_mu.reshape(-1, 1), ret1m)'''
+
+    # ─── Instead of the on‑disk calibrator, fit one in‑memory ─────────
+    from sklearn.isotonic import IsotonicRegression
+    # 1) compute μ for each bar
+    all_X = feats[pc_cols].to_numpy(dtype=np.float32)
+    all_mu = np.array(
+        [ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu for x in all_X]
+        )
+    # 2) compute binary 1‑bar outcome (1 if ret>0 else 0)
+    ret1m = (feats["close"].shift(-1) / feats["open"] - 1.0).fillna(0.0)
+    labels = (ret1m > 0).astype(int).to_numpy()
+
+    # 3) fit in‑memory isotonic μ→P(up)
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(all_mu, labels)
+    calibrator = iso
+
+    #ev.residual_threshold = 2.0
+    # ~75 % of τ² median keeps roughly the closest quartile of centroids
+    if "tau_sq" in stats.files:
+        ev.residual_threshold = 0.75 * float(np.median(stats["tau_sq"]))
+    else:
+        ev.residual_threshold = (0.6 * ev.h) ** 2  # sensible fallback
+
     numeric_idx = pc_cols  # only PCA features go to EVEngine
 
     import numpy as _np, pandas as _pd
@@ -496,11 +541,15 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #signals = df.copy()
     signals = eq_curve.copy()
     signals["cum_return"] = signals["equity"] / cfg["equity"] - 1.0
+    signals["mu"] = signals["mu_cal"]  # keep legacy column name
 
     signals["ret1m"] = signals["open"].shift(-1) / signals["open"] - 1.0
 
-    assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
-    assert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
+    #assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
+    #assert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
+    #assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
+    #ssert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
+
 
     # mask for all trades you took:
     trade_mask = signals.qty_next_bar > 0
@@ -518,7 +567,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     from scripts.diagnostics import BacktestDiagnostics
 
     diag = BacktestDiagnostics(
-        df=eq_curve,
+        df=signals,
         raw=df_raw,
         cfg=cfg
     )

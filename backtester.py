@@ -148,15 +148,22 @@ class Backtester:
             #if ev_raw.cluster_id not in self.good_clusters:
             #    continue
 
-            #mu_cal = (
-            #    float(self.cal.predict([[ev_raw.mu]])[0])
-            #    if self.cal is not None else ev_raw.mu
-            #    )
+            if ev_raw.cluster_id not in self.good_clusters:
+                continue
+
+            if ev_raw.residual > self.ev.residual_threshold:
+                continue
+
+
+            mu_cal = (
+                float(self.cal.predict([[ev_raw.mu]])[0])
+                if self.cal is not None else ev_raw.mu
+                )
 
 
 
 
-            '''ev_res = ev_raw.__class__(
+            ev_res = ev_raw.__class__(
                 mu = mu_cal,
                 sigma = ev_raw.sigma,
                 variance_down = ev_raw.variance_down,
@@ -166,16 +173,18 @@ class Backtester:
                 outcome_probs = ev_raw.outcome_probs,
                 position_size = ev_raw.position_size,
                 drift_ticket = ev_raw.drift_ticket,
-                        )'''
+                        )
 
-            ev_res = ev_raw
+            #ev_res = ev_raw
+
+
 
             # -------- Kelly sizing ----------------------------------
             adv_today = row.get("adv", None)
 
-            if _ := ev_res.mu > 0:
-                print(f"[DBG] bar {bar['ts']} µ={ev_res.mu:.5f}  cost_ps="
-                      f"{risk.cost_model.estimate():.4f}  cluster={ev_res.cluster_id}")
+            #if _ := ev_res.mu > 0:
+            #    print(f"[DBG] bar {bar['ts']} µ={ev_res.mu:.5f}  cost_ps="
+             #         f"{risk.cost_model.estimate():.4f}  cluster={ev_res.cluster_id}")
 
 
 
@@ -189,7 +198,7 @@ class Backtester:
             else:
                 qty = 0'''
 
-            # ── C: Gate on calibrated probability, not just sign ─────────────
+            '''# ── C: Gate on calibrated probability, not just sign ─────────────
             if self.cal is not None:
                 p_win = float(self.cal.predict([[ev_res.mu]])[0])
             else:
@@ -203,8 +212,18 @@ class Backtester:
                     adv = adv_today,
                 )
             else:
-                qty = 0
+                qty = 0'''
 
+            # ── SIMPLIFIED: Gate purely on raw µ>0 ──────────────────────────
+            if ev_res.mu > 0:
+                qty = risk.kelly_position(
+                    mu = ev_res.mu,
+                    variance_down = ev_res.variance_down,
+                    price = row["open"],
+                    adv = adv_today,
+                )
+            else:
+                qty = 0
 
             '''#ev_res = ev.evaluate(x_vec, adv_percentile=10.0, regime=None, half_spread=0)
 
@@ -330,7 +349,7 @@ class Backtester:
                 "realised_pnl": realised_pnl,
                 "unrealised_pnl": mtm,
                 "qty_next_bar": qty,
-                "mu": ev_res.mu,
+                "mu_cal": ev_res.mu,
                 "sigma_sq": ev_res.sigma,
                 "var_down": ev_res.variance_down,  # NEW
                 "residual": ev_res.residual,
