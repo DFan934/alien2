@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Callable, Dict, List
 
 from core.contracts import FillEvent, OrderEvent
+from execution.core.contracts import FillEvent, OrderEvent
 
 
 class BrokerAPI(abc.ABC):

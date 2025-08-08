@@ -10,14 +10,14 @@ from collections import deque
 import pandas as pd
 
 from execution.latency import latency_monitor
-from execution.latency import timeit
+#from execution.latency import timeit
 
 
-from prediction_engine.utils.latency import timeit
+#from prediction_engine.utils.latency import timeit
 # + new lines
 from execution.position_store import PositionStore
 from execution.core.contracts import TradeSignal
-
+from execution.latency import latency_monitor, timeit
 
 """Execution Manager
 ====================
@@ -99,7 +99,10 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self.ev = ev
         self.risk_mgr = risk_mgr
         self.lat_monitor = lat_monitor
-        self.safety = SafetyFSM(config.get("safety", {}))
+        #self.safety = SafetyFSM(config.get("safety", {}))
+
+        self._safety_q: "asyncio.Queue[SafetyAction]" = asyncio.Queue()
+        self.safety = SafetyFSM(config.get("safety", {}), channel=self._safety_q)
 
         # NEW: Instantiate integrated components
         self.regime_detector = RegimeDetector()
@@ -122,13 +125,22 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         #self.exit_mgr = ExitManager(self.store)
         self._risk_mult = 1.0
         self._halt_active = False
-        self._safety_q: "asyncio.Queue[SafetyAction]" = asyncio.Queue()
+        #self._safety_q: "asyncio.Queue[SafetyAction]" = asyncio.Queue()
         self.stop_mgr = StopManager(self.store)
         self.exit_mgr = ExitManager(self.store)
         # re‑instantiate SafetyFSM with channel
         self.safety = SafetyFSM(config.get("safety", {}), channel=self._safety_q)
+
+        # background watcher (started in start())
+        self._safety_task: Optional[asyncio.Task] = None
+
+        # feature order from EVEngine schema (fail-fast)
+        self._feature_names: Optional[list[str]] = getattr(ev, "feature_names", None)
+
+
+
         # background watcher
-        self._safety_task = asyncio.create_task(self._safety_watcher())
+        #self._safety_task = asyncio.create_task(self._safety_watcher())
         self.regime_profiles: dict = config.get("regime_profiles", {})
 
     # ------------------------------------------------------------------
@@ -137,7 +149,13 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self._writer_task = asyncio.create_task(self._signal_writer())
         self._safety_task = asyncio.create_task(self._safety_watcher())
 
-
+        if hasattr(self.lat_monitor, "mean"):
+            # our latency monitor exposes .mean(label)
+            try:
+                latency_ms = float(self.lat_monitor.mean("execution_bar"))
+            except TypeError:
+                # Prometheus Summary style fallback
+                latency_ms = 0.0
 
     async def stop(self) -> None:
         """Flush queue & stop writer."""
@@ -146,7 +164,8 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             self._writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._writer_task
-        if hasattr(self, "_safety_task") and self._safety_task:
+        #if hasattr(self, "_safety_task") and self._safety_task:
+        if self._safety_task:
             self._safety_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._safety_task
@@ -259,7 +278,7 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
 
         # 3) Numeric feature vector -----------------------------------
-        if self._numeric_keys is None:
+        #if self._numeric_keys is None:
             '''self._numeric_keys = [k for k, v in feats.items() if isinstance(v, (int, float)) and not math.isnan(v)]
             self._numeric_keys.sort()
             exp_dim = self.ev.centers.shape[1]
@@ -269,10 +288,24 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             # Preserve the *incoming* order and strictly respect the schema
             # defined in EVEngine (feature_schema.json).  We no longer sort or
             # truncate – any mismatch must be treated as a hard error.
-            self._numeric_keys = [
-                k for k, v in feats.items()
-                if isinstance(v, (int, float)) and not math.isnan(v)
-            ]
+        #    self._numeric_keys = [
+        #        k for k, v in feats.items()
+        #        if isinstance(v, (int, float)) and not math.isnan(v)
+        #    ]
+
+        # Strict feature-order enforcement from EVEngine artefacts
+        if self._feature_names:
+            missing = [f for f in self._feature_names if f not in feats]
+            extra = [k for k in feats.keys() if k not in self._feature_names]
+            if missing or extra:
+                raise ValueError(
+                f"Feature schema mismatch. Missing={missing} Extra={extra}"
+                )
+            self._numeric_keys = self._feature_names
+        else:
+            # Fallback (shouldn't happen once EVEngine is wired with schema)
+            self._numeric_keys = [k for k, v in feats.items()
+                                           if isinstance(v, (int, float)) and not math.isnan(v)]
 
         exp_dim = self.ev.centers.shape[1]
         if len(self._numeric_keys) != exp_dim:
@@ -494,7 +527,14 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         with self._log_path.open("a", buffering=1) as fp:
             while True:
                 line = await self._sig_q.get()
-                lat_ms = latency_monitor.mean("execution_bar")
+                #lat_ms = latency_monitor.mean("execution_bar")
+
+                # grab current average latency safely
+                try:
+                    lat_ms = float(latency_monitor.mean("execution_bar"))
+                except Exception:
+                    lat_ms = 0.0
+
                 fp.write(f"{line},{lat_ms:.3f}\n")
 
                 self._sig_q.task_done()

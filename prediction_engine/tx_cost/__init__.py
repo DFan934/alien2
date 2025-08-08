@@ -62,11 +62,21 @@ class BasicCostModel(BaseCostModel):
     #_IMPACT_COEFF: float = 9e-5          # κ
     #_DEFAULT_SPREAD_CENTS: float = 2.0   # ½-spread when no quote supplied
     #_COMMISSION: float = 0.002           # $/share
-    _IMPACT_COEFF: float = 0.0
-    _DEFAULT_SPREAD_CENTS: float = 0.0   # ½-spread when no quote supplied
-    _COMMISSION: float = 0.000
-    _VOL_COEFF = 0.5  # tune later
-    _SPREAD_FALLBACK = 0.003  # 30 bp round-trip for microcaps
+    #_IMPACT_COEFF: float = 0.0
+    #_DEFAULT_SPREAD_CENTS: float = 0.0   # ½-spread when no quote supplied
+    #_COMMISSION: float = 0.000
+    #_VOL_COEFF = 0.5  # tune later
+    #_SPREAD_FALLBACK = 0.003  # 30 bp round-trip for microcaps
+
+    # Calibrated-but-conservative defaults
+    # impact is modeled per-share via sqrt(q/ADV) — ~0.5 bps equivalent
+    _IMPACT_COEFF: float = 5e-5  # κ
+    _DEFAULT_SPREAD_CENTS: float = 1.5  # ½-spread fallback in ¢
+    _COMMISSION: float = 0.00005  # $/share (e.g., $0.005)
+    _SPREAD_FALLBACK = 0.00015  # 1.5¢ half-spread fallback (USD)
+
+
+
     # ------------------------------------------------------------------ #
     # Core                                                               #
     # ------------------------------------------------------------------ #
@@ -136,7 +146,8 @@ class BasicCostModel(BaseCostModel):
             slip = 0.00015 * max(0.0, min((adv_percentile - 5) / 15, 1.0))
 
 
-        return hs + slip
+        #return hs + slip
+        return float(hs + self._COMMISSION + slip)
 
 
 # ---------------------------------------------------------------------------#

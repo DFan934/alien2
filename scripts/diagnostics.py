@@ -128,7 +128,10 @@ class BacktestDiagnostics:
     def cluster_exposure(self):
         counts = self.df["cluster_id"].value_counts().sort_index()
         pnl    = self.df.groupby("cluster_id")["realized_pnl"].sum() if "realized_pnl" in self.df else None
-        table  = pd.DataFrame({"count": counts, "total_pnl": pnl}).fillna(0)
+        #table  = pd.DataFrame({"count": counts, "total_pnl": pnl}).fillna(0)
+        table = pd.DataFrame({"count": counts, "total_pnl": pnl})
+        # forward-compatible with pandas deprecations
+        table = table.infer_objects(copy=False).fillna(0)
         top10  = table.sort_values("count", ascending=False).head(10)
         print("=== Top 10 Clusters by Trade Count ===")
         print(top10.to_string(), "\n")

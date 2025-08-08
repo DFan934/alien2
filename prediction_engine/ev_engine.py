@@ -386,6 +386,7 @@ class EVEngine:
 
         scale_vec = np.asarray(schema.get("scales", []), dtype=np.float32)
         n_feat_schema = len(schema["features"])
+        feature_names = list(schema["features"])
         kernel_cfg = json.loads((artefact_dir / "kernel_bandwidth.json").read_text())
 
         blend_alpha = kernel_cfg.get("blend_alpha", 0.5)
@@ -458,7 +459,8 @@ class EVEngine:
         #        raise FileNotFoundError("RF weights file missing for rf_weighted metric")
 
 
-        return cls(
+        #return cls(
+        engine = cls(
             centers=centers,
             mu=stats["mu"],
             var=stats["var"],
@@ -481,6 +483,21 @@ class EVEngine:
             _n_feat_schema=n_feat_schema,
             cluster_regime=regime_arr,
         )
+
+        # persist names for execution manager checks
+        engine._feature_names = feature_names  # type: ignore[attr-defined]
+        return engine
+
+    # expose feature names loaded from schema for downstream enforcement
+    def feature_names(self) -> list[str] | None:
+        try:
+            # recover from cached state: schema length implies presence
+            schema_path = Path(self.__dict__.get("_EVEngine__artefact_dir", ""))
+        except Exception:
+            schema_path = None
+        # store at construction time if needed (simpler):
+
+        return getattr(self, "_feature_names", None)
 
     def _get_recency_weights(self, regime: MarketRegime, n_points: int) -> np.ndarray:
         """NEW: Generate recency weights based on the current market regime."""
@@ -719,8 +736,12 @@ class EVEngine:
         # 6. Subtract estimated cost
         #cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile = adv_percentile)
         # apply extra slippage buffer of +0.0001
-        cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
-        cost_ps += 0.0001
+        #cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
+        #cost_ps += 0.0001
+
+        cost_ps = self._cost.estimate(
+            half_spread = half_spread,  # if None, model uses 15 bps fallback
+            adv_percentile = adv_percentile)
 
         mu_net = mu - cost_ps
 

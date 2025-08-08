@@ -571,9 +571,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     cost_model = BasicCostModel()
 
     # ── turn every component off for this experiment ───────────────────
-    cost_model._DEFAULT_SPREAD_CENTS = 0.0  # bid-ask half-spread
-    cost_model._COMMISSION = 0.0  # broker commission
-    cost_model._IMPACT_COEFF = 0.0  # square-root market-impact  ⬅ NEW
+    #cost_model._DEFAULT_SPREAD_CENTS = 0.0  # bid-ask half-spread
+    #cost_model._COMMISSION = 0.0  # broker commission
+    #cost_model._IMPACT_COEFF = 0.0  # square-root market-impact  ⬅ NEW
     # -------------------------------------------------------------------
 
     broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
@@ -719,13 +719,25 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     plt.show()
 
     # --- C) Cluster‑level summary ---
-    cluster_stats = signals.groupby("cluster_id").apply(
+    '''cluster_stats = signals.groupby("cluster_id").apply(
         lambda g: pd.Series({
             "n": len(g),
             "mean_µ": g["mu"].mean(),
             "mean_ret1m": (g["open"].shift(-1) / g["open"] - 1.0).mean()
         })
-    ).sort_values("mean_ret1m")
+    ).sort_values("mean_ret1m")'''
+    #print(cluster_stats.head(10))
+
+    # pandas ≥2.1 deprecation-safe aggregation
+    cluster_stats = (
+           signals
+           .assign(ret1m= lambda df: df["open"].shift(-1) / df["open"] - 1.0)
+            .groupby("cluster_id", group_keys=False)
+            .agg(n=("mu", "size"),
+                mean_µ = ("mu", "mean"),
+                mean_ret1m = ("ret1m", "mean"))
+            .sort_values("mean_ret1m"))
+
     print(cluster_stats.head(10))
 
     # buy‐and‐hold using raw data (df_raw) rather than the signals CSV
