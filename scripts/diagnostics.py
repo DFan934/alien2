@@ -31,19 +31,53 @@ class BacktestDiagnostics:
               f"  Avg ret:     {avg_ret:.4f}\n")
 
     def calibration(self):
+        if self.df.empty:
+            print("[CAL] input df empty – skipping calibration");
+            return
+
         self.df["decile"] = pd.qcut(self.df["mu"], 10, labels=False, duplicates="drop")
         bucket = self.df.groupby("decile")["ret1m"].mean()
+
+        # ── DIAG: bin counts (n per decile) ────────────────────────────
+        bin_n = self.df.groupby("decile")["mu"].count()
+        print("[CAL] bin counts:", bin_n.to_dict())
+
         print("=== Calibration (µ‑decile → avg 1‑bar return) ===")
         print(bucket.to_string(), "\n")
 
     def roc_auc(self):
         # μ > 0 as predictor of ret1m>0
-        y_true  = (self.df["ret1m"] > 0).astype(int)
+        #y_true  = (self.df["ret1m"] > 0).astype(int)
+        #y_score = self.df["mu"].values
+
+        if self.df.empty:
+            print("[AUC] input df empty – skipping ROC");
+            return
+
+        y_true = (self.df["ret1m"] > 0).astype(int)
         y_score = self.df["mu"].values
         auc = roc_auc_score(y_true, y_score)
+
+       #auc = roc_auc_score(y_true, y_score)
+
+        # confusion matrix using µ>0 as hard classifier
+        y_pred = (y_score > 0).astype(int)
+        tp = int(((y_pred == 1) & (y_true == 1)).sum())
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        tn = int(((y_pred == 0) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+
+        print(f"=== ROC AUC (µ>0 vs actual sign) ===\n"
+        f"AUC = {auc:.3f}\n"
+        f"TP={tp}  FP={fp}  TN={tn}  FN={fn}\n")
+
         print(f"=== ROC AUC (µ>0 vs actual sign) ===\nAUC = {auc:.3f}\n")
 
     def drawdown(self):
+        if self.df.empty:
+            print("[DD] input df empty – skipping drawdown");
+            return
+
         eq = self.df["equity"]
         peak = eq.cummax()
         dd   = (eq / peak - 1) * 100

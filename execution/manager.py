@@ -155,6 +155,13 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
     @timeit("execution_bar")
     async def on_bar(self, bar: Dict[str, Any]) -> None:  # noqa: C901
         """Primary entry called by the bar‑ingestion loop."""
+        t0 = time.time()  # wall-clock start
+
+        lat = (time.time() - t0) * 1_000  # ms
+        print(f"[Latency] bar_ts={bar['ts']}  submit_ms={lat:.1f}")
+
+
+
         sym = bar["symbol"]
         price = bar["price"]
         adv = bar.get("adv", 1.0) # Use get for safety
@@ -277,14 +284,32 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         #ev_res = self.ev.evaluate(x_vec, base_qty, adv)
         ev_res = self.ev.evaluate(x_vec, adv_percentile=adv, regime=current_regime)
 
+        if ev_res.mu <= 0:  # net after cost
+            return # don’t trade negative edge
+
         # 4) Kelly scaling (downside variance) -------------------------
         #denom = max(ev_res.variance_down, 1e-8)
         denom = self.risk_mgr.scale_variance(ev_res.variance_down, adv)
 
         kelly_frac = max(0.0, ev_res.mu / (denom * 2))
         final_qty = int(base_qty * min(kelly_frac, 1.0))
+
+        # ─── DIAG: Kelly sizing details ─────────────────────────────────────
+        print(f"[Kelly] sym={sym}  μ={ev_res.mu:.6f}  σ_down={denom ** 0.5:.6f} "
+              f"base_qty={base_qty}  kelly_f={kelly_frac:.3f}  final_qty={final_qty}  "
+              f"adv_cap={adv:.0f}")
+        # ────────────────────────────────────────────────────────────────────
+
         if final_qty <= 0:
             return
+
+        # ─── DIAG: new entry candidate ──────────────────────────────────────
+        stop_px = price - feats.get("atr", 0.0) * self.risk_mgr.atr_multiplier \
+            if final_qty > 0 else float("nan")
+        take_profit_px = price * (1 + ExitManager.TP2_PCT)  # simple 1R TP
+        print(f"[Entry] sym={sym} μ={ev_res.mu:.6f} qty={final_qty} "
+              f"stop={stop_px:.2f} tp={take_profit_px:.2f}")
+        # ────────────────────────────────────────────────────────────────────
 
         # 5) Signal out -----------------------------------------------
         trade_id = f"{sym}_{int(time.time_ns())}"
@@ -323,10 +348,13 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             atr_now = feats.get("atr", 0.0)
             # Update stop (tighten/widen if needed)
             # after
-            new_stop = self.stop_mgr.update(sym, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+            #new_stop = self.stop_mgr.update(sym, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+
+            new_stop = self.stop_mgr.update(
+                sym, side, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+
             if new_stop is not None:
-                # TODO: Submit OrderEvent to broker to modify stop (fill this in if live)
-                logger.info(f"Stop updated for {sym}: {stop_px} → {new_stop}")
+                print(f"[Exit]  sym={sym}  new_stop={new_stop:.2f}  prev_stop={stop_px:.2f}")
 
             # Check for staged exits
             orderflow_delta = feats.get("orderflow_delta", 0.0)
@@ -352,7 +380,9 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         prof = self.regime_profiles.get(self.regime_detector.current().name, {})
 
         # after
-        new_stop = self.stop_mgr.update(sym, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+        #new_stop = self.stop_mgr.update(sym, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
+        new_stop = self.stop_mgr.update(
+            sym, side, price, ema_fast_dist, vwap_dist, atr_now, profile=prof)
         orderflow_delta = feats.get("orderflow_delta", 0.0)
         actions = self.exit_mgr.on_tick(sym, price, orderflow_delta, False, profile=prof)
 

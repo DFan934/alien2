@@ -82,12 +82,24 @@ class Backtester:
         log.info("Starting backtest with %d bars...", len(self.feats_df))
 
         # --- 2. Event Loop ---
-        for _, row in self.feats_df.iterrows():
-            bar = {
+        for i, (df_index, row) in enumerate(self.feats_df.iterrows(), 1):
+            '''bar = {
                 "ts": row["timestamp"],
                 "symbol": row["symbol"],
                 "price": row["open"],  # Fills at NEXT bar's open
-            }
+            }'''
+
+            # --- derive live half-spread -------------------------------------------------
+            # NB: raw bars have only O/H/L/C; use intrabar range as a crude proxy.
+            # Typical minute-bar low/high spread on small-caps ≈ 0.05–0.15 %.
+            half_spread = max(1e-6, (row["high"] - row["low"]) * 0.5)
+
+            bar = {
+                "ts": row["timestamp"],
+                "symbol": row["symbol"],
+                "price": row["open"],  # next-bar open fill
+                "half_spread": half_spread,  # ←  NEW – pass into EVEngine → cost model
+                }
 
             # --- proactive stop‑loss / take‑profit -----------------
             # --- proactive stop‑loss / take‑profit (flag only!) -------------
@@ -151,7 +163,12 @@ class Backtester:
 
             # -------- EV evaluation ---------------------------------
             adv_pct = row.get("adv_pct", 10.0)
-            half_spread = row.get("half_spread", 0.01)
+
+            #half_spread = row.get("half_spread", 0.01)
+
+            raw_spread = (row["high"] - row["low"]) * 0.5
+            # minute-bar range is much wider than bid-ask; assume only 10 % of it
+            half_spread = min(0.002 * row["close"], max(0.0002, 0.02 * raw_spread)) # 2 % of bar‐range<br>
             #  ─ determine today's regime (may return NaN / None) ─
             reg = self.regimes.get(row["timestamp"].normalize(), None)
             if pd.isna(reg):
@@ -159,7 +176,7 @@ class Backtester:
 
             ev_raw = ev.evaluate(
                 x_vec,
-                half_spread = 0.0,
+                half_spread = half_spread,
                 adv_percentile = adv_pct,
                 regime = reg,
             )
@@ -204,7 +221,10 @@ class Backtester:
 
             # ── 3.  Probability‑weighted Kelly fraction ──────────────────────
             #     Edge = P(up)‑0.55 ; full size once edge ≥ 20 %
-            p_up = float(self.cal.predict([[ev_raw.mu]])[0]) if self.cal else 0.5
+            #p_up = float(self.cal.predict([[ev_raw.mu]])[0]) if self.cal else 0.5
+            # crude mapping: assume N(0,σ)   P(up)≈Φ(μ/σ)
+            p_up = 0.5 * (1.0 + math.erf(ev_raw.mu / (2.0 * (ev_raw.sigma ** 0.5 + 1e-9))))
+
             edge = max(0.0, p_up - 0.55)  # need > 55 % to trade
             pos_fraction = np.clip(edge / 0.20, 0.0, 1.0)  # full Kelly at 75 %
 
@@ -227,7 +247,7 @@ class Backtester:
 
 
             ev_res = ev_raw.__class__(
-                mu = mu_cal,
+                mu = ev_raw.mu,
                 sigma = ev_raw.sigma,
                 variance_down = ev_raw.variance_down,
                 beta = ev_raw.beta,
@@ -288,16 +308,18 @@ class Backtester:
             else:
                 qty = 0'''
             # -- gate out bad analogues EARLY -----------------------
-            if ev_raw.residual > self.ev.residual_threshold:
-                continue
+            #if ev_raw.residual > self.ev.residual_threshold:
+            #    continue
 
             # ------------------------------------------------------------------
             # Use regression calibrator:  μ → expected 1‑bar return (E[r₁])
             # ------------------------------------------------------------------
-            exp_ret = (float(self.cal.predict([[ev_raw.mu]])[0])
-                       if self.cal is not None else ev_raw.mu)
+            #exp_ret = (float(self.cal.predict([[ev_raw.mu]])[0])
+            #           if self.cal is not None else ev_raw.mu)
+            exp_ret = ev_raw.mu
 
-            if exp_ret <= 0:          # no positive edge
+
+            '''if exp_ret <= 0:          # no positive edge
                 qty = 0
             else:
                 qty = risk.kelly_position(
@@ -306,8 +328,19 @@ class Backtester:
                           price          = row["open"],
                           adv            = adv_today,
                           #override_frac  = pos_fraction
-                       )
+                       )'''
 
+            # --- gate out weak edge OR bad analogue ----------------------------
+            _min_edge = 0.0004  # 4 bp ~ half today’s spread; tune if needed
+            if (exp_ret < _min_edge) or (ev_raw.residual > 0.75):
+                qty = 0
+            else:
+                qty = risk.kelly_position(
+                    mu=exp_ret,
+                    variance_down=ev_raw.variance_down,
+                    price=row["open"],
+                    adv=adv_today,
+                )
 
             '''#ev_res = ev.evaluate(x_vec, adv_percentile=10.0, regime=None, half_spread=0)
 
@@ -444,6 +477,16 @@ class Backtester:
 
             # --- 3. Record Equity ---
             current_equity = risk.account_equity + mtm
+
+            # ─── DIAG: every 50 bars ───────────────────────────────────────────
+            if i % 50 == 0:
+                cur_eq = risk.account_equity + mtm
+                max_dd = 1.0 - cur_eq / max(x["equity"] for x in equity_curve) \
+                    if equity_curve else 0.0
+                print(f"[Snap] bar={i:4d}  eq={cur_eq:,.0f}  "
+                      f"open_pos={risk.position_size}  maxDD={max_dd:.4f}")
+            # ───────────────────────────────────────────────────────────────────
+
             equity_curve.append({
                 "timestamp": bar["ts"],
                 "equity": current_equity,
@@ -467,4 +510,24 @@ class Backtester:
 
 
         log.info("Backtest loop finished.")
+
+        equity_df = pd.DataFrame(equity_curve)  # ← you create this just before return
+
+        # ─── DIAG: end-of-run summary ──────────────────────────────────────
+        print("\n[Equity.describe()]")
+        print(equity_df["equity"].describe())
+
+        # realised trade-level PnL array
+        trade_pnls = equity_df["realised_pnl"].values
+        print("\n[Trade-level PnL] n=", len(trade_pnls),
+              "  mean=", trade_pnls.mean().round(2),
+              "  std=", trade_pnls.std().round(2))
+
+        # quick histogram to CSV for later plotting
+        hist_path = Path("backtests") / "trade_pnl_hist.csv"
+        hist_path.parent.mkdir(exist_ok=True)
+        pd.Series(trade_pnls).to_csv(hist_path, index=False)
+        print("[Saved] trade-pnl histogram data →", hist_path)
+        # ───────────────────────────────────────────────────────────────────
+
         return pd.DataFrame(equity_curve)

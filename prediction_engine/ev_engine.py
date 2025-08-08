@@ -28,6 +28,9 @@ choice based on local centroid density, automatic loading of *kernel bandwidth*
 File location:  ``prediction_engine/ev_engine.py`` – drop‑in replacement for the
 old module.
 """
+# ⬆ after the last std-lib import near the top of the file
+import logging                         # ← ADD
+log = logging.getLogger(__name__)      # ← ADD
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -290,6 +293,9 @@ class EVEngine:
                 var_syn = float(beta @ self.var[idx])
                 var_down_syn = float(beta @ self.var_down[idx])
 
+            print(f"[EV] synth residual={residual:.5g}  α={self.alpha:.2f}")
+            print(f"[EV] β (first 5)={np.round(beta[:5], 4).tolist()}")
+            print(f"[EV] synth μ={mu_syn:.6f}  σ²={var_syn:.6f}")
 
             return mu_syn, var_syn, var_down_syn, beta.astype(np.float32, copy=False), residual
 
@@ -310,6 +316,9 @@ class EVEngine:
         # ── Compute τ² as the 75‑th‑percentile of inter‑centroid distances ──
         pair_d2 = ((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1).ravel()
         tau_sq_p75 = float(np.percentile(pair_d2, 75))
+
+        # ↓ ADD THIS LINE – keep only the closest ≈20 % analogues
+        tau_sq_p75 *= 0.40  # tighten residual gate
 
         stats_path = artefact_dir / "cluster_stats.npz"
         stats = np.load(stats_path, allow_pickle=True)
@@ -508,6 +517,11 @@ class EVEngine:
         """Return expected‑value statistics for one live feature vector."""
         x = np.ascontiguousarray(x, dtype=np.float32)
 
+        # ─── DEBUG: vector fingerprint & schema length ───────────────────────
+        vec_sha = hashlib.sha1(x.tobytes()).hexdigest()[:10]
+        print(f"[EV] start  vec_len={x.size}  sha={vec_sha}  expected_len={self._n_feat_schema}")
+        # ─────────────────────────────────────────────────────────────────────
+
         # ---- feature‑length / scale guard --------------------------
         if (self._n_feat_schema is not None) and (x.size != self._n_feat_schema):
             raise ValueError(
@@ -537,12 +551,11 @@ class EVEngine:
             if reg_mask.any():  # keep matches when possible
                 idx, dist2 = idx[reg_mask], dist2[reg_mask]
             else:  # ▲ NEW soft-fallback
-                import logging
-                logging.getLogger(__name__).warning(
+                log.warning(
                     "[EVEngine] regime=%s yielded zero matches; "
                     "falling back to all clusters",
                     regime.name,
-                )
+                    )
                 # fall back to full idx/dist2 already computed above
         # ---------------------------------------------------------------------
 
@@ -551,8 +564,7 @@ class EVEngine:
         # ---------------------------------------------------------------------
 
         if idx.size == 0:  # << add
-            import logging
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "[EVEngine] regime=%s had zero matches; falling back to all clusters",
                 regime.name
             )
@@ -571,6 +583,9 @@ class EVEngine:
         mu_k = float(np.dot(w, self.mu[idx]))
         var_k = float(np.dot(w, self.var[idx]))
         var_down_k = float(np.dot(w, self.var_down[idx]))
+
+        print(f"[EV] KNN k={idx.size}  ids={idx[:5].tolist()}  d2={np.round(dist2[:5], 6).tolist()}")
+        print(f"[EV] kernel μ={mu_k:.6f}  σ²={var_k:.6f}")
 
         # -----------------------------------------------------------------
         # NEW · decide whether to call analogue_synth
@@ -670,7 +685,8 @@ class EVEngine:
         # ------------------------------------------------------------
         # 4. Subtract transaction cost
         # ------------------------------------------------------------
-        cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
+        #cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
+        #print(f"[Cost] raw_mu={mu:+.6f}  cost_ps={cost_ps:+.6f}  mu_net_preCal={mu - cost_ps:+.6f}")
 
         # 5. ISO‑CALIBRATION  (post‑cost, pre‑return)
         '''mu_cal = (
@@ -685,13 +701,79 @@ class EVEngine:
         #    if self._calibrator is not None
         #    else mu
                # )
+
+        #if self._calibrator is not None:
+        #    mu_cal = float(self._calibrator.predict([[mu]])[0])
+        #    print(f"[Cal] raw_mu={mu:+.6f}  mu_cal={mu_cal:+.6f}")
+        #else:
+        #    mu_cal = mu
+
         # ── A: override raw µ with calibrated µ ─────────────────
         #mu = mu_cal
+        #mu_net = mu - cost_ps
+
+        # 5. ISO-CALIBRATION  **before** cost
+        if self._calibrator:
+            mu = float(self._calibrator.predict([[mu]])[0])  # calibrated µ
+            print(f"[Cal] µ_cal={mu:+.6f}")
+        # 6. Subtract estimated cost
+        #cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile = adv_percentile)
+        # apply extra slippage buffer of +0.0001
+        cost_ps = self._cost.estimate(half_spread=half_spread, adv_percentile=adv_percentile)
+        cost_ps += 0.0001
+
         mu_net = mu - cost_ps
+
+        mu_net_original = mu - cost_ps
+        mu_net = mu_net_original
+
+        # ------------------------------------------------------------------
+        # QUICK-WIN : penalise distant analogues
+        # • Hard gate  : skip anything whose residual > τ₇₅/3
+        # • Soft weight: shrink edge by 1/(1+residual)
+        # ------------------------------------------------------------------
+
+        #if residual > (self.residual_threshold / 3.0):
+        #    mu_net = 0.0  # treat as no-edge
+        # allow further-out analogues by raising threshold
+
+        '''if residual > (self.residual_threshold * 2.0):
+            mu_net = 0.0
+        else:
+            mu_net *= 1.0 / (1.0 + residual)'''
+
+        # softened gate on residual: allow up to half threshold
+        '''hard_limit = self.residual_threshold / 2.0
+        if residual > hard_limit:
+            mu_net = 0.0
+        else:
+            mu_net *= 1.0 / (1.0 + residual * 0.5)  # softer shrink
+        '''
+
+        hard_limit = self.residual_threshold * 0.66
+        if residual > hard_limit:
+            mu_net = 0.0
+        else:
+            # always shrink by 1/(1+residual), but don’t zero
+            mu_net *= 1.0 / (1.0 + residual)
+
+
 
         #mu_net = mu - cost_ps
         #mu = mu_cal  # use calibrated value
         #mu_net = mu - cost_ps
+
+        if self._calibrator:
+            mu_cal = float(self._calibrator.predict([[mu]])[0])
+            print(f"[Cal] raw_mu={mu:+.6f}  mu_cal={mu_cal:+.6f}")
+
+        # (old) we already zeroed mu_net on high residual
+        # now even if we zero above, add a soft fallback:
+        if mu_net == 0.0 and residual <= self.residual_threshold:
+            # recover a bit of edge for moderate residuals
+            mu_net = mu_net + (mu_net_original if 'mu_net_original' in locals() else mu_net) * 0.1
+
+
 
         # 6. if you want P(win), _compute it here_ but keep µ_net pure:
         p_win = (self._calibrator.predict([[mu]])[0]
@@ -745,6 +827,12 @@ class EVEngine:
         if dm.status()[0] is DriftStatus.RETRAIN_SIGNAL:
             from threading import Thread
             Thread(target=_kickoff_retrain, daemon=True).start()
+
+        print(f"[EV] DONE  mu_net={mu_net:.6f}  cluster_id={int(idx[0])}  pos_size={pos_size:.4f}")
+        # ────────────────────────────────────────────────────────────────────
+
+        print(f"[Cost] raw_mu={mu:+.6f}  cost_ps={cost_ps:+.6f}  "
+              f"mu_net={mu_net:+.6f}")
 
         return EVResult(
             mu_net,  # mu

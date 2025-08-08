@@ -48,6 +48,11 @@ class HistoricalIngestor:
             t0 = time.perf_counter()
             rows = 0
             for chunk in csv_chunk_generator(csv_path):
+                '''if logger.isEnabledFor(logger.DEBUG):
+                    logger.debug("[INGEST] %s chunk rows=%d  mem=%.2f MB",
+                                 symbol, len(chunk),
+                                 chunk.memory_usage(deep=True).sum() / 1e6)
+                    '''
                 chunk = clean_chunk(chunk, symbol)
                 write_partition(chunk, self.parquet_dir)
                 rows += len(chunk)

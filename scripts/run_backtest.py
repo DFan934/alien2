@@ -37,6 +37,27 @@ from execution.manager import ExecutionManager
 from execution.risk_manager import RiskManager            # NEW
 from prediction_engine.tx_cost import BasicCostModel
 from prediction_engine.calibration import load_calibrator, calibrate_isotonic  # NEW – iso µ‑cal
+
+
+# ─── global run metadata ─────────────────────────────────────────────
+import uuid, subprocess, datetime as dt
+RUN_ID = uuid.uuid4().hex[:8]          # short random id
+try:
+    GIT_SHA = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=Path(__file__).parents[2],  # repo root
+    ).decode().strip()
+except Exception:
+    GIT_SHA = "n/a"
+RUN_META = {
+    "run_id": RUN_ID,
+    "git_sha": GIT_SHA,
+    "started": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+}
+# ─────────────────────────────────────────────────────────────────────
+
+
+
 # Keep only PCA feature columns (produced by CoreFeaturePipeline)
 def _pca_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c.startswith("pca_")]
@@ -95,13 +116,21 @@ def _resolve_path(path_like: str | Path) -> Path:
 # ────────────────────────────────────────────────────────────────────────
 async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(
-        level=logging.INFO, format="[%(@levelname)s] %(message)s", stream=sys.stdout
+        level=logging.DEBUG, format="[%(levelname)s] %(message)s", stream=sys.stdout
     )
+
+
+
     # suppress EVEngine’s regime/residual warnings
     # logging.getLogger("prediction_engine.ev_engine").setLevel(logging.ERROR)
 
     log = logging.getLogger("backtest")
     import pandas as pd
+
+    log.info("🚀 Backtest run %s (commit %s) started %s",
+             RUN_ID, GIT_SHA, RUN_META["started"])
+    log.debug("Full CLI: %s", " ".join(sys.argv))
+
     # 1 ─ Load raw CSV
     csv_path = _resolve_path(cfg["csv"])
     df_raw = pd.read_csv(csv_path)
@@ -290,11 +319,21 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                        for x in all_X])
 
     # 2) compute *continuous* next‐bar return as our target
-    target = (feats["close"].shift(-1) / feats["open"] - 1.0).fillna(0.0)
+    #target = (feats["close"].shift(-1) / feats["open"] - 1.0).fillna(0.0)
+    target = (
+            feats["close"].shift(-1) / feats["open"] - 1.0
+            ).fillna(0.0).to_numpy()
+
 
     # 3) fit in‑memory isotonic μ→E[ret1m]
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(all_mu, target)
+
+    # convert target to a numpy array and drop any NaNs before fitting
+    y = np.asarray(target)
+    mask = ~np.isnan(y)
+    iso.fit(all_mu[mask], y[mask])
+
+    #iso.fit(all_mu, target)
 
     calibrator = iso
 
@@ -352,10 +391,44 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #from pathlib import Path
 
     # SANITY CHECK
-    all_mu = [ev.evaluate(row, adv_percentile=10.0).mu
-              for row in feats[pc_cols].to_numpy(dtype=np.float32)]
+    #all_mu = [ev.evaluate(row, adv_percentile=10.0).mu
+    #          for row in feats[pc_cols].to_numpy(dtype=np.float32)]
+
+    all_mu = np.array(
+        [ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu
+        for x in all_X],
+        dtype = np.float32,
+        )
+
+    target = (feats["close"].shift(-1) / feats["open"] - 1.0).fillna(0.0)
+    # also turn it into a NumPy array
+    ret1m = np.asarray(target, dtype=np.float32)
+
+    #iso = IsotonicRegression(out_of_bounds="clip")
+
+    # fit on binned means to reduce overfitting
+    iso = IsotonicRegression(out_of_bounds="clip")
+    # before fitting, aggregate into 20 quantile‐bins:
+    df_cal = pd.DataFrame(dict(mu=all_mu, ret=ret1m))
+    df_cal['bin'] = pd.qcut(df_cal['mu'], 20, duplicates='drop')
+    mu_bin = df_cal.groupby('bin')['mu'].mean().to_numpy()
+    ret_bin = df_cal.groupby('bin')['ret'].mean().to_numpy()
+    iso.fit(mu_bin, ret_bin)
+
+    # drop any nan targets
+    #mask = ~np.isnan(ret1m)
+    #iso.fit(all_mu[mask], ret1m[mask])
+
     print(f"[Sanity-full] µ>0 on full tape: {sum(m > 0 for m in all_mu)} / {len(all_mu)}")
 
+    # 3) compute realised return **minus cost**
+    cost = cost_model.estimate(half_spread=0, adv_percentile=10.0)
+    ret1m = feats["close"].shift(-1) / feats["open"] - 1.0 - cost
+    ret1m = ret1m.fillna(0.0)  # << make sure no NaN left
+    ret1m = ret1m.to_numpy()  # sklearn wants ndarray, not Series
+    #iso.fit(all_mu, ret1m)
+    mask = ~np.isnan(ret1m)
+    iso.fit(all_mu[mask], ret1m[mask])
     # ─── Quick mu sanity BEFORE scan ───────────────────────────────────
     import numpy as _np
     all_X = feats[numeric_idx].to_numpy(dtype=_np.float32)
@@ -412,8 +485,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         # ░░░░░░░░░░  PATCH 4  ░░ top‑quartile good_clusters ░░░░░░░░░░
         # This logic now correctly sits inside the if-block.
         # keep only clusters whose mean_ret1m is in the top quartile
-        q75 = np.percentile(mean_ret1m_by_cl, 75)
-        good_clusters = set(np.where(mean_ret1m_by_cl >= q75)[0])
+        #q75 = np.percentile(mean_ret1m_by_cl, 75)
+        #good_clusters = set(np.where(mean_ret1m_by_cl >= q75)[0])
+        q80 = np.percentile(mean_ret1m_by_cl, 80)  # keep top 20 %
+        good_clusters = set(np.where(mean_ret1m_by_cl >= q80)[0])
+
         print(f"[Filter] good_clusters tightened to top‑quartile (n={len(good_clusters)})")
         # =====================================================================
 
@@ -487,10 +563,19 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # 4 ─ Instantiate Broker, Cost model & RiskManager
 
-    cost_model = BasicCostModel()
+    '''cost_model = BasicCostModel()
 
     cost_model._DEFAULT_SPREAD_CENTS = float(cfg["spread_bp"])
-    cost_model._COMMISSION = float(cfg["commission"])
+    cost_model._COMMISSION = float(cfg["commission"])'''
+
+    cost_model = BasicCostModel()
+
+    # ── turn every component off for this experiment ───────────────────
+    cost_model._DEFAULT_SPREAD_CENTS = 0.0  # bid-ask half-spread
+    cost_model._COMMISSION = 0.0  # broker commission
+    cost_model._IMPACT_COEFF = 0.0  # square-root market-impact  ⬅ NEW
+    # -------------------------------------------------------------------
+
     broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
     risk = RiskManager(
         account_equity = float(cfg["equity"]),

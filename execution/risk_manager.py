@@ -148,7 +148,8 @@ class RiskManager:
             if (not math.isfinite(self.account_equity) or self.account_equity <= 0
                     or price <= 0 or not math.isfinite(variance_down)):
                 return 0
-            var_eff = max(variance_down, 1e-8)  # numerical floor
+            #var_eff = max(variance_down, 1e-8)  # numerical floor
+            var_eff = max(variance_down, 2.3e-4)
 
             # ── 2.  Choose Kelly fraction --------------------------
             if override_frac is not None:
@@ -174,8 +175,8 @@ class RiskManager:
             if adv is not None and adv > 0:
                 qty = min(qty, math.floor(adv * self.adv_cap_pct))
 
-            if override_frac is not None:
-                return max(int(override_frac), 0)
+            #if override_frac is not None:
+            #    return max(int(override_frac), 0)
 
             return max(qty, 0)
 
@@ -273,6 +274,16 @@ class RiskManager:
         self.day_pl = getattr(self, "day_pl", 0.0) + realized_pnl
 
         is_closed = (self.position_size == 0.0)
+
+        # ─── DIAG: post-fill risk snapshot ──────────────────────────────────
+        print(f"[Risk] fill side={side}  size={size}  px={price:.2f}  pnl={realized_pnl:.2f}  "
+              f"equity={self.account_equity:.2f}  pos_sz={self.position_size}  "
+              f"drawdown={self.drawdown():.4f}  max_dd={self.max_drawdown:.4f}")
+        # If SafetyFSM is wired, show active flag
+        if self.safety_fsm is not None and getattr(self.safety_fsm, 'active_reason', None):
+            print(f"[Risk] SAFETY FLAG — {self.safety_fsm.active_reason.name}")
+        # ────────────────────────────────────────────────────────────────────
+
         return is_closed, realized_pnl, tid
 
 

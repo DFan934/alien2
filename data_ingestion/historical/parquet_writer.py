@@ -3,6 +3,7 @@
 ############################
 """Write cleaned chunks to hive‑partitioned Parquet **with schema lock‑in**."""
 from __future__ import annotations
+import hashlib
 
 import json
 import pathlib
@@ -82,6 +83,11 @@ def write_partition(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
         return
 
     _validate_schema(df, parquet_root)
+
+    if logger.isEnabledFor(logger.DEBUG):
+        col_sha = hashlib.sha1(",".join(df.columns).encode()).hexdigest()[:10]
+        logger.debug("[WRITE] %s rows=%d  sha=%s → %s",
+                     df["symbol"].iat[0], len(df), col_sha, parquet_root)
 
     symbol = df["symbol"].iat[0]
     ts = df["timestamp"].dt

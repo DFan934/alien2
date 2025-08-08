@@ -183,8 +183,8 @@ if __name__ == "__main__":
     import argparse
     from prediction_engine.ev_engine import EVEngine
     from prediction_engine.distance_calculator import DistanceCalculator  # noqa
-    from prediction_engine.execution.manager import ExecutionManager
-    from prediction_engine.execution.risk_manager import RiskManager
+    from execution.manager import ExecutionManager
+    from execution.risk_manager import RiskManager
 
     parser = argparse.ArgumentParser(description="Async back‑test runner")
     parser.add_argument("--parquet", required=True, help="Path to feature parquet slice")

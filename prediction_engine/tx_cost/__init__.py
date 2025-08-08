@@ -59,11 +59,14 @@ class BasicCostModel(BaseCostModel):
     """
 
     # Nightly-calibrated constants (override before back-test if needed)
-    _IMPACT_COEFF: float = 9e-5          # κ
-    _DEFAULT_SPREAD_CENTS: float = 2.0   # ½-spread when no quote supplied
-    _COMMISSION: float = 0.002           # $/share
+    #_IMPACT_COEFF: float = 9e-5          # κ
+    #_DEFAULT_SPREAD_CENTS: float = 2.0   # ½-spread when no quote supplied
+    #_COMMISSION: float = 0.002           # $/share
+    _IMPACT_COEFF: float = 0.0
+    _DEFAULT_SPREAD_CENTS: float = 0.0   # ½-spread when no quote supplied
+    _COMMISSION: float = 0.000
     _VOL_COEFF = 0.5  # tune later
-
+    _SPREAD_FALLBACK = 0.003  # 30 bp round-trip for microcaps
     # ------------------------------------------------------------------ #
     # Core                                                               #
     # ------------------------------------------------------------------ #
@@ -116,19 +119,24 @@ class BasicCostModel(BaseCostModel):
     # ------------------------------------------------------------------ #
     # Convenience alias (back-compat with old code)                      #
     # ------------------------------------------------------------------ #
-    def estimate(
-        self,
-        *,
-        half_spread: float | None = None,
-        adv_percentile: float | None = None,
-    ) -> float:
-        """Delegates to :meth:`cost` using a unit share."""
-        return self.cost(
-            1.0,
-            half_spread=half_spread,
-            adv_pct=adv_percentile,
-            volatility=None,
-        )
+    def estimate(self,
+                 *,
+                                  half_spread: float | None = None,
+                                  adv_percentile: float | None = None) -> float:
+
+
+    # 1. spread component  (if caller didn’t provide one)
+        hs = half_spread if half_spread is not None else self._SPREAD_FALLBACK
+
+    # 2. slippage: 0 bp at ADV≤5 %, ramps to 15 bp at ADV=20 %
+
+        if adv_percentile is None:
+            slip = 0.0000
+        else:
+            slip = 0.00015 * max(0.0, min((adv_percentile - 5) / 15, 1.0))
+
+
+        return hs + slip
 
 
 # ---------------------------------------------------------------------------#

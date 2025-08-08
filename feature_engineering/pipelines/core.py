@@ -17,6 +17,8 @@ from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+import logging
+log = logging.getLogger(__name__)
 
 from feature_engineering.pipelines.dataset_loader import load_parquet_dataset
 from feature_engineering.utils import logger, timeit
@@ -71,6 +73,9 @@ class CoreFeaturePipeline:
         expected by the calculators).
         Returns ONLY pca_1 … pca_k (+ symbol, timestamp), NOT raw features.
         """
+
+        log.info("[FE] run_mem start – rows=%d", len(df_raw))
+
         # 1) Apply calculators sequentially
         df = df_raw.copy()
 
@@ -82,7 +87,12 @@ class CoreFeaturePipeline:
                 df.drop(columns=col, inplace=True)
 
         for calc in _CALCULATORS:
+            t0 = pd.Timestamp.utcnow()
             df = calc(df)
+            log.debug("[FE] %-14s rows=%d  dt=%.0f ms",
+                      calc.__class__.__name__,
+                      len(df),
+                      (pd.Timestamp.utcnow() - t0).total_seconds() * 1e3)
 
         df = df.ffill().bfill()
 
@@ -105,6 +115,11 @@ class CoreFeaturePipeline:
             ]
         )
         transformed = pipe.fit_transform(features)
+
+        pca = pipe.named_steps["pca"]
+        log.info("[FE] PCA n_comp=%d  cum_var=%.1f%%",
+                 pca.n_components_,
+                 pca.explained_variance_ratio_.sum() * 100)
 
         # Save PCA/scaler as .npy (consistent with meta)
         out_dir = self.parquet_root / "_fe_meta"
