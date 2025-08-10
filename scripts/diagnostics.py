@@ -38,6 +38,9 @@ class BacktestDiagnostics:
         self.df["decile"] = pd.qcut(self.df["mu"], 10, labels=False, duplicates="drop")
         bucket = self.df.groupby("decile")["ret1m"].mean()
 
+        win_by_decile = self.df.groupby("decile")["ret1m"].apply(lambda s: (s > 0).mean())
+        print("Win-rate by µ decile:\n", win_by_decile.to_string())
+
         # ── DIAG: bin counts (n per decile) ────────────────────────────
         bin_n = self.df.groupby("decile")["mu"].count()
         print("[CAL] bin counts:", bin_n.to_dict())

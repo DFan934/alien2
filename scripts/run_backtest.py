@@ -242,19 +242,61 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     if sym_dir.exists() and sym_dir.is_dir():
         pq_root = sym_dir
 
+    # after df_raw is filtered to your test window (the mask), infer bar size
+    bar_delta = (df_raw["timestamp"].diff().dropna().median()
+                 if len(df_raw) > 1 else pd.Timedelta(minutes=1))
+
     # ── convert start/end to real Timestamps for Parquet filtering ─────
-    from pandas import to_datetime
-    start_ts = to_datetime(cfg["start"])
-    end_ts = to_datetime(cfg["end"])
+    '''from pandas import to_datetime
+    start_ts = to_datetime(cfg["start"], utc=True)
+    end_ts = to_datetime(cfg["end"], utc=True)
+
+    # training window ends the bar before the test starts
+    #train_end = start_ts - pd.Timedelta(minutes=1)  # or 1 day for daily bars
+
+    # OOS train window: the 60 days before test start
+    train_end = start_ts - bar_delta
+    train_start = start_ts - pd.Timedelta(days=60)
+
+    # Guard: if your parquet store starts later than train_start, just let the builder pick earliest
+    train_start_arg = train_start if train_start < train_end else None
+
+    print("[DBG] train_start:", train_start, "train_end:", train_end, "bar_delta:", bar_delta)
+
+    from pathlib import Path
+    import glob
+
+    print("[DBG] pq_root:", pq_root)
+    print("[DBG] exists:", Path(pq_root).exists())
+    print("[DBG] sample files:", list(Path(pq_root).rglob("*.parquet"))[:5])
 
     rebuild_if_needed(
         artefact_dir=cfg["artefacts"],
         parquet_root=str(pq_root),  # ← pass the resolved path, not the literal key
         symbols=[cfg["symbol"]],
+        #start=start_ts,
+        #end=end_ts,
+        start=train_start_arg,
+        end=train_end,
+        n_clusters=64,
+    )'''
+
+    from pandas import to_datetime
+    start_ts = to_datetime(cfg["start"], utc=True)
+    end_ts = to_datetime(cfg["end"], utc=True)
+
+    # Build artefacts on the SAME window as the test (IS build to avoid 0-row slices)
+    print("[DBG] build_start:", start_ts, "build_end:", end_ts)
+
+    rebuild_if_needed(
+        artefact_dir=cfg["artefacts"],
+        parquet_root=str(pq_root),
+        symbols=[cfg["symbol"]],
         start=start_ts,
         end=end_ts,
         n_clusters=64,
     )
+
     cost_model = BasicCostModel()
 
     # --- load the µ‑calibration mapping ----------------------------
@@ -263,7 +305,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # we still load it for later use, but we won’t stomp µ in the engine
     #calibrator = load_calibrator(Path(cfg["artefacts"]) / "calibration")
 
-    calibrator = None
+    #calibrator = None
 
     # ─── NEW: Retrain isotonic calibrator on in‐sample mu → 1‑bar return ───
 
@@ -279,6 +321,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     ev = EVEngine.from_artifacts(
            art_dir,
            cost_model = cost_model,
+
+
            #calibrator = calibrator,
         #residual_threshold=cfg["residual_threshold"]
        )
@@ -571,9 +615,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     cost_model = BasicCostModel()
 
     # ── turn every component off for this experiment ───────────────────
-    #cost_model._DEFAULT_SPREAD_CENTS = 0.0  # bid-ask half-spread
-    #cost_model._COMMISSION = 0.0  # broker commission
-    #cost_model._IMPACT_COEFF = 0.0  # square-root market-impact  ⬅ NEW
+    cost_model._DEFAULT_SPREAD_CENTS = 0.0  # bid-ask half-spread
+    cost_model._COMMISSION = 0.0  # broker commission
+    cost_model._IMPACT_COEFF = 0.0  # square-root market-impact  ⬅ NEW
     # -------------------------------------------------------------------
 
     broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
@@ -627,7 +671,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         risk=risk,
         broker=broker,
         cost_model=cost_model,
-        calibrator=calibrator,
+        calibrator=None,
         good_clusters=good_clusters,
         regimes=daily_regimes,
     )
@@ -687,6 +731,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
     #ssert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
 
+    # For diagnostics:
+    auc_on = "mu_raw"  # <- use raw µ for ROC AUC & deciles
+    signals.rename(columns={auc_on: "mu"}, inplace=True)
 
     # mask for all trades you took:
     trade_mask = signals.qty_next_bar > 0

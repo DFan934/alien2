@@ -34,6 +34,24 @@ def rebuild_if_needed(
     """
     Rebuild PathClusterEngine artefacts if they are missing or outdated.
     """
+
+    raw_pq_path = Path(parquet_root)
+
+
+
+
+    if not raw_pq_path.exists():
+        raise FileNotFoundError(f"No parquet dataset at {raw_pq_path}")
+
+    # Try an unfiltered tiny read to inspect columns
+    try:
+        probe = pd.read_parquet(raw_pq_path, engine="pyarrow")
+        print("[DBG] parquet columns:", probe.columns.tolist())
+        print("[DBG] timestamp dtype:", probe.get("timestamp", pd.Series(dtype="object")).dtype)
+        print("[DBG] head timestamps:", probe.get("timestamp", pd.Series()).head())
+    except Exception as e:
+        print("[DBG] unfiltered read failed:", repr(e))
+
     artefact_dir = Path(artefact_dir)
     artefact_dir.mkdir(parents=True, exist_ok=True) # Ensure directory exists
     meta = _load_meta(artefact_dir / "meta.json")
@@ -59,7 +77,7 @@ def rebuild_if_needed(
     LOG.warning("[artefacts] Artefacts missing — rebuilding artefacts …")
 
     # 1) Load raw minute-bar parquet slice
-    raw_pq_path = Path(parquet_root)
+    '''raw_pq_path = Path(parquet_root)
     filt = [("symbol", "in", list(symbols)),
             ("timestamp", ">=", start),
             ("timestamp", "<=", end)]
@@ -68,8 +86,66 @@ def rebuild_if_needed(
         raise RuntimeError("Rebuild slice returned zero rows – check dates/symbols.")
 
     # Ensure timestamp is a datetime object
-    raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"])'''
 
+    # 1) Load without Arrow filters + normalize tz; then filter in pandas
+    raw_pq_path = Path(parquet_root)
+    raw = pd.read_parquet(raw_pq_path, engine="pyarrow")
+    if raw.empty:
+        raise RuntimeError("Parquet read returned zero rows – check path.")
+
+    # Normalize timestamps to UTC-naive for consistent comparisons
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True)
+    raw["timestamp"] = raw["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    ## Normalize start/end the same way
+    #start_ts = pd.to_datetime(start, utc=True).tz_convert("UTC").tz_localize(None)
+    #end_ts = pd.to_datetime(end, utc=True).tz_convert("UTC").tz_localize(None)
+
+    # Normalize start/end
+    start_ts = pd.to_datetime(start, utc=True) if start is not None else None
+    end_ts = pd.to_datetime(end, utc=True) if end is not None else None
+
+    # Make timestamps UTC-naive for consistent comparisons
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True)
+    raw["timestamp"] = raw["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+    if start_ts is not None:
+        start_ts = start_ts.tz_convert("UTC").tz_localize(None)
+    if end_ts is not None:
+        end_ts = end_ts.tz_convert("UTC").tz_localize(None)
+
+    # If caller passed None, clamp to dataset bounds
+    if start_ts is None:
+        start_ts = raw["timestamp"].min()
+    if end_ts is None:
+        end_ts = raw["timestamp"].max()
+
+    # (Optional but helpful) sanity prints
+    print("[DBG] dataset window:", raw["timestamp"].min(), "→", raw["timestamp"].max())
+    print("[DBG] requested window:", start_ts, "→", end_ts)
+
+    # Symbol filter only if not already partitioned by symbol
+    mask_sym = True
+    if "symbol" in raw.columns and "symbol=" not in str(Path(parquet_root)):
+        mask_sym = raw["symbol"].isin(list(symbols))
+
+    mask_time = (raw["timestamp"] >= start_ts) & (raw["timestamp"] <= end_ts)
+    raw = raw.loc[mask_sym & mask_time].copy()
+    if raw.empty:
+        raise RuntimeError("Rebuild slice returned zero rows after normalization – check dates/symbols/timezone.")
+
+    # If you’re *not* already inside symbol=... partitions, apply a symbol filter
+    '''mask_sym = True
+    if "symbol" in raw.columns and "symbol=" not in str(raw_pq_path):
+        mask_sym = raw["symbol"].isin(list(symbols))
+
+    # Now filter by time window in pandas
+    mask = mask_sym & (raw["timestamp"] >= start_ts) & (raw["timestamp"] <= end_ts)
+    raw = raw.loc[mask].copy()
+
+    if raw.empty:
+        raise RuntimeError("Rebuild slice returned zero rows after normalization – check dates/symbols/timezone.")
+    '''
     # Add the missing 'trigger_ts' and 'volume_spike_pct' columns
     raw["trigger_ts"] = raw["timestamp"]
     volume_ma = raw['volume'].rolling(window=20, min_periods=1).mean()
@@ -126,9 +202,18 @@ def rebuild_if_needed(
     ).ffill().bfill()  # Fill any gaps
 
     # --- FIX: Generate numeric labels with the correct DatetimeIndex ---
-    y_numeric_series = pd.Series(
+    '''y_numeric_series = pd.Series(
         one_bar_ahead(raw).values,
         index=pd.to_datetime(raw['timestamp']),  # Use the timestamp column for the index
+        name="ret_fwd"
+    )'''
+
+    # AFTER (per-symbol open→open next-bar return)
+    raw = raw.sort_values(["symbol", "timestamp"])
+    raw["ret_fwd"] = raw.groupby("symbol")["open"].shift(-1) / raw["open"] - 1.0
+    y_numeric_series = pd.Series(
+        raw["ret_fwd"].values,
+        index=pd.to_datetime(raw["timestamp"]),
         name="ret_fwd"
     )
 
