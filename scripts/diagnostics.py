@@ -5,21 +5,119 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
 from prediction_engine.market_regime import label_days, RegimeParams
+from pathlib import Path
+from prediction_engine.calibration import map_mu_to_prob
+
+
+from prediction_engine.calibration import map_mu_to_prob, load_calibrator
 
 class BacktestDiagnostics:
     def __init__(self, df: pd.DataFrame, raw: pd.DataFrame, cfg: dict):
-        """
-        df: the equity‐curve DataFrame returned by Backtester.run()
-        raw: the original raw bar DataFrame (with open, high, low, close, volume, timestamp)
-        cfg: the backtest CONFIG dict
-        """
-        self.df = df.copy()
+        self.df  = df.copy()
         self.raw = raw.copy()
         self.cfg = cfg
 
-        # core series
-        self.df["ret1m"] = self.df["open"].shift(-1) / self.df["open"] - 1
+        self.df["ret1m"]      = self.df["open"].shift(-1) / self.df["open"] - 1
         self.df["cum_return"] = self.df["equity"] / cfg["equity"] - 1
+        self.df["is_entry"]   = (self.df.get("qty_next_bar", 0) > 0)
+
+        self.calib_dir = None
+        calib_path = (cfg or {}).get("calibration_dir") or (cfg or {}).get("calib_dir")
+        if calib_path:
+            self.calib_dir = Path(calib_path)
+
+        '''# --- compute p ONLY for entry bars; NaN elsewhere ------------------
+        p = np.full(len(self.df), np.nan, dtype=float)
+        entry_idx = self.df.index[self.df["is_entry"]]
+        if len(entry_idx) > 0:
+            mu_vec = self.df.loc[entry_idx, "mu"].to_numpy()
+            p_vals = map_mu_to_prob(
+                mu_vec,
+                calibrator=None,                 # let loader handle it
+                artefact_dir=self.calib_dir,     # uses on-disk iso if present
+                default_if_missing=None,         # else smooth fallback
+            )
+            if p_vals.shape[0] != entry_idx.shape[0]:
+                raise ValueError(
+                    f"[Diagnostics] p length {p_vals.shape[0]} != #entries {entry_idx.shape[0]}"
+                )
+            print("mu[:5] =", mu_vec[:5])
+            print("p[:5]  =", p_vals[:5])
+
+            p[self.df["is_entry"].to_numpy()] = p_vals
+        self.df["p"] = p'''
+
+        # --- calibrated probability p: prefer precomputed values from df ---
+        # We want p only on ENTRY bars; NaN elsewhere.
+        entries_mask = self.df["is_entry"].to_numpy()
+
+        # If caller already provided p (e.g., run_backtest.py), preserve it for entries
+        has_p_col = ("p" in self.df.columns) and self.df["p"].notna().any()
+        if has_p_col:
+            # keep given p on entries; force non-entries to NaN
+            self.df.loc[~self.df["is_entry"], "p"] = np.nan
+        else:
+          # compute p ONLY for entries; leave others NaN
+            p = np.full(len(self.df), np.nan, dtype=float)
+            entry_idx = self.df.index[self.df["is_entry"]]
+            if len(entry_idx) > 0:
+                mu_vec = self.df.loc[entry_idx, "mu"].to_numpy(dtype=float)
+                # Try to load on-disk calibrator; otherwise map_mu_to_prob falls back smoothly
+                try:
+                    p_vals = map_mu_to_prob(
+                        mu_vec,
+                        calibrator = None,  # loader handles on-disk if available
+                        artefact_dir = self.calib_dir,  # uses on-disk iso if present
+                        default_if_missing = None,  # else monotone fallback
+                    )
+                except Exception as e:
+                    print(f"[Diagnostics] map_mu_to_prob failed ({e}); using neutral mapping.")
+                    # Neutral, rank-preserving fallback (same idea as map_mu_to_prob’s tanh)
+                    finite = np.isfinite(mu_vec)
+                    scale = np.median(np.abs(mu_vec[finite])) * 5.0 if finite.any() else 1.0
+                    p_vals = 0.5 * (1.0 + np.tanh(mu_vec / max(scale, 1e-3)))
+
+                # Guardrail: clip p away from 0 and 1 to avoid saturation on tiny samples
+                #p_vals = np.clip(p_vals, 0.35, 0.65)
+
+
+                if p_vals.shape[0] != entry_idx.shape[0]:
+
+                    raise ValueError(
+                        f"[Diagnostics] p length {p_vals.shape[0]} != #entries {entry_idx.shape[0]}"
+                    )
+                print("mu[:5] =", mu_vec[:5])
+                print("p[:5]  =", p_vals[:5])
+                p[self.df["is_entry"].to_numpy()] = p_vals
+                self.df["p"] = p
+
+        '''# after self.df["p"] is computed
+        entries = (self.df["qty_next_bar"] > 0)
+        p_non_null = self.df["p"].notna().sum()
+        print(f"[Diag] entries={entries.sum()} / rows={len(self.df)}")
+        print(
+            f"[Diag] p non-null={p_non_null}  min/max(valid)={self.df['p'].dropna().min():.3f}/{self.df['p'].dropna().max():.3f}")
+
+        u = np.unique(self.df.loc[entries, "p"].dropna().values)
+        print(f"[Diag] unique p on entries: count={len(u)}  sample={u[:10]}")
+
+        # Optional: quick sanity prints
+        print(f"[Diag] entries={self.df['is_entry'].sum()} / rows={len(self.df)}")
+        print(f"[Diag] p non-null={self.df['p'].notna().sum()}  "
+              f"min/max(valid)={np.nanmin(self.df['p']):.3f}/{np.nanmax(self.df['p']):.3f}")'''
+
+        # Prints that don’t crash if there are zero valid p’s
+        entries = (self.df["qty_next_bar"] > 0)
+        p_non_null = int(self.df["p"].notna().sum())
+        print(f"[Diag] entries={entries.sum()} / rows={len(self.df)}")
+        if p_non_null > 0:
+            pmin = float(self.df["p"].dropna().min())
+            pmax = float(self.df["p"].dropna().max())
+            print(f"[Diag] p non-null={p_non_null}  min/max(valid)={pmin:.3f}/{pmax:.3f}")
+            u = np.unique(self.df.loc[entries, "p"].dropna().values)
+            print(f"[Diag] unique p on entries: count={len(u)}  sample={u[:10]}")
+        else:
+            print(f"[Diag] p non-null=0")
 
     def print_trade_stats(self):
         trades = self.df["qty_next_bar"] > 0
@@ -35,46 +133,52 @@ class BacktestDiagnostics:
             print("[CAL] input df empty – skipping calibration");
             return
 
+        # µ deciles (all rows)
         self.df["decile"] = pd.qcut(self.df["mu"], 10, labels=False, duplicates="drop")
         bucket = self.df.groupby("decile")["ret1m"].mean()
-
         win_by_decile = self.df.groupby("decile")["ret1m"].apply(lambda s: (s > 0).mean())
+
         print("Win-rate by µ decile:\n", win_by_decile.to_string())
-
-        # ── DIAG: bin counts (n per decile) ────────────────────────────
-        bin_n = self.df.groupby("decile")["mu"].count()
-        print("[CAL] bin counts:", bin_n.to_dict())
-
-        print("=== Calibration (µ‑decile → avg 1‑bar return) ===")
+        print("[CAL] bin counts:", self.df.groupby("decile")["mu"].count().to_dict())
+        print("=== Calibration (µ-decile → avg 1-bar return) ===")
         print(bucket.to_string(), "\n")
 
-    def roc_auc(self):
-        # μ > 0 as predictor of ret1m>0
-        #y_true  = (self.df["ret1m"] > 0).astype(int)
-        #y_score = self.df["mu"].values
+        ## p-deciles (entries only → non-NaN p)
+        dfp = self.df[self.df["p"].notna()].copy()
+        if len(dfp) == 0:
+            print("=== Calibration (p-decile) ===\n(no entry bars with valid p)\n")
+            return
 
+        dfp["p_decile"] = pd.qcut(dfp["p"], 10, labels=False, duplicates="drop")
+        bucket_p = dfp.groupby("p_decile")["ret1m"].mean()
+        win_by_p = dfp.groupby("p_decile")["ret1m"].apply(lambda s: (s > 0).mean())
+
+        print("Win-rate by calibrated-p decile:\n", win_by_p.to_string())
+        print("[CAL] bin counts (p):", dfp.groupby("p_decile")["p"].count().to_dict())
+        print("=== Calibration (p-decile → avg 1-bar return) ===")
+        print(bucket_p.to_string(), "\n")
+
+        # keep legacy µ-deciles print too if you like
+
+    def roc_auc(self):
         if self.df.empty:
             print("[AUC] input df empty – skipping ROC");
             return
-
-        y_true = (self.df["ret1m"] > 0).astype(int)
-        y_score = self.df["mu"].values
+        dfp = self.df[self.df["p"].notna()].copy()
+        if dfp.empty:
+            print("[AUC] no valid p on entry bars – skipping ROC");
+            return
+        y_true = (dfp["ret1m"] > 0).astype(int).to_numpy()
+        y_score = dfp["p"].to_numpy()
         auc = roc_auc_score(y_true, y_score)
-
-       #auc = roc_auc_score(y_true, y_score)
-
-        # confusion matrix using µ>0 as hard classifier
-        y_pred = (y_score > 0).astype(int)
+        # simple µ>0 classifier just for reference (use p if you prefer):
+        y_pred = (y_score > 0.5).astype(int)
         tp = int(((y_pred == 1) & (y_true == 1)).sum())
         fp = int(((y_pred == 1) & (y_true == 0)).sum())
         tn = int(((y_pred == 0) & (y_true == 0)).sum())
         fn = int(((y_pred == 0) & (y_true == 1)).sum())
-
-        print(f"=== ROC AUC (µ>0 vs actual sign) ===\n"
-        f"AUC = {auc:.3f}\n"
-        f"TP={tp}  FP={fp}  TN={tn}  FN={fn}\n")
-
-        print(f"=== ROC AUC (µ>0 vs actual sign) ===\nAUC = {auc:.3f}\n")
+        print(f"=== ROC AUC (p vs actual sign on entries) ===\nAUC = {auc:.3f}")
+        print(f"TP={tp}  FP={fp}  TN={tn}  FN={fn}\n")
 
     def drawdown(self):
         if self.df.empty:
@@ -101,6 +205,13 @@ class BacktestDiagnostics:
         plt.figure(); self.df["residual"].hist(bins=50); plt.title("Residuals"); plt.show()
 
     def trade_pnl_hist(self):
+        col = "realized_pnl"
+        if col not in self.df and "realised_pnl" in self.df:
+            self.df[col] = self.df["realised_pnl"]
+        if col not in self.df:
+            print("No 'realized_pnl' column; skipping trade-level P&L histogram.\n")
+            return
+
         if "realized_pnl" not in self.df:
             print("No 'realized_pnl' column; skipping trade‑level P&L histogram.\n")
             return

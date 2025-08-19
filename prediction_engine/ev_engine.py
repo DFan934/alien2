@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import hashlib
 
-from hypothesis.extra.numpy import NDArray
+# remove: from hypothesis.extra.numpy import NDArray
+from numpy.typing import NDArray
 from sklearn.isotonic import IsotonicRegression
 
 from .calibration import calibrate_isotonic
@@ -47,6 +48,8 @@ from .distance_calculator import DistanceCalculator
 from .weight_optimization import WeightOptimizer
 from .market_regime import MarketRegime
 from .analogue_synth import AnalogueSynth
+from .calibration import map_mu_to_prob
+
 
 from .distance_calculator import DistanceCalculator
 from .tx_cost import BasicCostModel
@@ -82,6 +85,10 @@ class EVResult:
     position_size: float = 0.0
     drift_ticket: int = -1            # NEW – link to DriftMonitor
     # NEW – Kelly size
+
+    # NEW ↓
+    mu_raw: float = 0.0
+    p_up: float = 0.5
 
 
 
@@ -315,10 +322,12 @@ class EVEngine:
 
         # ── Compute τ² as the 75‑th‑percentile of inter‑centroid distances ──
         pair_d2 = ((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1).ravel()
-        tau_sq_p75 = float(np.percentile(pair_d2, 75))
+        #tau_sq_p75 = float(np.percentile(pair_d2, 75))
+        tau_sq_p75 = float(np.percentile(pair_d2, 85))
+
 
         # ↓ ADD THIS LINE – keep only the closest ≈20 % analogues
-        tau_sq_p75 *= 0.40  # tighten residual gate
+        #tau_sq_p75 *= 0.40  # tighten residual gate
 
         stats_path = artefact_dir / "cluster_stats.npz"
         stats = np.load(stats_path, allow_pickle=True)
@@ -580,6 +589,8 @@ class EVEngine:
 
         # ---------------------------------------------------------------------
 
+        regime_name = getattr(regime, "name", "ANY")
+
         if idx.size == 0:  # << add
             log.warning(
                 "[EVEngine] regime=%s had zero matches; falling back to all clusters",
@@ -730,7 +741,7 @@ class EVEngine:
         #mu_net = mu - cost_ps
 
         # 5. ISO-CALIBRATION  **before** cost
-        if self._calibrator:
+        '''if self._calibrator:
             mu = float(self._calibrator.predict([[mu]])[0])  # calibrated µ
             print(f"[Cal] µ_cal={mu:+.6f}")
         # 6. Subtract estimated cost
@@ -746,8 +757,93 @@ class EVEngine:
         mu_net = mu - cost_ps
 
         mu_net_original = mu - cost_ps
-        mu_net = mu_net_original
+        mu_net = mu_net_original'''
+        # ------------------------------------------------------------
+        # 4. Keep RAW µ for trading math; do NOT overwrite with calibration
+        # ------------------------------------------------------------
+        mu_raw = mu  # <- preserve the model’s raw expected edge
 
+        # 5) Transaction cost and net edge (from RAW µ)
+        cost_ps = self._cost.estimate(
+            half_spread=half_spread,
+            adv_percentile=adv_percentile
+        )
+        mu_net = mu_raw - cost_ps
+
+        mu_net_original = mu_net  # keep a copy before residual penalties
+
+        # ------------------------------------------------------------
+        # QUICK-WIN : penalise distant analogues
+        # ------------------------------------------------------------
+        '''hard_limit = self.residual_threshold * 0.66
+        if residual > hard_limit:
+            mu_net = 0.0
+        else:
+            # always shrink by 1/(1+residual), but don’t zero
+            mu_net *= 1.0 / (1.0 + residual)
+
+        # soft recovery for moderate residuals that got zeroed:
+        if mu_net == 0.0 and residual <= self.residual_threshold:
+            mu_net = mu_net + (mu_net_original if 'mu_net_original' in locals() else 0.0) * 0.1'''
+
+        # replace the residual penalty block with a gentle taper
+        shrink = 1.0 / (1.0 + residual / max(self.residual_threshold, 1e-6))
+        mu_net *= shrink
+        # DO NOT set mu_net = 0.0 on “hard_limit” – remove that branch entirely for this test
+
+        # ------------------------------------------------------------
+        # 6) Calibrated probability (single source of truth) — do NOT mutate µ
+        # ------------------------------------------------------------
+        '''p_up_arr = map_mu_to_prob(
+            mu_raw,  # <-- use RAW µ, not mu_net
+            calibrator=self._calibrator,
+            #artefact_dir=self.calibration_dir,  # or where iso_calibrator.pkl lives
+            default_if_missing=0.5  # NEUTRAL, not 0.6
+            #artefact_dir=self.calibration_dir  # we already passed a calibrator
+        )
+        #p_up = float(np.atleast_1d(p_up_arr)[0])
+        # after you compute mu_val (a float)
+        p_up = float(
+            map_mu_to_prob([mu_val], calibrator=self.calibrator, default_if_missing=0.5)[0]
+        )'''
+
+        p_up_arr = map_mu_to_prob(
+            mu_raw,  # raw μ (float is fine)
+            calibrator=self._calibrator,  # use the injected calibrator
+            default_if_missing=0.5  # neutral if none available
+        )
+        p_up = float(np.atleast_1d(p_up_arr)[0])
+
+        print(f"[Cal] p_up={p_up:.3f}")
+
+
+        # (Optional: print both raw µ and calibrated mapping without changing µ)
+        '''if self._calibrator:
+            mu_cal = float(np.atleast_1d(self._calibrator.predict(np.atleast_1d(mu_raw)))[0])
+            print(f"[Cal] raw_mu={mu_raw:+.6f}  mu_cal={mu_cal:+.6f}")
+        '''
+        if self._calibrator is not None:
+            mu_cal = float(np.atleast_1d(self._calibrator.predict(np.atleast_1d(mu_raw)))[0])
+            print(f"[Cal] raw_mu={mu_raw:+.6f}  mu_cal={mu_cal:+.6f}")
+
+        # ------------------------------------------------------------
+        # 7) Kelly position size (based on mu_net, as before)
+        # ------------------------------------------------------------
+        pos_size = self._sizer.size(mu_net, sig2_down ** 0.5, adv_percentile)
+
+        # ------------------------------------------------------------
+        # Drift-monitor logging uses the calibrated probability
+        # ------------------------------------------------------------
+        from math import erf, sqrt as _sqrt  # (kept if you use erf elsewhere)
+
+        dm = get_monitor()
+        ticket_id = dm.log_pred(p_up)
+        if dm.status()[0] is DriftStatus.RETRAIN_SIGNAL:
+            from threading import Thread
+            Thread(target=_kickoff_retrain, daemon=True).start()
+
+        print(f"[EV] DONE  mu_net={mu_net:.6f}  cluster_id={int(idx[0])}  pos_size={pos_size:.4f}")
+        print(f"[Cost] raw_mu={mu_raw:+.6f}  cost_ps={cost_ps:+.6f}  mu_net={mu_net:+.6f}")
         # ------------------------------------------------------------------
         # QUICK-WIN : penalise distant analogues
         # • Hard gate  : skip anything whose residual > τ₇₅/3
@@ -771,12 +867,12 @@ class EVEngine:
             mu_net *= 1.0 / (1.0 + residual * 0.5)  # softer shrink
         '''
 
-        hard_limit = self.residual_threshold * 0.66
+        '''hard_limit = self.residual_threshold * 0.66
         if residual > hard_limit:
             mu_net = 0.0
         else:
             # always shrink by 1/(1+residual), but don’t zero
-            mu_net *= 1.0 / (1.0 + residual)
+            mu_net *= 1.0 / (1.0 + residual)'''
 
 
 
@@ -784,11 +880,11 @@ class EVEngine:
         #mu = mu_cal  # use calibrated value
         #mu_net = mu - cost_ps
 
-        if self._calibrator:
-            mu_cal = float(self._calibrator.predict([[mu]])[0])
-            print(f"[Cal] raw_mu={mu:+.6f}  mu_cal={mu_cal:+.6f}")
+        #if self._calibrator:
+        #    mu_cal = float(self._calibrator.predict([[mu]])[0])
+        #    print(f"[Cal] raw_mu={mu:+.6f}  mu_cal={mu_cal:+.6f}")
 
-        # (old) we already zeroed mu_net on high residual
+        '''# (old) we already zeroed mu_net on high residual
         # now even if we zero above, add a soft fallback:
         if mu_net == 0.0 and residual <= self.residual_threshold:
             # recover a bit of edge for moderate residuals
@@ -799,7 +895,7 @@ class EVEngine:
         # 6. if you want P(win), _compute it here_ but keep µ_net pure:
         p_win = (self._calibrator.predict([[mu]])[0]
                  if self._calibrator else None)
-
+'''
         #5. NEW: Calculate blended probabilistic outcomes
         blended_probs = {}
         all_labels = set(label for probs in self.outcome_probs.values() for label in probs.keys())
@@ -830,7 +926,7 @@ class EVEngine:
                  blended_probs[k] /= tot
 
 
-        # ------------------------------------------------------------
+        '''# ------------------------------------------------------------
         # 6. Kelly position size (NEW)
         # ------------------------------------------------------------
         pos_size = self._sizer.size(mu_net, sig2_down ** 0.5, adv_percentile)
@@ -840,8 +936,20 @@ class EVEngine:
         # ------------------------------------------------------------
         from math import erf, sqrt as _sqrt
 
-        p_up = 0.5 * (1.0 + erf(mu / (_sqrt(2.0 * sig2) + 1e-9)))
-        dm = get_monitor()
+
+        #p_up = 0.5 * (1.0 + erf(mu / (_sqrt(2.0 * sig2) + 1e-9)))
+
+        # --- Calibrated probability for logging/monitoring (single source of truth)
+        p_up_arr = map_mu_to_prob(
+            mu,
+            calibrator=self._calibrator,
+            artefact_dir=None  # engine already has self._calibrator if available
+        )
+        p_up = float(np.atleast_1d(p_up_arr)[0])
+        print(f"[Cal] p_up={p_up:.3f}")'''
+
+
+        '''dm = get_monitor()
         ticket_id = dm.log_pred(p_up)  # OMS must later call
         # dm.log_outcome(ticket_id, realised_pnl > 0)
 
@@ -853,7 +961,7 @@ class EVEngine:
         # ────────────────────────────────────────────────────────────────────
 
         print(f"[Cost] raw_mu={mu:+.6f}  cost_ps={cost_ps:+.6f}  "
-              f"mu_net={mu_net:+.6f}")
+              f"mu_net={mu_net:+.6f}")'''
 
         return EVResult(
             mu_net,  # mu
@@ -864,7 +972,9 @@ class EVEngine:
             int(idx[0]),  # cluster_id
             blended_probs,  # outcome_probs
             pos_size,  # position_size
-            ticket_id  # drift_ticket
+            ticket_id,  # drift_ticket
+            mu_raw=mu_raw,
+            p_up=p_up,
         )
 
 
