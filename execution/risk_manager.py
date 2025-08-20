@@ -123,62 +123,51 @@ class RiskManager:
             variance_down: float,
             price: float,
             adv: float | None = None,
-            override_frac: float | None = None,
-            ) -> int:
-            """
-            Position sizing via Kelly, with an optional manual equity fraction.
+            override_frac: float | None = None,  # kept for back-compat
+            scale_frac: float | None = None,  # ← NEW
+    ) -> int:
+        import math
 
-            Parameters
-            ----------
-            mu : float
-                Expected next‑bar return (already calibrated).
-            variance_down : float
-                Down‑side variance estimate.
-            price : float
-                Fill price you expect at next‑bar open.
-            adv : float, optional
-                Average daily volume, used for the ADV liquidity cap.
-            override_frac : float, optional
-                If provided (0‑1), use *this* equity fraction instead of the
-                analytic Kelly fraction.  Still capped by ``max_kelly``.
-            """
-            import math, logging
+        if (not math.isfinite(self.account_equity) or self.account_equity <= 0
+                or price <= 0 or not math.isfinite(variance_down)):
+            return 0
 
-            # ── 1.  Guard rails ------------------------------------------------
-            if (not math.isfinite(self.account_equity) or self.account_equity <= 0
-                    or price <= 0 or not math.isfinite(variance_down)):
-                return 0
-            #var_eff = max(variance_down, 1e-8)  # numerical floor
-            var_eff = max(variance_down, 2.3e-4)
+        var_eff = max(variance_down, 1e-8)  # numerical floor only
+        kelly_f_base = mu / (2 * var_eff)  # downside-variance Kelly
+        # hard cap
+        kelly_f_base = max(0.0, min(kelly_f_base, self.max_kelly))
 
-            # ── 2.  Choose Kelly fraction --------------------------
-            if override_frac is not None:
-                kelly_f = min(max(override_frac, 0.0), self.max_kelly)
-            else:
-                kelly_f = min(mu / (2 * var_eff), self.max_kelly)
+        # --- scale by probability edge, not replace ---
+        scaler = 1.0
+        #if override_frac is not None:  # treat as scaler (0..1)
+        #    scaler *= max(0.0, min(override_frac / max(self.max_kelly, 1e-9), 1.0))
+        #if scale_frac is not None:
+        #    scaler *= max(0.0, min(scale_frac, 1.0))
+        # Only honor an override if it's strictly positive; otherwise fall back to analytic Kelly.
+        use_override = (override_frac is not None) and (override_frac > 1e-6)
 
-            if kelly_f <= 0:
-                return 0
+        if use_override:
+            kelly_f = min(max(override_frac, 0.0), self.max_kelly)
+        else:
+            kelly_f = min(mu / (2 * var_eff), self.max_kelly)
 
-            # ── 3.  Convert to share quantity ----------------------
-            dollar_notional = kelly_f * self.account_equity
-            max_notional = self.account_equity * self.max_leverage
-            raw_qty = min(dollar_notional, max_notional) / price
 
-            if not math.isfinite(raw_qty):
-                logging.warning("kelly raw_qty non‑finite: %r", raw_qty)
-                return 0
+        #kelly_f = kelly_f_base * scaler
+        if kelly_f <= 0:
+            return 0
 
-            qty = math.floor(raw_qty)
+        dollar_notional = kelly_f * self.account_equity
+        max_notional = self.account_equity * self.max_leverage
+        raw_qty = min(dollar_notional, max_notional) / price
+        if not math.isfinite(raw_qty):
+            return 0
 
-            # ── 4.  Liquidity brake (ADV) --------------------------
-            if adv is not None and adv > 0:
-                qty = min(qty, math.floor(adv * self.adv_cap_pct))
+        qty = math.floor(raw_qty)
 
-            #if override_frac is not None:
-            #    return max(int(override_frac), 0)
+        if adv is not None and adv > 0:
+            qty = min(qty, math.floor(adv * self.adv_cap_pct))  # adv_cap_pct is a fraction (e.g., 0.20)
 
-            return max(qty, 0)
+        return max(qty, 0)
 
     # ░░░░░░░░░░  END PATCH  ░░░░░░░░░░
 

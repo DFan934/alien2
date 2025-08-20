@@ -463,12 +463,21 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     else:
         iso_prob.fit(df_prob["mu"].to_numpy(), df_prob["y"].to_numpy())
 
-    def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
+    '''def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
         p = iso_prob.predict(mu_vals)
         # very light guardrail
         if np.ptp(p) < 0.05 and len(p) > 1:
             p = 0.5 + 0.5 * (p - p.mean())  # expand a touch around 0.5
-        return np.clip(p, 0.30, 0.70)
+        '''
+
+    def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
+        p = iso_prob.predict(mu_vals)
+        if np.ptp(p) < 0.05 and len(p) > 1:
+            p = 0.5 + 0.5 * (p - p.mean())  # small spread boost
+        return p  # ← no hard clip here
+        # (If you really want a guard: return np.clip(p, 0.40, 0.60))
+
+        #return np.clip(p, 0.30, 0.70)
 
 
 
@@ -484,6 +493,20 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # 4) Inject the PROBABILITY calibrator into the engine so evaluate() yields p_up ≠ constant
     ev._calibrator = iso_prob
+
+    # Optional: clip live calibrator a bit to avoid degenerate p's on tiny samples
+    '''class ClippedIso:
+        def __init__(self, base, lo=0.30, hi=0.70):
+            self.base, self.lo, self.hi = base, lo, hi
+
+        def predict(self, x):
+            x = np.asarray(x).reshape(-1)
+            p = self.base.predict(x)
+            return np.clip(p, self.lo, self.hi)
+
+    ev._calibrator = ClippedIso(iso_prob, lo=0.30, hi=0.70)'''
+
+    ev._calibrator = iso_prob  # ← preferred
 
     # 5) Residual gate: keep in **squared** units (matches dist2/residual usage)
     stats = np.load(art_dir / "cluster_stats.npz", allow_pickle=True)
@@ -501,6 +524,10 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
           f"h²={(ev.h ** 2):.6g}")
 
     _p = iso_prob.predict(all_mu)
+    cfg["p_gate"] = float(np.quantile(_p, 0.60))  # modest bar
+    cfg["full_p"] = float(np.quantile(_p, 0.80))  # where we want max scale
+    print(f"[ISO] gate={cfg['p_gate']:.3f}  full={cfg['full_p']:.3f}  "
+          f"p(mean,std,min,max)=({float(_p.mean()):.3f},{float(_p.std()):.3f},{float(_p.min()):.3f},{float(_p.max()):.3f})")
     print(f"[ISO] p(mean,std,min,max) = "
           f"({float(_p.mean()):.3f}, {float(_p.std()):.3f}, {float(_p.min()):.3f}, {float(_p.max()):.3f})")
     print(f"[ISO] frac p>0.51 = {float((_p > 0.51).mean()):.3f}  "
@@ -511,7 +538,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #cfg["p_gate"] = max(0.48, min(cfg["p_gate"], 0.52))  # keep it sensible
     #cfg["full_p"] = float(max(cfg["p_gate"] + 0.06, np.quantile(_p, 0.75)))
     # TEMP: gentler gates so entries can occur on this tape
-    cfg["p_gate"] = 0.30  # allow entries above the clipped floor
+    cfg["p_gate"] = 0.295  # allow entries above the clipped floor
     cfg["full_p"] = 0.55  # hit max Kelly by here
 
     # 6) Quick sanity prints (optional)
@@ -951,7 +978,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # --- clip isotonic outputs to avoid degenerate tiny/huge p's on small samples
 
-    class ClippedIso:
+    '''class ClippedIso:
         def __init__(self, base, lo=0.30, hi=0.70):
             self.base, self.lo, self.hi = base, lo, hi
 
@@ -960,7 +987,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             p = self.base.predict(x)
             return np.clip(p, self.lo, self.hi)
 
-    ev._calibrator = ClippedIso(iso_prob, lo=0.30, hi=0.70)
+    ev._calibrator = ClippedIso(iso_prob, lo=0.30, hi=0.70)'''
 
     from scripts.diagnostics import BacktestDiagnostics
 

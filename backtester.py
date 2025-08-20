@@ -154,8 +154,8 @@ class Backtester:
                 # analogue too far from any centroid
             #    continue
 
-
-            print("[Skip reasons]", reasons)
+            if i % 50 == 0:
+                print("[Skip reasons snapshot]", reasons)
 
             # ── probability gate (calibrated in run_backtest via ev._calibrator) --
             # ev_raw.p_up is provided by EVEngine if ._calibrator is set
@@ -191,9 +191,8 @@ class Backtester:
             #    p_up = 0.5 * (1.0 + math.erf(ev_raw.mu / (2.0 * denom)))
 
             # --- probability & sizing (ordered!) ---
-            # --- probability & sizing (ordered!) ---
             # Prefer the engine’s calibrated probability (already using iso_prob)
-            p_up = float(getattr(ev_raw, "p_up", float("nan")))
+            '''p_up = float(getattr(ev_raw, "p_up", float("nan")))
             # In Backtester.run() before sizing:
             if self.cfg.get("force_entries_on_mu", False):
                 p_up = 0.55 if ev_raw.mu > 0 else 0.45
@@ -204,26 +203,74 @@ class Backtester:
                 else:
                     denom = max(1e-6, float(ev_raw.sigma)) ** 0.5
                     p_up = 0.5 * (1.0 + math.erf(ev_raw.mu / (2.0 * denom)))
-
+            
             # CLIP HERE so the gate has a fighting chance
             p_up = float(np.clip(p_up, 0.30, 0.70))
 
+            if not math.isfinite(p_up):
+                p_up = 0.50
+
             # DO NOT clamp here; let the gate decide
-            if p_up < P_GATE:
+            if p_up < P_GATE:'''
+
+            # --- probability & sizing (ordered!) ---
+            # 1) Get an UNCLIPPED probability for sizing math
+            p_raw = float(getattr(ev_raw, "p_up", float("nan")))
+            if self.cfg.get("force_entries_on_mu", False):
+                p_raw = 0.55 if ev_raw.mu > 0 else 0.45
+            if not math.isfinite(p_raw):
+                if self.cal is not None:
+                    p_raw = float(self.cal.predict([ev_raw.mu])[0])
+                else:
+                    denom = max(1e-6, float(ev_raw.sigma)) ** 0.5
+                    p_raw = 0.5 * (1.0 + math.erf(ev_raw.mu / (2.0 * denom)))
+
+            # 2) Use a LIGHTLY CLIPPED copy only for gating/logging
+            p_clip = float(np.clip(p_raw, 0.30, 0.70))
+            if not math.isfinite(p_clip):
+                p_clip = 0.50
+            #frac_p = 0.0
+
+            # ---- gate ----
+            if p_clip < P_GATE:
                 qty = 0
                 reasons["p_gate"] += 1
             else:
-                edge = (p_up - P_GATE) / p_span
-                frac = float(np.clip(edge, 0.0, 1.0)) * risk.max_kelly
-                exp_ret = ev_raw.mu  # use raw μ for sizing target (you already subtract cost elsewhere)
+                # primary: Kelly using mu/var_down, ramp fraction by p_raw
+                edge = (p_raw - P_GATE) / p_span
+                frac_p = float(np.clip(edge, 0.0, 1.0))  # 0..1
+                frac = frac_p * risk.max_kelly  # fraction of equity
+
                 adv_today = row.get("adv_shares", None)
+                override = frac if frac > 1e-6 else None  # only pass when > 0
+
                 qty = risk.kelly_position(
-                    mu=exp_ret,
+                    mu=ev_raw.mu,
                     variance_down=ev_raw.variance_down,
                     price=row["open"],
                     adv=adv_today,
-                    override_frac=frac,
+                    override_frac=override,
                 )
+
+                # ---- fallback to deterministic p-ramp so we don't round to zero ----
+                if qty <= 0:
+                    acct_eq = float(risk.account_equity)
+                    px = float(row["open"])
+                    target_notional = (frac_p * risk.max_kelly) * acct_eq
+
+                    adv_cap_pct = float(self.cfg.get("adv_cap_pct", getattr(risk, "adv_cap_pct", 0.20)))
+                    if adv_today is None or not math.isfinite(float(adv_today)):
+                        adv_cap_shares = float("inf")
+                    else:
+                        adv_cap_shares = adv_cap_pct * float(adv_today)
+
+                    qty_ramp = int(np.floor(target_notional / max(px, 1e-9)))
+                    qty_cap = int(np.floor(adv_cap_shares))
+                    qty_fb = int(max(0, min(qty_ramp, qty_cap)))
+                    if qty_fb == 0 and np.isfinite(adv_cap_shares) and adv_cap_shares >= 1:
+                        qty_fb = 1
+                    qty = max(qty, qty_fb)
+
                 if qty <= 0:
                     reasons["qty_zero"] += 1
                 else:
@@ -284,10 +331,14 @@ class Backtester:
                 "realized_pnl": realised_pnl,  # US spelling; diagnostics handles both
                 "unrealised_pnl": mtm,
                 "qty_next_bar": qty,
-                "mu_raw": getattr(ev_raw, "mu_raw", ev_raw.mu),
-                "mu_net": ev_raw.mu,
+                #"mu_raw": getattr(ev_raw, "mu_raw", ev_raw.mu),
+                #"mu_net": ev_raw.mu,
                 #"mu_cal": ev_raw.mu,  # keep same column your scripts expect
-                "mu_cal": getattr(ev_raw, "mu_raw", ev_raw.mu),  # or drop the field entirely
+                #"mu_cal": getattr(ev_raw, "mu_raw", ev_raw.mu),  # or drop the field entirely
+                "mu_raw": getattr(ev_raw, "mu_raw", ev_raw.mu),  # pre-cost
+                "mu_net": ev_raw.mu,  # post-cost (what EV returns)
+                "mu_cal": ev_raw.mu,  # for now, keep equal to net μ
+
                 "sigma_sq": ev_raw.sigma,
                 "var_down": ev_raw.variance_down,
                 "residual": ev_raw.residual,
@@ -297,8 +348,14 @@ class Backtester:
                 "cluster_id": ev_raw.cluster_id,
                 "notional_abs": abs(risk.position_size * row["open"]),
                 "adv_used": row.get("adv_shares", None),
-                "p_up": p_up,
-                "frac": float(np.clip((p_up - P_GATE) / p_span, 0.0, 1.0)) if p_up >= P_GATE else 0.0,
+                #"p_up": p_up,
+                "p_up": p_clip,
+                "p_up_raw": p_raw,
+                "is_entry": bool(qty > 0),
+                #"frac": float(np.clip((p_up - P_GATE) / p_span, 0.0, 1.0)) if p_up >= P_GATE else 0.0,
+                #"frac": frac_p,  # the 0..1 ramp you used for sizing
+                "frac": float(np.clip((p_raw - P_GATE) / p_span, 0.0, 1.0)) if p_clip >= P_GATE else 0.0,
+
             })
 
         log.info("Backtest loop finished.")
