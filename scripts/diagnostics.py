@@ -134,7 +134,10 @@ class BacktestDiagnostics:
             return
 
         # µ deciles (all rows)
-        self.df["decile"] = pd.qcut(self.df["mu"], 10, labels=False, duplicates="drop")
+        #self.df["decile"] = pd.qcut(self.df["mu"], 10, labels=False, duplicates="drop")
+
+        self.df["decile"] = self.safe_deciles(self.df["mu"], q=10)
+
         bucket = self.df.groupby("decile")["ret1m"].mean()
         win_by_decile = self.df.groupby("decile")["ret1m"].apply(lambda s: (s > 0).mean())
 
@@ -159,6 +162,28 @@ class BacktestDiagnostics:
         print(bucket_p.to_string(), "\n")
 
         # keep legacy µ-deciles print too if you like
+
+    # -------- Helpers ----------------------------------------------------------
+    @staticmethod
+    def safe_deciles(series: pd.Series, q: int = 10) -> pd.Series:
+        """
+        Try qcut with duplicates="drop"; if bins collapse badly (heavy ties),
+        fall back to rank-based quantiles to keep counts near-uniform.
+        """
+
+        s = pd.Series(series).astype(float)
+        try:
+            dec = pd.qcut(s, q, labels=False, duplicates="drop")
+        # if we actually got q buckets, we’re done
+            if pd.unique(dec.dropna()).size == q:
+                return dec
+
+        except Exception:
+            pass
+        # rank-based fallback
+        ranks = s.rank(method="average", pct=True)
+        return pd.qcut(ranks, q, labels=False, duplicates="drop")
+
 
     def roc_auc(self):
         if self.df.empty:

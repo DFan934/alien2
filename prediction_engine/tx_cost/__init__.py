@@ -129,7 +129,7 @@ class BasicCostModel(BaseCostModel):
     # ------------------------------------------------------------------ #
     # Convenience alias (back-compat with old code)                      #
     # ------------------------------------------------------------------ #
-    def estimate(self,
+    '''def estimate(self,
                  *,
                                   half_spread: float | None = None,
                                   adv_percentile: float | None = None) -> float:
@@ -147,6 +147,26 @@ class BasicCostModel(BaseCostModel):
 
 
         #return hs + slip
+        return float(hs + self._COMMISSION + slip)'''
+
+    def estimate(
+        self,
+        *,
+        half_spread: float | None = None,
+        adv_percentile: float | None = None
+        ) -> float:
+        """
+        + Lightweight per-share cost estimate (used in EVEngine):
+        + cost_ps = half_spread_fallback + commission + slip(ADV%)
+        +  """
+
+        # 1) spread (fallback if not provided)
+        hs = float(half_spread) if half_spread is not None else float(self._SPREAD_FALLBACK)
+        # 2) ADV% slippage: 0 bp at ≤5%, up to 15 bp by 20%
+        if adv_percentile is None:
+            slip = 0.0
+        else:
+            slip = 0.00015 * max(0.0, min((float(adv_percentile) - 5.0) / 15.0, 1.0))
         return float(hs + self._COMMISSION + slip)
 
 

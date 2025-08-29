@@ -24,6 +24,10 @@ from prediction_engine.ev_engine import EVEngine
 from execution.risk_manager import RiskManager
 from prediction_engine.tx_cost import BasicCostModel
 from typing import Any
+from prediction_engine.ev_engine import EVEngine
+from execution.risk_manager import RiskManager
+from prediction_engine.tx_cost import BasicCostModel
+from typing import Any
 
 class Backtester:
     """
@@ -59,6 +63,9 @@ class Backtester:
         self.risk = risk
         self.broker = broker
         self.cost = cost_model
+        # ensure fills in RiskManager are costed during backtests
+        if hasattr(self.risk, "cost_model") and self.risk.cost_model is None:
+            self.risk.cost_model = cost_model
         self.good_clusters = good_clusters
         self.cal = calibrator
         self.regimes = regimes

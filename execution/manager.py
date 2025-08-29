@@ -53,6 +53,9 @@ from execution.core.contracts import SafetyAction
 #from execution.exit_manager import ExitManager
 from execution.stop_manager import StopManager
 from execution.exit_manager import ExitManager
+from execution.latency import latency_monitor, timeit
+from execution.position_store import PositionStore
+from execution.core.contracts import TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -149,13 +152,18 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self._writer_task = asyncio.create_task(self._signal_writer())
         self._safety_task = asyncio.create_task(self._safety_watcher())
 
-        if hasattr(self.lat_monitor, "mean"):
+        '''if hasattr(self.lat_monitor, "mean"):
             # our latency monitor exposes .mean(label)
             try:
                 latency_ms = float(self.lat_monitor.mean("execution_bar"))
             except TypeError:
                 # Prometheus Summary style fallback
-                latency_ms = 0.0
+                latency_ms = 0.0'''
+
+        if hasattr(self.lat_monitor, "mean"):
+            latency_ms: float = float(self.lat_monitor.mean("execution_bar"))
+        else:
+            latency_ms = 0.0
 
     async def stop(self) -> None:
         """Flush queue & stop writer."""
@@ -192,7 +200,7 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
         # 0) Live metrics for safety check -----------------------------
         # ▲ Compute latency mean robustly – works for Prometheus Summary too
-        if hasattr(self.lat_monitor, "mean"):
+        '''if hasattr(self.lat_monitor, "mean"):
             latency_ms: float = float(self.lat_monitor.mean)
         elif all(hasattr(self.lat_monitor, a) for a in ("_sum", "_count")):
             try:
@@ -200,7 +208,14 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             except Exception:  # fallback if Prometheus internals absent
                 latency_ms = 0.0
         else:
+            latency_ms = 0.0'''
+
+        # Always call mean("execution_bar"); if unsupported, fall back to 0.0
+        try:
+            latency_ms: float = float(self.lat_monitor.mean("execution_bar"))
+        except Exception:
             latency_ms = 0.0
+
         atr = float(feats.get("atr", 0.0))
         trade_loss = float(getattr(self.risk_mgr, "last_loss", 0.0))
         day_pl = float(getattr(self.risk_mgr, "day_pl", 0.0))

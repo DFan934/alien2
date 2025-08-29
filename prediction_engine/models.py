@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Tuple
 
 import numpy as np
@@ -59,7 +60,16 @@ class KNNModel:
 class ModelManager:
     """Hybrid ensemble: variance‑weighted KNN + RandomForest."""
 
-    def __init__(self, use_rf: bool = True):
+    '''def __init__(self, use_rf: bool = True):
+        self.knn = KNNModel()
+        self.rf: RandomForestRegressor | None = None if use_rf else None
+        self.use_rf = use_rf'''
+
+    def __init__(self, artefact_dir: str | Path, use_rf: bool = True):
+        # Store the path that RetrainingManager needs
+        self.artefact_dir = Path(artefact_dir)
+
+        # Your existing logic
         self.knn = KNNModel()
         self.rf: RandomForestRegressor | None = None if use_rf else None
         self.use_rf = use_rf

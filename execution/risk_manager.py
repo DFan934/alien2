@@ -10,6 +10,9 @@ from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 from prediction_engine.tx_cost import BasicCostModel
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Any
+
 
 @dataclass
 class RiskManager:
@@ -43,6 +46,8 @@ class RiskManager:
         self.position_size: float = 0.0
         self.avg_entry_price: float = 0.0
         self.max_drawdown: float = 0.0
+        self.last_loss: float = 0.0
+        self.day_pl: float = 0.0
 
     # --------------------- real‑time updates ---------------------------------
     def update_atr(self, symbol: str, atr: float):
@@ -260,8 +265,8 @@ class RiskManager:
 
         # in process_fill, after you compute `realized_pnl`:
         self.last_loss = max(0.0, -realized_pnl)
-        self.day_pl = getattr(self, "day_pl", 0.0) + realized_pnl
-
+        #self.day_pl = getattr(self, "day_pl", 0.0) + realized_pnl
+        self.day_pl = self.day_pl + realized_pnl
         is_closed = (self.position_size == 0.0)
 
         # ─── DIAG: post-fill risk snapshot ──────────────────────────────────
