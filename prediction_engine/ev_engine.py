@@ -89,6 +89,7 @@ class EVResult:
     # NEW ↓
     mu_raw: float = 0.0
     p_up: float = 0.5
+    p_source: str = "kernel"  # <-- ADD THIS LINE
 
 
 
@@ -615,6 +616,39 @@ class EVEngine:
         print(f"[EV] KNN k={idx.size}  ids={idx[:5].tolist()}  d2={np.round(dist2[:5], 6).tolist()}")
         print(f"[EV] kernel μ={mu_k:.6f}  σ²={var_k:.6f}")
 
+        # --- NEW: kernel probability as a rock-solid fallback ---
+        # Probability that next-bar return is > 0 using the same kernel weights.
+        # y should be a 1D array of realized next-bar returns for neighbors.
+        y = np.asarray(self.mu[idx], dtype=float) # CORRECTED: Use neighbor returns from self.mu[idx]
+        w = np.asarray(w, dtype=float)
+        w_sum = float(w.sum()) if w.size else 0.0
+
+        if w_sum > 1e-9:  # Use a small epsilon for float comparison
+            p_kernel = float(np.sum(w * (y > 0)) / w_sum)
+        else:
+            p_kernel = 0.5
+            # keep p away from exact 0/1
+        p_kernel = float(np.clip(p_kernel, 1e-3, 1.0 - 1e-3))
+
+        # --- Try calibrated probability if provided; fallback to kernel ---
+        p_source = "kernel"
+        p_up = p_kernel
+        if getattr(self, "_calibrator", None) is not None:  # CORRECTED: Use self._calibrator
+            try:
+                # Calibrator expects X sorted/in-range; we pass the kernel mu 'mu_k'
+                p_iso = float(
+                    self._calibrator.predict(np.array([mu_k], dtype=float).reshape(-1, 1))[0])  # CORRECTED: Use mu_k
+                if np.isfinite(p_iso):
+                    p_up = float(np.clip(p_iso, 1e-3, 1.0 - 1e-3))
+                    p_source = "isotonic"
+            except Exception:
+                # Keep kernel fallback
+                p_up = p_kernel
+                p_source = "kernel"
+
+        # Debug visibility
+        print(f"[Cal] p_up={p_up:.3f} source={p_source}")
+
         # -----------------------------------------------------------------
         # NEW · decide whether to call analogue_synth
         # -----------------------------------------------------------------
@@ -975,6 +1009,7 @@ class EVEngine:
             ticket_id,  # drift_ticket
             mu_raw=mu_raw,
             p_up=p_up,
+            p_source=p_source,
         )
 
 

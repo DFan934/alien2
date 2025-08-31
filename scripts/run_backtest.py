@@ -118,7 +118,7 @@ def _resolve_path(path_like: str | Path) -> Path:
 # ────────────────────────────────────────────────────────────────────────
 async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(
-        level=logging.DEBUG, format="[%(levelname)s] %(message)s", stream=sys.stdout
+        level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout
     )
 
 
@@ -370,72 +370,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # === µ → probability + µ → expected-return calibration (clean version) ===
     from sklearn.isotonic import IsotonicRegression
 
-    '''# 1) compute µ for each bar using the SAME engine instance
-    all_X = feats[pc_cols].to_numpy(dtype=np.float32)
-    all_mu = np.array([ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu for x in all_X])
-
-    # 2a) Build binary labels for PROBABILITY calibration: win on next bar?
-    #labels = ((feats["close"].shift(-1) / feats["open"] - 1.0) > 0).astype(int).to_numpy()
-    # PROB calibration label: win over next bar (entry at next open, exit next close)
-    labels = (
-            (feats["close"].shift(-1) / feats["open"].shift(-1) - 1.0) > 0
-    ).astype(int).to_numpy()
-
-
-
-
-    # 2b) (optional) continuous target for RETURN calibration
-    ret1m_raw = (feats["close"].shift(-1) / feats["open"] - 1.0).to_numpy()
-    # subtract a simple cost estimate so the sizing target reflects tradable edge
-    _cost_est = cost_model.estimate(half_spread=0, adv_percentile=10.0)  # 0 in free_mode
-    ret1m = np.nan_to_num(ret1m_raw - _cost_est, nan=0.0)
-
-    # 3a) PROBABILITY calibrator: µ → P(up)
-    iso_prob = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    mask_prob = np.isfinite(all_mu) & np.isfinite(labels)
-    #iso_prob.fit(all_mu[mask_prob], labels[mask_prob])
-
-    # replace plain iso_prob.fit(all_mu[mask_prob], labels[mask_prob]) with binned fit:
-    bins = 12  # small sample → fewer bins
-    dfp = pd.DataFrame({"mu": all_mu[mask_prob], "y": labels[mask_prob]})
-    dfp["bin"] = pd.qcut(dfp["mu"], bins, duplicates="drop")
-    x_bin = dfp.groupby("bin")["mu"].mean().to_numpy()
-    y_bin = dfp.groupby("bin")["y"].mean().to_numpy()
-
-    iso_prob = IsotonicRegression(out_of_bounds="clip", y_min=0.05, y_max=0.95)
-    iso_prob.fit(x_bin, y_bin)
-
-    # (optional) if the spread is still < 0.05, mix with a logistic fallback:
-    if np.ptp(iso_prob.predict(x_bin)) < 0.05:
-        med = np.median(x_bin)
-        scale = np.median(np.abs(x_bin - med)) * 3.0 or 1e-3
-        platt = lambda z: 1.0 / (1.0 + np.exp(-(z - med) / scale))
-        mix = 0.5
-        y_mix = (1 - mix) * y_bin + mix * platt(x_bin)
-        iso_prob.fit(x_bin, y_mix)
-
-    from sklearn.isotonic import IsotonicRegression
-    # 3a) PROBABILITY calibrator: μ → P(up), fit on binned means to avoid saturation
-    iso_prob = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    mask_prob = np.isfinite(all_mu) & np.isfinite(labels)
-    df_prob = pd.DataFrame({"mu": all_mu[mask_prob], "y": labels[mask_prob]})
-
-    if len(df_prob) >= 40:
-        df_prob["bin"] = pd.qcut(df_prob["mu"], 20, duplicates="drop")
-        mu_bin_p = df_prob.groupby("bin")["mu"].mean().to_numpy()
-        y_bin_p = df_prob.groupby("bin")["y"].mean().to_numpy()
-        iso_prob.fit(mu_bin_p, y_bin_p)
-    else:
-        iso_prob.fit(df_prob["mu"].to_numpy(), df_prob["y"].to_numpy())
-      # light guardrail: clip predictions into a neutral band to avoid 0/1 snaps
-
-
-    def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
-        p = iso_prob.predict(mu_vals)
-        return np.clip(p, 0.35, 0.65)'''
-
-    from sklearn.isotonic import IsotonicRegression
-
     all_X = feats[pc_cols].to_numpy(dtype=np.float32)
     all_mu = np.array([ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu for x in all_X])
 
@@ -449,70 +383,95 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     _cost_est = cost_model.estimate(half_spread=0, adv_percentile=10.0)  # 0 in free_mode
     ret1m = np.nan_to_num(ret1m_raw - _cost_est, nan=0.0)
 
-    # labels/ret1m already fixed above
-    mask_prob = np.isfinite(all_mu) & np.isfinite(labels)
-    df_prob = pd.DataFrame({"mu": all_mu[mask_prob], "y": labels[mask_prob]})
+    # ======================== START OF PATCH ========================
+    # === Probability calibration (mu -> p_up) ===
+    # Use a pre-fit artefact from TRAIN ONLY (walk-forward). Otherwise rely on EV's kernel fallback.
+    iso_prob = None
+    if CONFIG.get("calibration_dir"):
+        try:
+            calib_path = Path(CONFIG["calibration_dir"])
+            if calib_path.exists():
+                iso_prob = load_calibrator(calib_path)
+                log.info("Loaded probability calibrator from %s", calib_path)
+            else:
+                log.warning("Calibration directory not found: %s. Relying on EVEngine kernel.", calib_path)
+        except Exception as e:
+            log.warning("Could not load calibrator from %s: %s. Relying on EVEngine kernel.", CONFIG.get("calibration_dir"), e)
 
-    iso_prob = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    nbins = 12 if len(df_prob) < 120 else 20
-    if len(df_prob) >= 40:
-        df_prob["bin"] = pd.qcut(df_prob["mu"], nbins, duplicates="drop")
-        mu_bin = df_prob.groupby("bin")["mu"].mean().to_numpy()
-        y_bin = df_prob.groupby("bin")["y"].mean().to_numpy()
-        iso_prob.fit(mu_bin, y_bin)
+    # If an external calibrator was loaded, run diagnostics on it
+    if iso_prob:
+        def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
+            p = iso_prob.predict(mu_vals)
+            if np.ptp(p) < 0.05 and len(p) > 1:
+                p = 0.5 + 0.5 * (p - p.mean())  # small spread boost
+            return p
+
+        _p = _predict_p(all_mu)
+        cfg["p_gate"] = float(np.quantile(_p, 0.60))  # modest bar
+        cfg["full_p"] = float(np.quantile(_p, 0.80))  # where we want max scale
+        log.info(f"[ISO] gate={cfg['p_gate']:.3f}  full={cfg['full_p']:.3f}  "
+                 f"p(mean,std,min,max)=({float(_p.mean()):.3f},{float(_p.std()):.3f},{float(_p.min()):.3f},{float(_p.max()):.3f})")
+        log.info(f"[ISO] frac p>0.51 = {float((_p > 0.51).mean()):.3f}  "
+                 f"frac p>0.55 = {float((_p > 0.55).mean()):.3f}")
+        grid = np.linspace(all_mu.min(), all_mu.max(), 7)
+        log.info("[ISO prob] p(grid) = %s", np.round(_predict_p(grid), 3))
     else:
-        iso_prob.fit(df_prob["mu"].to_numpy(), df_prob["y"].to_numpy())
-
-    '''def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
-        p = iso_prob.predict(mu_vals)
-        # very light guardrail
-        if np.ptp(p) < 0.05 and len(p) > 1:
-            p = 0.5 + 0.5 * (p - p.mean())  # expand a touch around 0.5
-        '''
-
-    def _predict_p(mu_vals: np.ndarray) -> np.ndarray:
-        p = iso_prob.predict(mu_vals)
-        if np.ptp(p) < 0.05 and len(p) > 1:
-            p = 0.5 + 0.5 * (p - p.mean())  # small spread boost
-        return p  # ← no hard clip here
-        # (If you really want a guard: return np.clip(p, 0.40, 0.60))
-
-        #return np.clip(p, 0.30, 0.70)
-
-
+        # Fallback gates if no calibrator is loaded
+        cfg["p_gate"] = 0.295
+        cfg["full_p"] = 0.55
+    # ========================= END OF PATCH =========================
 
     # 3b) (optional) RETURN calibrator: µ → E[ret1m]
     iso_ret = IsotonicRegression(out_of_bounds="clip")
     mask_ret = np.isfinite(all_mu) & np.isfinite(ret1m)
     # mild de-noising via quantile binning (helps tiny samples)
     df_cal = pd.DataFrame({"mu": all_mu[mask_ret], "ret": ret1m[mask_ret]})
-    df_cal["bin"] = pd.qcut(df_cal["mu"], 20, duplicates="drop")
-    mu_bin = df_cal.groupby("bin")["mu"].mean().to_numpy()
-    ret_bin = df_cal.groupby("bin")["ret"].mean().to_numpy()
-    iso_ret.fit(mu_bin, ret_bin)
+
+    # === Calibration (mu -> expected return) ===
+    # Robust to sparse data (AND-mode): drop empty bins, drop NaNs, sort by X
+    try:
+        df_cal["bin"] = pd.qcut(df_cal["mu"], q=12, duplicates="drop")
+    except ValueError:
+    # If still too few unique values, fall back to fewer bins (e.g., 6)
+        df_cal["bin"] = pd.qcut(df_cal["mu"], q=min(6, df_cal["mu"].nunique()), duplicates="drop")
+
+    # 2) Drop any rows with NaN label or mu before grouping
+    df_cal_nonan = df_cal.dropna(subset=["mu", "ret"])
+
+    # 3) Aggregate only observed (non-empty) bins; keep counts to debug sparsity
+    grp = (df_cal_nonan.groupby("bin", observed=True)  # only keep bins that actually appear
+               .agg(mu_mean=("mu", "mean"), ret_mean=("ret", "mean"), n=("mu", "size"))
+                 .reset_index()
+                       )
+
+    # 4) Drop any NaN aggregates (can happen with pathological inputs)
+    grp = grp.dropna(subset=["mu_mean", "ret_mean"])
+
+    # 5) Build X, y and sort by X (isotonic requires increasing X)
+    X = grp["mu_mean"].to_numpy()
+    y = grp["ret_mean"].to_numpy()
+    order = np.argsort(X)
+    X = X[order]
+    y = y[order]
+
+    # 6) Debugging aid: print bin counts that were actually used
+    used_counts = grp.loc[order, "n"].tolist()
+    print(f"[CAL] used bin counts: {used_counts}  (total rows={int(df_cal_nonan.shape[0])})")
+
+    # 7) Fit isotonic only if we have enough points; otherwise fall back
+    if len(X) >= 4:  # isotonic needs a handful of points to be meaningful
+        iso_ret.fit(X, y)
+    else:
+        print("[CAL] Too few points for isotonic (len<4) — using fallback mapping.")
+        iso_ret = None  # signal downstream to use tanh/logistic fallback for p_up
+
 
     # 4) Inject the PROBABILITY calibrator into the engine so evaluate() yields p_up ≠ constant
     ev._calibrator = iso_prob
 
-    # Optional: clip live calibrator a bit to avoid degenerate p's on tiny samples
-    '''class ClippedIso:
-        def __init__(self, base, lo=0.30, hi=0.70):
-            self.base, self.lo, self.hi = base, lo, hi
-
-        def predict(self, x):
-            x = np.asarray(x).reshape(-1)
-            p = self.base.predict(x)
-            return np.clip(p, self.lo, self.hi)
-
-    ev._calibrator = ClippedIso(iso_prob, lo=0.30, hi=0.70)'''
-
-    ev._calibrator = iso_prob  # ← preferred
-
     # 5) Residual gate: keep in **squared** units (matches dist2/residual usage)
     stats = np.load(art_dir / "cluster_stats.npz", allow_pickle=True)
     if "tau_sq" in stats.files:
-        #ev.residual_threshold = float(np.percentile(stats["tau_sq"], 90))  # d², no sqrt
-        # was 90th
         ev.residual_threshold = float(np.percentile(stats["tau_sq"], 95)) if "tau_sq" in stats.files else (
                                                                                                                       2.5 * ev.h) ** 2
         print("[Residual gate] threshold(d²)=", ev.residual_threshold)
@@ -522,31 +481,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     print(f"[τ²] residual_threshold={ev.residual_threshold:.6g}  "
           f"h²={(ev.h ** 2):.6g}")
-
-    _p = iso_prob.predict(all_mu)
-    cfg["p_gate"] = float(np.quantile(_p, 0.60))  # modest bar
-    cfg["full_p"] = float(np.quantile(_p, 0.80))  # where we want max scale
-    print(f"[ISO] gate={cfg['p_gate']:.3f}  full={cfg['full_p']:.3f}  "
-          f"p(mean,std,min,max)=({float(_p.mean()):.3f},{float(_p.std()):.3f},{float(_p.min()):.3f},{float(_p.max()):.3f})")
-    print(f"[ISO] p(mean,std,min,max) = "
-          f"({float(_p.mean()):.3f}, {float(_p.std()):.3f}, {float(_p.min()):.3f}, {float(_p.max()):.3f})")
-    print(f"[ISO] frac p>0.51 = {float((_p > 0.51).mean()):.3f}  "
-          f"frac p>0.55 = {float((_p > 0.55).mean()):.3f}")
-
-    # After computing _p
-    #cfg["p_gate"] = float(np.quantile(_p, 0.40))  # lower bar = allow some trades
-    #cfg["p_gate"] = max(0.48, min(cfg["p_gate"], 0.52))  # keep it sensible
-    #cfg["full_p"] = float(max(cfg["p_gate"] + 0.06, np.quantile(_p, 0.75)))
-    # TEMP: gentler gates so entries can occur on this tape
-    cfg["p_gate"] = 0.295  # allow entries above the clipped floor
-    cfg["full_p"] = 0.55  # hit max Kelly by here
-
-    # 6) Quick sanity prints (optional)
-    grid = np.linspace(all_mu.min(), all_mu.max(), 7)
-    #print("[ISO prob] p(grid) =", np.round(iso_prob.predict(grid), 3))
-    print("[ISO prob] p(grid) =", np.round(_predict_p(grid), 3))
-
-    print("[Residual gate] threshold(d²)=", ev.residual_threshold)
 
     # Keep iso_ret around for sizing decisions in the backtest loop if you want:
     #   exp_ret = float(iso_ret.predict([[ev_raw.mu]])[0])
@@ -597,106 +531,16 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(f"Frac residual < {ev.residual_threshold:.3g}:",
           (_np.array(res) < ev.residual_threshold).mean())
 
-    #import numpy as np
-    #from pathlib import Path
-
-    # SANITY CHECK
-    #all_mu = [ev.evaluate(row, adv_percentile=10.0).mu
-    #          for row in feats[pc_cols].to_numpy(dtype=np.float32)]
-
-    '''all_mu = np.array(
-        [ev.evaluate(x, adv_percentile=10.0, half_spread=0).mu
-        for x in all_X],
-        dtype = np.float32,
-        )
-
-    target = (feats["close"].shift(-1) / feats["open"] - 1.0).fillna(0.0)
-    # also turn it into a NumPy array
-    ret1m = np.asarray(target, dtype=np.float32)
-
-    #iso = IsotonicRegression(out_of_bounds="clip")
-
-    # fit on binned means to reduce overfitting
-    iso = IsotonicRegression(out_of_bounds="clip")
-    # before fitting, aggregate into 20 quantile‐bins:
-    df_cal = pd.DataFrame(dict(mu=all_mu, ret=ret1m))
-    df_cal['bin'] = pd.qcut(df_cal['mu'], 20, duplicates='drop')
-    mu_bin = df_cal.groupby('bin')['mu'].mean().to_numpy()
-    ret_bin = df_cal.groupby('bin')['ret'].mean().to_numpy()
-    iso.fit(mu_bin, ret_bin)
-
-    # drop any nan targets
-    #mask = ~np.isnan(ret1m)
-    #iso.fit(all_mu[mask], ret1m[mask])
-
-    print(f"[Sanity-full] µ>0 on full tape: {sum(m > 0 for m in all_mu)} / {len(all_mu)}")
-
-    # 3) compute realised return **minus cost**
-    cost = cost_model.estimate(half_spread=0, adv_percentile=10.0)
-    ret1m = feats["close"].shift(-1) / feats["open"] - 1.0 - cost
-    ret1m = ret1m.fillna(0.0)  # << make sure no NaN left
-    ret1m = ret1m.to_numpy()  # sklearn wants ndarray, not Series
-    #iso.fit(all_mu, ret1m)
-    mask = ~np.isnan(ret1m)
-    iso.fit(all_mu[mask], ret1m[mask])
-    # ─── Quick mu sanity BEFORE scan ───────────────────────────────────
-    import numpy as _np
-    all_X = feats[numeric_idx].to_numpy(dtype=_np.float32)
-    all_mu = _np.array([ev.evaluate(x, adv_percentile=10.0).mu for x in all_X])
-    print(f"[Sanity-full] μ>0: {(all_mu > 0).sum()} / {len(all_mu)}")
-    # (optionally plot a histogram)
-    # ─────────────────────────────────────────────────────────────────────
-
-    # ─── P2 Sanity Check: full‑period µ distribution (unfiltered) ────────
-    import numpy as _np
-    import matplotlib.pyplot as _plt
-    # turn your PCA features into a matrix
-    mus = feats[numeric_idx].to_numpy(dtype=_np.float32)
-    # evaluate µ for every bar
-    ev_res = [ev.evaluate(x,
-                          adv_percentile=10.0,
-                          regime=None,
-                          half_spread=0) for x in mus]
-
-
-
-
-    mu_vals = _np.array([r.mu for r in ev_res], dtype=_np.float32)
-
-    sample_mu = np.linspace(mu_vals.min(), mu_vals.max(), 10)
-    #print("Calibrated p’s:", calibrator.predict(sample_mu))
-
-    print(f"[Sanity] Unfiltered µ>0: {(mu_vals > 0).sum()} / {len(mu_vals)}")
-    _plt.hist(mu_vals, bins=30)
-    _plt.title("Full-period µ distribution")
-    _plt.show()'''
-    # ──────────────────────────────────────────────────────────────────────
-
     stats_path = Path(cfg["artefacts"]) / "cluster_stats.npz"
     stats = np.load(stats_path, allow_pickle=True)
 
 
-    #print("Calibrator thresholds:", calibrator.X_thresholds_)
-    #print("Calibrator y:", calibrator.y_min, calibrator.y_max)
-
-    #for x in np.linspace(mu_vals.min(), mu_vals.max(), 5):
-    #    print("map", x, "→", calibrator.predict([[x]])[0])
-
     mu = stats["mu"]
-    #mu_by_cluster = stats["mu"]  # array of length n_clusters
-    #mean_ret1m_by_cl = stats["mean_ret1m"]
-    #good_clusters = set(np.where(mu_by_cluster > 0)[0])
-    #good_clusters = set(np.where(mean_ret1m_by_cl > 0)[0])
 
     # ─── Good‑cluster filter – favour clusters that actually made money ───
     if "mean_ret1m" in stats.files:  # produced by PathClusterEngine ≥ 0.4
         mean_ret1m_by_cl = stats["mean_ret1m"].astype(float)
 
-        # ░░░░░░░░░░  PATCH 4  ░░ top‑quartile good_clusters ░░░░░░░░░░
-        # This logic now correctly sits inside the if-block.
-        # keep only clusters whose mean_ret1m is in the top quartile
-        #q75 = np.percentile(mean_ret1m_by_cl, 75)
-        #good_clusters = set(np.where(mean_ret1m_by_cl >= q75)[0])
         q80 = np.percentile(mean_ret1m_by_cl, 80)  # keep top 20 %
         good_clusters = set(np.where(mean_ret1m_by_cl >= q80)[0])
 
@@ -727,11 +571,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
           " max =", mu.max())
     print("first 10 µ:", mu[:10])
 
-    #stats = np.load(Path(cfg["artefacts"]) / "cluster_stats.npz", allow_pickle=True)
-    #mu = stats["mu"]
-    #good_clusters = set(np.where(mu_by_cluster > 0)[0])
-
-
     print("[DEBUG clusters] µ summary: ",
           f"mean={mu.mean():.8f}, min={mu.min():.8f}, max={mu.max():.8f}")
     print("[DEBUG clusters] first 10 µ:", mu[:10])
@@ -750,51 +589,13 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             f"\n[ERROR] Feature list mismatch.\n  Artefacts: {expected}\n  Runtime : {pc_cols}"
         )
 
-
-    '''sha_actual = hashlib.sha1(sha_actual.encode()).hexdigest()[:12]
-    if sha_actual != sha_expected:
-        print("\n[DEBUG] Features in artefacts (meta.json):")
-        with open(art_dir / "meta.json", "r", encoding="utf-8") as mf:
-            meta = json.load(mf)
-            print(meta["features"])
-
-        print("\n[DEBUG] Features produced at runtime (feats):")
-        feature_cols_live = [c for c in feats.columns if c not in ("symbol", "timestamp")]
-        print(feature_cols_live)
-
-        raise RuntimeError(
-            f"Feature SHA mismatch – artefact built for {sha_expected}, got {sha_actual}"
-        )'''
-
     # --- sanity: compare first row *before* + *after* the PCA re‑fit ----------
     live_vec = feats.loc[0, pc_cols].to_numpy()
     train_vec = np.load("weights/centers.npy")[0]  # first centroid
     print("first live PCA vector : ", live_vec[:6])
     print("first centroid vector : ", train_vec[:6])
 
-    # feature_cols = [
-    #    c for c in feats.columns if c not in ("symbol", "timestamp")
-    # ]  # order preserved
-    # numeric_idx = feats[feature_cols].select_dtypes("number").columns.tolist()
-
     # 4 ─ Instantiate Broker, Cost model & RiskManager
-
-    '''cost_model = BasicCostModel()
-
-    cost_model._DEFAULT_SPREAD_CENTS = float(cfg["spread_bp"])
-    cost_model._COMMISSION = float(cfg["commission"])'''
-
-    #cost_model = BasicCostModel()
-
-    # ── turn every component off for this experiment ───────────────────
-    #cost_model._DEFAULT_SPREAD_CENTS = 0.0  # bid-ask half-spread
-    #cost_model._COMMISSION = 0.0  # broker commission
-    #cost_model._IMPACT_COEFF = 0.0  # square-root market-impact  ⬅ NEW
-    # -------------------------------------------------------------------
-
-
-
-
     broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
     risk = RiskManager(
         account_equity = float(cfg["equity"]),
@@ -803,32 +604,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         adv_cap_pct = float(cfg.get("adv_cap_pct", 0.20)),
         )
 
-    #cost_model.spread_bp = float(cfg["spread_bp"])
-    #cost_model.commission = float(cfg["commission"])
-    #broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
-    # risk = RiskManager(
-    #    account_equity=float(cfg["equity"]), cost_model=cost_model, max_kelly=0.5
-    # )
-
-    # RiskManager now only takes initial equity and max_kelly; drop cost_model
-    #risk = RiskManager(
-    #    float(cfg["equity"]))
-
-    # cost_model = BasicCostModel(
-    #    spread_bp=float(cfg["spread_bp"]), commission=float(cfg["commission"])
-    # )
-    # broker = BrokerStub(slippage_bp=float(cfg["slippage_bp"]))
-    # risk = RiskManager(
-    #    account_equity=float(cfg["equity"]), cost_model=cost_model, max_kelly=0.5
-    # )
-
-    # 5 ─ Event loop
-    #bt = Backtester(feats, cfg)  # Pass the prepared DataFrame
-    # 5 ─ Event loop
-    # Pass all the required components into the Backtester
     # ─── Recompute daily regimes for later breakdown ───
     from prediction_engine.market_regime import label_days, RegimeParams
-    #df_raw["timestamp"] = pd.to_datetime(df_raw["Date"] + " " + df_raw["Time"])
     daily_df = (
         df_raw
         .set_index("timestamp")
@@ -840,7 +617,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     if "mean_ret1m" in stats.files:
         bad = set(np.where(stats["mean_ret1m"] <= 0)[0])
-        # OR stricter: bottom 20%
         q20 = np.percentile(stats["mean_ret1m"], 20)
         bad = set(np.where(stats["mean_ret1m"] <= q20)[0])
         good_clusters = set(range(len(stats["mu"]))) - bad
@@ -856,70 +632,23 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         good_clusters=good_clusters,
         regimes=daily_regimes,
     )
-
-    #eq_curve = bt.run()
-    mu_min, mu_med, mu_max = float(all_mu.min()), float(np.median(all_mu)), float(all_mu.max())
-    print("[ISO sanity] p(min,med,max) =",
-          iso_prob.predict([mu_min, mu_med, mu_max]))
+    if iso_prob:
+        mu_min, mu_med, mu_max = float(all_mu.min()), float(np.median(all_mu)), float(all_mu.max())
+        print("[ISO sanity] p(min,med,max) =",
+              iso_prob.predict([mu_min, mu_med, mu_max]))
 
     eq_curve = bt.run()
-    #signals = eq_curve.copy()
 
     leverage_peak = (eq_curve["notional_abs"] / eq_curve["equity"]).max()
     print(f"[Risk] peak_leverage = {leverage_peak:.2f}×")
 
-    '''csv_path = _resolve_path(cfg["csv"])
-    df_raw = pd.read_csv(csv_path)
-    # ─── rename uppercase OHLC to lowercase to match resample keys ───
-    df_raw.rename(
-        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"},
-        inplace=True,
-    )'''
-
-
-
-    '''# ─── Recompute daily regimes for later breakdown ───
-    from prediction_engine.market_regime import label_days, RegimeParams
-    df_raw["timestamp"] = pd.to_datetime(df_raw["Date"] + " " + df_raw["Time"])
-    daily_df = (
-        df_raw
-        .set_index("timestamp")
-        .resample("D")
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-        .dropna()
-    )
-    daily_regimes = label_days(daily_df, RegimeParams())'''
-
-    # Save
-    #out_path = Path(cfg["out"])
-    #eq_curve.to_csv(out_path, index=False)
-
-    import matplotlib.pyplot as plt
-
-    # After eq_curve.to_csv(...)
-    #df = pd.read_csv(out_path)
-
-    # equity‐based cumulative return
-    #df["cum_return"] = df["equity"] / cfg["equity"] - 1.0
-
-    # --- A) Add one‑bar forward return and win/loss stats ---
-    #signals = df.copy()
     signals = eq_curve.copy()
     signals["cum_return"] = signals["equity"] / cfg["equity"] - 1.0
-    #signals["mu"] = signals["mu_cal"]  # keep legacy column name
 
     signals["mu_raw"] = signals["mu_raw"]  # (no-op, just clarity)
     signals["mu_cal"] = signals["mu_cal"]  # (already there)
     signals["mu"] = signals["mu_raw"]  # <- use raw mu for diagnostics/ROC
-    # If you want to be extra safe about duped names coming from earlier code:
     signals = signals.loc[:, ~signals.columns.duplicated()].copy()
-
-    # --- PATCH: compute calibrated probability p for entries only ---
-    # Define "entries" as rows where we actually put on risk next bar
-    '''entries = signals.get(
-        "qty_next_bar",
-        pd.Series(False, index=signals.index, dtype=bool)
-    ) > 0'''
 
     entries = signals.get("qty_next_bar", pd.Series(False, index=signals.index, dtype=bool)) > 0
 
@@ -933,13 +662,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # Use the *same* in-memory calibrator you fit above (iso_prob)
     try:
-        '''p_vals = map_mu_to_prob(
-            signals.loc[entries, "mu"].to_numpy(dtype=float),
-            calibrator=iso_prob,
-            default_if_missing=0.5,  # neutral if anything goes sideways
-        )'''
-        p_vals = _predict_p(signals.loc[entries, "mu"].to_numpy(dtype=float))
-        signals.loc[entries, "p"] = p_vals
+        if iso_prob:
+            p_vals = _predict_p(signals.loc[entries, "mu"].to_numpy(dtype=float))
+            signals.loc[entries, "p"] = p_vals
     except Exception as e:
         print(f"[PATCH warn] Failed to compute calibrated p: {e}")
 
@@ -953,17 +678,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     else:
         print("[PATCH warn] No valid p on entries; check entries mask (qty_next_bar).")
 
-    #signals["ret1m"] = signals["open"].shift(-1) / signals["open"] - 1.0
-
-    #assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
-    #assert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
-    #assert (signals['mu'].std() > 1e-3), "µ collapsed to constant"
-    #ssert ((signals['mu'] > 0).mean() < 0.25), "µ gate too lax"
-
-    # For diagnostics:
-    #auc_on = "mu_raw"  # <- use raw µ for ROC AUC & deciles
-    #signals.rename(columns={auc_on: "mu"}, inplace=True)
-
     # mask for all trades you took:
     trade_mask = signals.qty_next_bar > 0
     # among those, which were wins?
@@ -971,23 +685,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     print("Positive‑µ trade stats:")
     print("  Total trades:", trade_mask.sum())
-    print("  Win rate:   ", (trade_mask & winning_mask).sum() / trade_mask.sum())
-    # average return *of the trades you actually took*:
-    avg_ret = signals.loc[trade_mask, "ret1m"].mean()
-    print("  Avg ret:    ", avg_ret)
-
-    # --- clip isotonic outputs to avoid degenerate tiny/huge p's on small samples
-
-    '''class ClippedIso:
-        def __init__(self, base, lo=0.30, hi=0.70):
-            self.base, self.lo, self.hi = base, lo, hi
-
-        def predict(self, x):
-            x = np.asarray(x).reshape(-1)
-            p = self.base.predict(x)
-            return np.clip(p, self.lo, self.hi)
-
-    ev._calibrator = ClippedIso(iso_prob, lo=0.30, hi=0.70)'''
+    if trade_mask.sum() > 0:
+        print("  Win rate:   ", (trade_mask & winning_mask).sum() / trade_mask.sum())
+        # average return *of the trades you actually took*:
+        avg_ret = signals.loc[trade_mask, "ret1m"].mean()
+        print("  Avg ret:    ", avg_ret)
 
     from scripts.diagnostics import BacktestDiagnostics
 
@@ -998,6 +700,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     )
     diag.run_all()
 
+    import matplotlib.pyplot as plt
     plt.figure()
     plt.scatter(signals.mu, signals.ret1m, s=5, alpha=0.3)
     plt.title("µ forecast vs realized 1‑bar return")
@@ -1005,16 +708,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     plt.ylabel("ret1m")
     plt.grid(True)
     plt.show()
-
-    # --- C) Cluster‑level summary ---
-    '''cluster_stats = signals.groupby("cluster_id").apply(
-        lambda g: pd.Series({
-            "n": len(g),
-            "mean_µ": g["mu"].mean(),
-            "mean_ret1m": (g["open"].shift(-1) / g["open"] - 1.0).mean()
-        })
-    ).sort_values("mean_ret1m")'''
-    #print(cluster_stats.head(10))
 
     # pandas ≥2.1 deprecation-safe aggregation
     cluster_stats = (
@@ -1062,17 +755,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         plt.ylabel("Count")
         plt.show()
 
-    # after running, in notebook / REPL:
-    #signals = pd.read_csv("backtest_signals.csv")
-    #signals["ret1m"] = signals["open"].shift(-1) / signals["open"] - 1.0
     pearson_r = signals["mu"].corr(signals["ret1m"])
     print("Pearson r =", pearson_r)
 
     print("Residual summary:")
     print(signals["residual"].describe())
-
-    #pct_below = (signals["residual"] < 0.75).mean()
-    #print("Pct residual < 0.75:", pct_below)
 
     thr = getattr(ev, "residual_threshold", 0.75)
     pct_below = (signals["residual"] < thr).mean()
@@ -1097,7 +784,3 @@ __all__ = ["run", "CONFIG"]
 
 if __name__ == "__main__":
     asyncio.run(run(CONFIG))
-
-
-
-

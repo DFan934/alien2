@@ -70,6 +70,10 @@ class Backtester:
         self.cal = calibrator
         self.regimes = regimes
 
+        # ADD THESE TWO LINES AT THE END
+        self._p_min = float('inf')
+        self._p_max = float('-inf')
+
     def run(self) -> pd.DataFrame:
         """
         Executes the main backtesting event loop.
@@ -220,7 +224,7 @@ class Backtester:
             # DO NOT clamp here; let the gate decide
             if p_up < P_GATE:'''
 
-            # --- probability & sizing (ordered!) ---
+            '''# --- probability & sizing (ordered!) ---
             # 1) Get an UNCLIPPED probability for sizing math
             p_raw = float(getattr(ev_raw, "p_up", float("nan")))
             if self.cfg.get("force_entries_on_mu", False):
@@ -281,7 +285,48 @@ class Backtester:
                 if qty <= 0:
                     reasons["qty_zero"] += 1
                 else:
+                    reasons["took_entry"] += 1'''
+
+            # FILE: prediction_engine/testing_validation/backtester.py (inside Backtester.run)
+
+            # --- Probability Gate & Sizing (NEW, from Patch B) ---
+            p_up = ev_raw.p_up
+            p_source = ev_raw.p_source  # For logging/diagnostics
+
+            # Track min/max to detect if the probability signal has collapsed
+            self._p_min = min(self._p_min, p_up)
+            self._p_max = max(self._p_max, p_up)
+
+            # If p_up stops varying, it's a sign the calibrator is flat. Warn the user.
+            if (i > 100) and (self._p_max - self._p_min) < 1e-6:
+                log.warning(
+                    f"p_up has collapsed to a constant value of {p_up:.4f} at bar {i}. Sizing may be compromised.")
+
+            # ---- Gate & Size using p_up ----
+            if p_up < P_GATE:
+                qty = 0
+                reasons["p_gate"] += 1
+            else:
+                # Map probability edge to a fraction of equity
+                edge = (p_up - P_GATE) / p_span  # 0..1 scale
+                frac = float(np.clip(edge, 0.0, 1.0)) * risk.max_kelly
+                adv_today = row.get("adv_shares", None)
+
+                # Get position size from RiskManager
+                qty = risk.kelly_position(
+                    mu=ev_raw.mu,  # Kelly still uses mu/var for risk
+                    variance_down=ev_raw.variance_down,
+                    price=row["open"],
+                    adv=adv_today,
+                    override_frac=frac,  # Use probability-driven fraction
+                )
+
+                if qty <= 0:
+                    reasons["qty_zero"] += 1
+                else:
                     reasons["took_entry"] += 1
+
+            # ... The rest of the loop continues from here (stop-loss logic, etc.) ...
 
             # TEMP: use gentler gates until we see trades; we can tighten later
             #P_GATE = 0.51
@@ -338,6 +383,7 @@ class Backtester:
                 "realized_pnl": realised_pnl,  # US spelling; diagnostics handles both
                 "unrealised_pnl": mtm,
                 "qty_next_bar": qty,
+
                 #"mu_raw": getattr(ev_raw, "mu_raw", ev_raw.mu),
                 #"mu_net": ev_raw.mu,
                 #"mu_cal": ev_raw.mu,  # keep same column your scripts expect
@@ -356,12 +402,18 @@ class Backtester:
                 "notional_abs": abs(risk.position_size * row["open"]),
                 "adv_used": row.get("adv_shares", None),
                 #"p_up": p_up,
-                "p_up": p_clip,
-                "p_up_raw": p_raw,
-                "is_entry": bool(qty > 0),
+                #"p_up": p_clip,
+                #"p_up_raw": p_raw,
+                #"is_entry": bool(qty > 0),
                 #"frac": float(np.clip((p_up - P_GATE) / p_span, 0.0, 1.0)) if p_up >= P_GATE else 0.0,
                 #"frac": frac_p,  # the 0..1 ramp you used for sizing
-                "frac": float(np.clip((p_raw - P_GATE) / p_span, 0.0, 1.0)) if p_clip >= P_GATE else 0.0,
+                #"frac": float(np.clip((p_raw - P_GATE) / p_span, 0.0, 1.0)) if p_clip >= P_GATE else 0.0,
+                # --- WITH THESE LINES ---
+                "p_up": p_up,
+                "p_source": p_source,
+                "is_entry": bool(qty > 0),
+                "frac": float(np.clip((p_up - P_GATE) / p_span, 0.0, 1.0)) if p_up >= P_GATE else 0.0,
+
 
             })
 

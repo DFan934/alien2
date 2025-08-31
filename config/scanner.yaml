@@ -7,3 +7,8 @@ rvol:
 
 liquidity:
   adv_cap_pct: 20.0   # max 20 % ADV position
+
+
+# NEW: control reduction logic in CompositeDetector
+composite:
+  mode: AND   # set to OR if you want more permissive scans

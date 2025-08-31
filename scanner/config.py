@@ -26,6 +26,7 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
     "gap":      {"pct": 0.02},
     "rvol":     {"thresh": 2.0, "lookback": 20},
     "liquidity":{"adv_cap_pct": 20.0},
+    "composite":{"mode": "AND"},
 }
 
 
@@ -39,8 +40,14 @@ def load(path: str | Path | None = None) -> Dict[str, Dict[str, Any]]:
     with cfg_path.open("r", encoding="utf‑8") as fh:
         user_cfg = yaml.safe_load(fh) or {}
     # shallow‑merge defaults
-    out: Dict[str, Dict[str, Any]] = {k: {**v, **user_cfg.get(k, {})}
-                                      for k, v in _DEFAULTS.items()}
+    #out: Dict[str, Dict[str, Any]] = {k: {**v, **user_cfg.get(k, {})}
+    #                                  for k, v in _DEFAULTS.items()}
+
+    # shallow-merge defaults including 'composite.mode'
+    out: Dict[str, Dict[str, Any]] = {
+        k: {**v, **user_cfg.get(k, {})} for k, v in _DEFAULTS.items()
+                                                             }
+
     return out
 
 

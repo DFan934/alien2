@@ -70,11 +70,22 @@ class BasicCostModel(BaseCostModel):
 
     # Calibrated-but-conservative defaults
     # impact is modeled per-share via sqrt(q/ADV) — ~0.5 bps equivalent
-    _IMPACT_COEFF: float = 5e-5  # κ
+    '''_IMPACT_COEFF: float = 5e-5  # κ
     _DEFAULT_SPREAD_CENTS: float = 1.5  # ½-spread fallback in ¢
     _COMMISSION: float = 0.00005  # $/share (e.g., $0.005)
     _SPREAD_FALLBACK = 0.00015  # 1.5¢ half-spread fallback (USD)
+    '''
 
+    # --- CHANGED: Constants updated per the patch ---
+    # Commission: five mills per share ($0.005/share)
+    _COMMISSION = 0.005  # $/share
+    # Half-spread defaults:
+    _DEFAULT_SPREAD_CENTS = 1.5  # cents
+    _SPREAD_FALLBACK = 0.015  # dollars (1.5 cents)
+
+    # Kept from original for the cost() method
+    _IMPACT_COEFF: float = 5e-5  # κ
+    _VOL_COEFF = 0.5
 
 
     # ------------------------------------------------------------------ #
@@ -87,6 +98,7 @@ class BasicCostModel(BaseCostModel):
         half_spread: float | None = None,
         adv_pct: float | None = None,
         volatility: float | None = None,    # NEW: σ of 1‑min returns
+        **kwargs,
     ) -> float:
         """
         Parameters
@@ -99,32 +111,31 @@ class BasicCostModel(BaseCostModel):
             Order size **as % of ADV** (0–100).  When supplied, impact is scaled
             by that liquidity tier; otherwise unit ADV is assumed.
         """
+
+        if adv_pct is None and "adv_percentile" in kwargs:
+            adv_pct = kwargs.pop("adv_percentile")
+
         # --- spread + commission ------------------------------------- #
+        #hs = half_spread if half_spread is not None else self._DEFAULT_SPREAD_CENTS * 0.01
         hs = half_spread if half_spread is not None else self._DEFAULT_SPREAD_CENTS * 0.01
-        commission = self._COMMISSION
+
+        #commission = self._COMMISSION
+        c  = self._COMMISSION
 
         # --- add volatility‐based slippage term ---------------- #
         # caller may optionally pass `volatility` (std‐dev of returns) in adv_pct kw
         #vol = adv_pct if isinstance(adv_pct, float) and vol_kwarg_provided else 0.0
         #vol_slippage = getattr(self, "_VOL_COEFF", 0.5) * vol
 
-        # --- market-impact (square-root) ----------------------------- #
-        if adv_pct is None:
-            frac = 1.0  # assume 1 × ADV normalisation (unit share cost)
-        else:
-            # adv_pct is “% of ADV” for *this* order; clamp to [1e-6, 100]
-            frac = np.clip(adv_pct / 100.0, 1e-6, 1.0)
+        # Using getattr for robustness, as shown in the patch
+        impact = getattr(self, "_IMPACT_COEFF", 0.0) * (adv_pct or 0.0)
+        vol_slip = getattr(self, "_VOL_COEFF", 0.0) * (volatility or 0.0) if volatility is not None else 0.0
 
-        impact = self._IMPACT_COEFF * np.sqrt(frac)
+        per_share = hs + c + impact + vol_slip
 
-        # --- volatility‑scaled queue slippage --------------------- #
-        vol_slippage = 0.0
-
-        if volatility is not None and np.isfinite(volatility):
-                        vol_slippage = self._VOL_COEFF * volatility
-
-
-        return float(hs + commission + impact + vol_slippage)
+        # The original file returned per-share cost, so we keep that behavior
+        # instead of multiplying by abs(qty) as the patch's comments imply.
+        return float(per_share)
 
     # ------------------------------------------------------------------ #
     # Convenience alias (back-compat with old code)                      #
@@ -150,24 +161,26 @@ class BasicCostModel(BaseCostModel):
         return float(hs + self._COMMISSION + slip)'''
 
     def estimate(
-        self,
-        *,
-        half_spread: float | None = None,
-        adv_percentile: float | None = None
-        ) -> float:
+            self,
+            *,
+            half_spread: float | None = None,
+            adv_pct: float | None = None,  # CHANGED: Parameter renamed from adv_percentile
+            **kwargs,
+    ) -> float:
         """
-        + Lightweight per-share cost estimate (used in EVEngine):
-        + cost_ps = half_spread_fallback + commission + slip(ADV%)
-        +  """
+        Return an *estimate* of per-share cost to use in EV or sizing logic.
+        """
 
-        # 1) spread (fallback if not provided)
-        hs = float(half_spread) if half_spread is not None else float(self._SPREAD_FALLBACK)
-        # 2) ADV% slippage: 0 bp at ≤5%, up to 15 bp by 20%
-        if adv_percentile is None:
-            slip = 0.0
-        else:
-            slip = 0.00015 * max(0.0, min((float(adv_percentile) - 5.0) / 15.0, 1.0))
-        return float(hs + self._COMMISSION + slip)
+        # Back-compat: allow callers to pass adv_percentile=...
+        if adv_pct is None and "adv_percentile" in kwargs:
+            adv_pct = kwargs.pop("adv_percentile")
+
+        # --- CHANGED: Logic replaced with the patch's simplified model ---
+        hs = half_spread if half_spread is not None else self._SPREAD_FALLBACK
+        c = self._COMMISSION
+        impact = getattr(self, "_IMPACT_COEFF", 0.0) * (adv_pct or 0.0)
+
+        return float(hs + c + impact)
 
 
 # ---------------------------------------------------------------------------#

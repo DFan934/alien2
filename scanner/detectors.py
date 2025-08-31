@@ -12,7 +12,7 @@ Only the *SectorMomentumDetector* section changed – rest of file is unchanged.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Literal
 import pandas as pd
 from .config import load as _load_cfg
 from .sector_feed import CACHE  # <-- new dependency
@@ -95,28 +95,47 @@ class BullishEngulfingDetector:
 @dataclass(slots=True)
 class CompositeDetector:
     """Logical‑AND reducer over sub‑detectors (sync **or** async)."""
+    #sub: list[Callable[[pd.DataFrame], "pd.Series | Awaitable[pd.Series]"]] = field(default_factory=list)
+    """
+    Reducer over sub-detectors (sync **or** async).
+    mode="AND": pass only rows that all sub-detectors agree on.
+    mode="OR": pass rows that any sub-detector flags.
+    """
     sub: list[Callable[[pd.DataFrame], "pd.Series | Awaitable[pd.Series]"]] = field(default_factory=list)
+    mode: Literal["AND", "OR"] = "AND"
 
-    async def __call__(self, df: pd.DataFrame) -> pd.Series:  # noqa: C901
+    # FILE: scanner/detectors.py
+
+    async def __call__(self, df: pd.DataFrame) -> pd.Series:
         import inspect, asyncio
-        #mask = pd.Series(True, index=df.index)
 
-        mask = pd.Series(False, index=df.index)
-        for det in self.sub:
-            res = det(df)  # may be coroutine
-            if inspect.iscoroutine(res):
-                res = await res  # type: ignore[assignment]
-            #mask &= res
-            mask |= res
-            if not mask.any():
-                break  # early‑exit
-        return mask
+        if self.mode == "AND":
+            mask = pd.Series(True, index=df.index)
+            for det in self.sub:
+                res = det(df)
+                if inspect.iscoroutine(res):
+                    res = await res
+                mask &= res
+                if not mask.any():
+                    break
+            return mask
+        else:  # "OR"
+            mask = pd.Series(False, index=df.index)
+            for det in self.sub:
+                res = det(df)
+                if inspect.iscoroutine(res):
+                    res = await res
+                # Apply the result to the mask regardless of detector type
+                mask |= res
+                if mask.all():
+                    break
+            return mask
 
 
 # ---------------------------------------------------------------------------
 # Factory – build a CompositeDetector from YAML
 # ---------------------------------------------------------------------------
-def build_from_yaml(path: str | None = None) -> "CompositeDetector":
+'''def build_from_yaml(path: str | None = None) -> "CompositeDetector":
     cfg = _load_cfg(path)
     detectors: list[Callable[[pd.DataFrame],
                              "pd.Series | Awaitable[pd.Series]"]] = []
@@ -126,11 +145,31 @@ def build_from_yaml(path: str | None = None) -> "CompositeDetector":
 
     # add any extra rule you like here – order matters (cheapest first)
     return CompositeDetector(detectors)
+'''
 
+def build_from_yaml(path: str | None = None) -> "CompositeDetector":
+    cfg = _load_cfg(path)
+    detectors: list[Callable[[pd.DataFrame],
+                             "pd.Series | Awaitable[pd.Series]"]] = []
 
-def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
+    detectors.append(GapDetector(**cfg["gap"]))
+    detectors.append(HighRVOLDetector(**cfg["rvol"]))
+
+    # add any extra rule you like here – order matters (cheapest first)
+    mode = cfg.get("composite", {}).get("mode", "AND")
+    return CompositeDetector(detectors, mode=mode)
+
+'''def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
     cfg = _load_cfg(cfg_path)
     return CompositeDetector([
         GapDetector(**cfg["gap"]),
         HighRVOLDetector(**cfg["rvol"]),
-    ])
+    ])'''
+
+def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
+    cfg = _load_cfg(cfg_path)
+    mode = cfg.get("composite", {}).get("mode", "AND")
+    return CompositeDetector([
+        GapDetector(**cfg["gap"]),
+        HighRVOLDetector(**cfg["rvol"]),
+    ], mode=mode)
