@@ -17,7 +17,7 @@ import pandas as pd
 from prediction_engine.calibration import map_mu_to_prob
 from prediction_engine.ev_engine import EVEngine
 from execution.risk_manager import RiskManager
-from prediction_engine.testing_validation.backtester import BrokerStub
+from prediction_engine.testing_validation.async_backtester import BrokerStub
 from execution.manager import ExecutionManager
 # Backtester now receives ready‑made components; only type hints needed
 from prediction_engine.ev_engine import EVEngine

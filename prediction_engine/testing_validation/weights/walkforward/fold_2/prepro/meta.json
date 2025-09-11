@@ -1,0 +1,24 @@
+{
+  "predict_cols": [
+    "vwap_delta",
+    "rvol_20d",
+    "ema_9_dist",
+    "ema_20_dist",
+    "roc_10",
+    "atr_14",
+    "adx_14",
+    "time_since_trigger_min",
+    "volume_spike_pct"
+  ],
+  "n_components": 6,
+  "explained_variance_ratio_": [
+    0.4010716378688812,
+    0.19533459842205048,
+    0.1347229927778244,
+    0.11388049274682999,
+    0.07597731053829193,
+    0.05427154526114464
+  ],
+  "scaler_mean_sha1": "77a100e2741711f2b64e372fd009518ca999d09e",
+  "scaler_scale_sha1": "e4663a30c8aa79a36af01637e31165a44c2df536"
+}

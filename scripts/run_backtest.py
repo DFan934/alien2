@@ -28,7 +28,7 @@ from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel  # NEW
 from execution.risk_manager import RiskManager
-from prediction_engine.testing_validation.backtester import BrokerStub  # NEW
+from prediction_engine.testing_validation.async_backtester import BrokerStub  # NEW
 from scripts.rebuild_artefacts import rebuild_if_needed  # NEW
 from scanner.detectors import build_detectors        # ‹— add scanner import
 from backtester import Backtester
