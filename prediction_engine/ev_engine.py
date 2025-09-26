@@ -232,13 +232,30 @@ class EVEngine:
         #    recency_w = None
 
         # Build distance helper – core k‑NN search (recency comes later)
+
+        self._cost = cost_model
+
         self._dist = DistanceCalculator(
             ref = self.centers,
             metric = metric,
             rf_weights = rf_weights,
         )
 
-        self._cost: BasicCostModel = cost_model or BasicCostModel()
+        #self._cost: BasicCostModel = cost_model or BasicCostModel()
+
+        # --- COST MODEL SANITY (NEW) ---
+        # If no cost model is provided, do not silently construct one.
+        # Costs will be treated as zero in evaluate().
+        #if getattr(self, "_cost", None) is not None:  # <-- This now works correctly
+        ## --- COST MODEL SANITY (NEW) ---
+        # If no cost model is provided, do not silently construct one.
+        # Costs will be treated as zero in evaluate().
+        if getattr(self, "_cost", None) is not None:
+            # Document expected unit explicitly: USD per share (not fraction).
+            self._cost_unit = "usd_per_share"
+        else:
+            self._cost_unit = "none"
+
 
         # Kelly-sizer helper (singleton inside engine)
         self._sizer = KellySizer()
@@ -616,6 +633,35 @@ class EVEngine:
         print(f"[EV] KNN k={idx.size}  ids={idx[:5].tolist()}  d2={np.round(dist2[:5], 6).tolist()}")
         print(f"[EV] kernel μ={mu_k:.6f}  σ²={var_k:.6f}")
 
+        # --- Probability (single source of truth) ------------------------------
+        # Precedence: isotonic (if present) -> else kernel monotone map.
+        '''try:
+            if self._calibrator is not None:
+                # Use the same mapping as training (isotonic over µ)
+                from prediction_engine.calibration import map_mu_to_prob
+                p_up = float(map_mu_to_prob(np.array([mu_k], dtype=float),
+                                            calibrator=self._calibrator)[0])
+                
+                
+                '''
+        try:
+            if self._calibrator is not None:
+                #Use the same mapping as training (isotonic over µ) — use the module-level import
+                p_up = float(map_mu_to_prob(np.array([mu_k], dtype=float),
+                calibrator = self._calibrator)[0])
+
+                p_source = "isotonic"
+            else:
+                # Monotone kernel fallback (tanh on µ magnitude)
+                scale = max(1e-6, np.median([abs(mu_k), 1e-4]))
+                p_up = float(0.5 * (1.0 + np.tanh(mu_k / (5.0 * scale))))
+                p_source = "kernel"
+        except Exception:
+            p_up, p_source = 0.5, "fallback"
+
+        p_up = float(np.clip(p_up, 1e-3, 1.0 - 1e-3))
+        print(f"[Cal] p_up={p_up:.3f} source={p_source}")
+
         # --- NEW: kernel probability as a rock-solid fallback ---
         # Probability that next-bar return is > 0 using the same kernel weights.
         # y should be a 1D array of realized next-bar returns for neighbors.
@@ -649,6 +695,52 @@ class EVEngine:
         # Debug visibility
         print(f"[Cal] p_up={p_up:.3f} source={p_source}")
 
+        # --- COST handling (unit-safe) ----------------------------------------
+        mu_raw = float(mu_k)  # kernel µ before costs
+        mu_net = mu_raw
+
+        if self._cost is not None:
+            # You’ll want to pass a price in the future; until then, keep costs zero in debug.
+            price = getattr(self, "last_price", None)
+            if price is not None and price > 0:
+                usd_ps_oneway = float(self._cost.estimate())  # $/share (one-way)
+                cost_frac = (usd_ps_oneway / float(price)) * 2.0  # round-trip fraction
+                mu_net = mu_raw - cost_frac
+                print(f"[Cost] mu_raw={mu_raw:+.6f} usd_ps={usd_ps_oneway:.4f} price={price:.4f} "
+                      f"cost_frac_rt={cost_frac:.6f} mu_net={mu_net:+.6f}")
+            else:
+                # No price available → skip cost until wired. Debug prints to avoid confusion.
+                print(f"[Cost] mu_raw={mu_raw:+.6f} (no price; skipping cost) mu_net={mu_net:+.6f}")
+        else:
+            print(f"[Cost] mu_raw={mu_raw:+.6f} (no cost model) mu_net={mu_net:+.6f}")
+
+        '''# --- COST handling (unit-safe) ----------------------------------------
+        # If a cost model is present, it should return $/share (one-way).
+        # Convert to a *fraction of price* and subtract as round-trip.
+        cost_frac = 0.0
+        price_used = np.nan
+        if self._cost_model is not None:
+            try:
+                # You can customize how we fetch a price; for O->C we use next open.
+                # If price is not injected here, fall back to |mu_k| scaling or skip.
+                # Minimal, safe default for now: skip unless caller later wires price.
+                est_cost_ps = float(self._cost_model.estimate())  # $/share, one-way
+                # Your engine doesn’t carry price at this point; until you wire it,
+                # keep costs OFF in debug runs (see run_backtest change below).
+                # To fully enable: pass price into evaluate(...) or set self.last_price.
+                price_used = float("nan")
+                cost_frac = 0.0  # keep zero until price wiring is added
+            except Exception:
+                cost_frac = 0.0
+
+        # Apply cost as round-trip fraction
+        mu_raw = float(mu_k)
+        mu_net = float(mu_raw - 2.0 * cost_frac)
+
+        print(
+            f"[Cost] mu_raw={mu_raw:+.6f}  cost_ps_usd={getattr(self._cost_model, 'commission', float('nan')) if self._cost_model else 0.0:.4f} "
+            f"price={price_used}  cost_frac_rt={2.0 * cost_frac:.6f}  mu_net={mu_net:+.6f}")
+        '''
         # -----------------------------------------------------------------
         # NEW · decide whether to call analogue_synth
         # -----------------------------------------------------------------
@@ -668,6 +760,15 @@ class EVEngine:
             residual = nearest_d2  # <<<<<<<<< was always 0
 
             mu_syn, var_syn, var_down_syn = mu_k, var_k, var_down_k
+
+        mu_final = float(mu_net)  # use cost-adjusted µ for decisions
+
+        # ... your sizing code ...
+        # kelly = self._sizer.size(mu_final, var_down_syn)   # example
+        # position_size = max(0.0, min(kelly, 0.4))          # cap 40%
+
+
+
         '''# ------------------------------------------------------------
         # 3. Synthetic analogue via inverse‑difference weights
         # ------------------------------------------------------------
@@ -744,6 +845,13 @@ class EVEngine:
         sig2 *= liquidity_mult
         sig2_down *= liquidity_mult
 
+        res = EVResult(
+            mu=mu_final, sigma=float(var_syn), variance_down=float(var_down_syn),
+            beta=beta.astype(np.float32), residual=float(residual),
+            cluster_id=int(idx[0]), position_size=float(0.0),
+            mu_raw=mu_raw, p_up=float(p_up), p_source=p_source
+        )
+
         # ------------------------------------------------------------
         # 4. Subtract transaction cost
         # ------------------------------------------------------------
@@ -797,14 +905,36 @@ class EVEngine:
         # ------------------------------------------------------------
         mu_raw = mu  # <- preserve the model’s raw expected edge
 
+
         # 5) Transaction cost and net edge (from RAW µ)
-        cost_ps = self._cost.estimate(
+        '''cost_ps = self._cost.estimate(
             half_spread=half_spread,
             adv_percentile=adv_percentile
         )
         mu_net = mu_raw - cost_ps
+        '''
+
+        '''if self._cost is not None:
+            cost_ps = self._cost.estimate(
+            half_spread = half_spread,
+            adv_percentile = adv_percentile
+                                        )
+        else:
+            cost_ps = 0.0
+            mu_net = mu_raw - cost_ps
 
         mu_net_original = mu_net  # keep a copy before residual penalties
+        '''
+
+        if self._cost is not None:
+            cost_ps = self._cost.estimate(
+            half_spread = half_spread,
+            adv_percentile = adv_percentile
+                                       )
+        else:
+            cost_ps = 0.0
+            mu_net = mu_raw - cost_ps
+            mu_net_original = mu_net  # keep a copy before residual penalties
 
         # ------------------------------------------------------------
         # QUICK-WIN : penalise distant analogues

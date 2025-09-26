@@ -1,0 +1,23 @@
+{
+  "n_test": 13,
+  "n_entries": 13,
+  "auc_all": 0.375,
+  "auc_entries": 0.375,
+  "win_rate": 0.07692307692307693,
+  "avg_ret": -0.00037700966740407724,
+  "max_drawdown": 0.0,
+  "rolling20_sharpe": {
+    "count": 0.0,
+    "mean": null,
+    "std": null,
+    "min": null,
+    "25%": null,
+    "50%": null,
+    "75%": null,
+    "max": null
+  },
+  "label_horizon": "UNKNOWN",
+  "p_min": 0.018924302788844622,
+  "p_max": 0.058823529411764705,
+  "p_iqr": 0.0
+}

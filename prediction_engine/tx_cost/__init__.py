@@ -182,6 +182,15 @@ class BasicCostModel(BaseCostModel):
 
         return float(hs + c + impact)
 
+# --- NEW: Explicit zero-cost model for debug / unit tests --------------
+class NoCostModel(BaseCostModel):
+    """Always returns zero per-share cost (useful for debug runs)."""
+    def cost(self, qty: float = 1.0, *, half_spread: float | None = None,
+             adv_pct: float | None = None, **kwargs) -> float:
+        return 0.0
+    def estimate(self, *, half_spread: float | None = None,
+                 adv_percentile: float | None = None, **kwargs) -> float:
+        return 0.0
 
 # ---------------------------------------------------------------------------#
 # Legacy free-function shim  – forwards to singleton instance                #

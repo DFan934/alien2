@@ -55,10 +55,25 @@ _PREDICT_COLS = [
 class CoreFeaturePipeline:
     """Run feature engineering in‑memory using pure Pandas/SciKit."""
 
-    def __init__(self, parquet_root: str | Path):
+    '''def __init__(self, parquet_root: str | Path):
         self.parquet_root = Path(parquet_root)
         if not self.parquet_root.exists():
             raise FileNotFoundError(self.parquet_root)
+    '''
+
+    def __init__(self, parquet_root: str | Path):
+        self.parquet_root = Path(parquet_root)
+        if not self.parquet_root.exists():
+            # Allow creation if the intention is to use run_mem, which creates subdirs.
+            # raise FileNotFoundError(self.parquet_root)
+            pass
+
+        # --- NEW: Auto-load the fitted pipeline if it exists ---
+        pipe_path = self.parquet_root / "_fe_meta" / "pipeline.pkl"
+        if pipe_path.exists():
+            log.info(f"[FE] Loading pre-fitted pipeline from {pipe_path}")
+            self._pipe = joblib.load(pipe_path)
+
 
     # ------------------------------------------------------------------
     # In-memory variant – used by unit-tests & quick back-tests
@@ -103,9 +118,13 @@ class CoreFeaturePipeline:
         ).dt.total_seconds().div(60)
         df["volume_spike_pct"] = df["volume_spike_pct"]
 
+        df_with_features = self._calculate_base_features(df_raw)
+
 
         # Select only the features to use for PCA
-        features = df[_PREDICT_COLS].astype(np.float32)
+        #features = df[_PREDICT_COLS].astype(np.float32)
+        features = df_with_features[_PREDICT_COLS].astype(np.float32)
+
 
         pipe = Pipeline(
             steps=[
@@ -115,6 +134,8 @@ class CoreFeaturePipeline:
             ]
         )
         transformed = pipe.fit_transform(features)
+
+        self._pipe = pipe
 
         pca = pipe.named_steps["pca"]
         log.info("[FE] PCA n_comp=%d  cum_var=%.1f%%",
@@ -127,11 +148,23 @@ class CoreFeaturePipeline:
         np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
         np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
 
+        # ALSO persist the actual fitted objects for eval-time transform (A2)
+        joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
+        joblib.dump(pipe, out_dir / "pipeline.pkl")
+
+
         n_comp = pipe.named_steps["pca"].n_components_
         pca_cols = [f"pca_{i + 1}" for i in range(n_comp)]
-        df_pca = pd.DataFrame(transformed, columns=pca_cols, index=df.index, dtype=np.float32)
-        df_pca["symbol"] = df["symbol"].values
-        df_pca["timestamp"] = df["timestamp"].values
+        #df_pca = pd.DataFrame(transformed, columns=pca_cols, index=df.index, dtype=np.float32)
+        df_pca = pd.DataFrame(transformed, columns=pca_cols, index=df_with_features.index, dtype=np.float32)
+
+        #df_pca["symbol"] = df["symbol"].values
+        #df_pca["timestamp"] = df["timestamp"].values
+
+        df_pca["symbol"] = df_with_features["symbol"].values
+        df_pca["timestamp"] = df_with_features["timestamp"].values
 
         pca_meta = {
             "n_components": int(n_comp),
@@ -143,6 +176,38 @@ class CoreFeaturePipeline:
         #out["close"] = df["close"].values  # keep close so cluster builder can create y
 
         return df_pca, pca_meta
+
+        # In feature_engineering/pipelines/core.py, inside the CoreFeaturePipeline class
+
+    def _calculate_base_features(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+        """Applies all base feature calculators and adds context features."""
+        df = df_raw.copy()
+
+        # Ensure numeric types before calculations
+        num_cols = ["open", "high", "low", "close", "volume"]
+        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+
+        if "Date" in df.columns and "Time" in df.columns:
+            df = df.drop(columns=["Date", "Time"])
+
+        for calc in _CALCULATORS:
+            df = calc(df)
+
+        # This forward/backward fill is crucial for stability
+        df = df.ffill().bfill()
+
+        # Compute trigger-context features if the columns exist
+        if "trigger_ts" in df.columns:
+            df["time_since_trigger_min"] = (
+                    df["timestamp"] - df["trigger_ts"]
+            ).dt.total_seconds().div(60)
+
+        # The column should already exist from run_backtest.py, just ensure it
+        if "volume_spike_pct" not in df.columns:
+            df["volume_spike_pct"] = 0.0
+
+        return df
+
 
     @classmethod
     def from_artifact_dir(cls, artefact_dir: Path) -> "CoreFeaturePipeline":
@@ -161,11 +226,19 @@ class CoreFeaturePipeline:
     # -----------------------------------------------------------------------
     # 🔄 Transform in‑memory DataFrame without re‑fitting
     # -----------------------------------------------------------------------
-    def transform_mem(self, df: pd.DataFrame) -> pd.DataFrame:
+    '''def transform_mem(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Apply the saved scaler+PCA _without_ refitting.
         """
-        X_raw = df[self.raw_feature_cols].to_numpy(dtype=np.float32)
+        #X_raw = df[self.raw_feature_cols].to_numpy(dtype=np.float32)
+
+        # Use the same predictor list as run/run_mem
+        predict_cols = [
+            "vwap_delta", "rvol_20d", "ema_9_dist", "ema_20_dist", "roc_10",
+            "atr_14", "adx_14", "time_since_trigger_min", "volume_spike_pct"
+        ]
+        X_raw = df[predict_cols].to_numpy(dtype=np.float32)
+
         X_scaled = self._scaler.transform(X_raw)  # type: ignore[attr-defined]
         X_pca = self._pca.transform(X_scaled)  # type: ignore[attr-defined]
         feats = pd.DataFrame(
@@ -175,7 +248,33 @@ class CoreFeaturePipeline:
         )
         feats["symbol"] = df["symbol"].values
         feats["timestamp"] = df["timestamp"].values
-        return feats
+        return feats'''
+
+    # In feature_engineering/pipelines/core.py
+
+    def transform_mem(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates all features, then TRANSFORMS using the pre-fitted pipeline.
+        """
+        if not hasattr(self, '_pipe'):
+            raise RuntimeError("Pipeline has not been fitted yet. Call run_mem() first.")
+
+        # 1) Apply all base feature calculations
+        df_with_features = self._calculate_base_features(df_raw)
+
+        # 2) Select only the features to use for PCA
+        features = df_with_features[_PREDICT_COLS].astype(np.float32)
+
+        # 3) Transform using the fitted pipeline
+        transformed = self._pipe.transform(features)
+
+        n_comp = self._pipe.named_steps["pca"].n_components_
+        pca_cols = [f"pca_{i + 1}" for i in range(n_comp)]
+        df_pca = pd.DataFrame(transformed, columns=pca_cols, index=df_with_features.index, dtype=np.float32)
+        df_pca["symbol"] = df_with_features["symbol"].values
+        df_pca["timestamp"] = df_with_features["timestamp"].values
+
+        return df_pca
 
     # ---------------------------------------------------------------------
     @timeit("pipeline‑run")
@@ -245,6 +344,12 @@ class CoreFeaturePipeline:
         out_dir.mkdir(exist_ok=True)
         np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
         np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
+
+        # ALSO persist the actual fitted objects for eval-time transform (A2)
+        joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+        # ADD THIS LINE to save the whole pipeline object
+        joblib.dump(pipe, out_dir / "pipeline.pkl")
 
         k = pipe.named_steps["pca"].n_components_
         pca_cols = [f"pca_{i + 1}" for i in range(k)]
