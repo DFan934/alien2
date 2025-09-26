@@ -26,6 +26,13 @@ __all__ = [
     "CompositeDetector",
 ]
 
+DEFAULTS_DEV_LOOSE = {
+    "gap": {"pct": 0.0005},        # 0.05% gap (was 0.10%)
+    "rvol": {"thresh": 0.8, "lookback": 20},  # was 1.0×
+}
+DEFAULT_COMPOSITE_MODE = "OR"      # ← make OR the default for dev
+
+
 # Existing simple detectors ---------------------------------------------------
 
 def _pct_gap(df: pd.DataFrame) -> pd.Series:
@@ -147,7 +154,7 @@ class CompositeDetector:
     return CompositeDetector(detectors)
 '''
 
-def build_from_yaml(path: str | None = None) -> "CompositeDetector":
+'''def build_from_yaml(path: str | None = None) -> "CompositeDetector":
     cfg = _load_cfg(path)
     detectors: list[Callable[[pd.DataFrame],
                              "pd.Series | Awaitable[pd.Series]"]] = []
@@ -157,7 +164,7 @@ def build_from_yaml(path: str | None = None) -> "CompositeDetector":
 
     # add any extra rule you like here – order matters (cheapest first)
     mode = cfg.get("composite", {}).get("mode", "AND")
-    return CompositeDetector(detectors, mode=mode)
+    return CompositeDetector(detectors, mode=mode)'''
 
 '''def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
     cfg = _load_cfg(cfg_path)
@@ -166,10 +173,30 @@ def build_from_yaml(path: str | None = None) -> "CompositeDetector":
         HighRVOLDetector(**cfg["rvol"]),
     ])'''
 
-def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
+'''def build_detectors(cfg_path: str | None = None) -> CompositeDetector:
     cfg = _load_cfg(cfg_path)
     mode = cfg.get("composite", {}).get("mode", "AND")
     return CompositeDetector([
         GapDetector(**cfg["gap"]),
         HighRVOLDetector(**cfg["rvol"]),
-    ], mode=mode)
+    ], mode=mode)'''
+
+
+def build_from_yaml(path: str | None = None) -> "CompositeDetector":
+    cfg = _load_cfg(path)
+    detectors: list[Callable[[pd.DataFrame], "pd.Series | Awaitable[pd.Series]"]] = []
+    detectors.append(GapDetector(**cfg["gap"]))
+    detectors.append(HighRVOLDetector(**cfg["rvol"]))
+    mode = cfg.get("composite", {}).get("mode", DEFAULT_COMPOSITE_MODE)  # ← changed default
+    return CompositeDetector(detectors, mode=mode)
+
+def build_detectors(cfg_path: str | None = None, *, dev_loose: bool = False) -> CompositeDetector:
+    """Factory with optional dev-loosening of thresholds to boost pass-rate while iterating."""
+    cfg = _load_cfg(cfg_path)
+    mode = cfg.get("composite", {}).get("mode", DEFAULT_COMPOSITE_MODE)
+    gap_cfg = dict(cfg.get("gap", {}))
+    rvol_cfg = dict(cfg.get("rvol", {}))
+    if dev_loose:
+        gap_cfg.update(DEFAULTS_DEV_LOOSE["gap"])
+        rvol_cfg.update(DEFAULTS_DEV_LOOSE["rvol"])
+    return CompositeDetector([GapDetector(**gap_cfg), HighRVOLDetector(**rvol_cfg)], mode=mode)

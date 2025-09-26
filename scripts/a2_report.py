@@ -111,15 +111,22 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
     # --- NEW: try to read artifacts meta (for label_horizon) ---
     meta_horizon = "UNKNOWN"
     try:
+
         meta_path = (Path(artifacts_root) / "meta.json")
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
             meta_horizon = str(meta.get("label_horizon", "UNKNOWN"))
+            meta_side = meta.get("label_side", "UNKNOWN")
+            meta_thresh = meta.get("label_threshold", "UNKNOWN")
+            print(f"[Report] label_horizon = {meta_horizon}")
+            print(f"[Report] label_side    = {meta_side}   label_threshold = {meta_thresh}")
+
     except Exception:
         pass
 
-
     dec = _load_all_decisions(artifacts_root)
+
+
 
     # --- NEW: p-spread telemetry on all scanned rows ---
     p_min = float("nan")
@@ -155,6 +162,24 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
         ent = dec[dec["gate"] == 1]
         if len(ent) > 0 and ent["label"].nunique() > 1:
             auc_entries = float(roc_auc_score(ent["label"].to_numpy(), ent["p"].to_numpy()))
+    except Exception:
+        pass
+
+    # --- Flipped AUCs (sign check) ---
+    auc_all_flip = float("nan")
+    auc_entries_flip = float("nan")
+    try:
+        if dec["label"].nunique() > 1:
+            p_all = dec["p"].to_numpy(dtype=float)
+            y_all = dec["label"].to_numpy(dtype=float)
+            auc_all_flip = float(roc_auc_score(y_all, 1.0 - p_all))
+    except Exception:
+        pass
+    try:
+        if len(ent) > 0 and ent["label"].nunique() > 1:
+            p_ent = ent["p"].to_numpy(dtype=float)
+            y_ent = ent["label"].to_numpy(dtype=float)
+            auc_entries_flip = float(roc_auc_score(y_ent, 1.0 - p_ent))
     except Exception:
         pass
 
@@ -228,9 +253,27 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
 
     print(f"AUC(all)={auc_all if not np.isnan(auc_all) else 'nan'}")
     print(f"AUC(entries)={auc_entries if not np.isnan(auc_entries) else 'nan'}")
+
+    print(f"AUC(all, 1-p)={auc_all_flip if not np.isnan(auc_all_flip) else 'nan'}")
+    print(f"AUC(entries, 1-p)={auc_entries_flip if not np.isnan(auc_entries_flip) else 'nan'}")
+
     print(f"(p_min={p_min:.3f}  p_max={p_max:.3f}  p_IQR={p_iqr:.3f})")  # NEW
 
+    # --- Reliability / Brier diagnostics (raw p) ---
+    try:
+        p_all = dec["p"].to_numpy(dtype=float)
+        y_all = dec["label"].to_numpy(dtype=float)
+        print_reliability("raw (all)", p_all, y_all)
+    except Exception:
+        pass
 
+    try:
+        if len(ent) > 0:
+            p_ent = ent["p"].to_numpy(dtype=float)
+            y_ent = ent["label"].to_numpy(dtype=float)
+            print_reliability("raw (entries)", p_ent, y_ent)
+    except Exception:
+        pass
 
     print("\n=== Drawdown ===")
     print(f"Max drawdown = {max_dd*100:.2f}%")
@@ -245,3 +288,38 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
         print("n/a (insufficient variety)")
 
     return {"decisions": dec, "entries": entries, "summary": summary}
+
+
+def _brier_score(p: np.ndarray, y: np.ndarray) -> float:
+    m = np.isfinite(p) & np.isfinite(y)
+    if m.sum() == 0: return float('nan')
+    return float(np.mean((p[m] - y[m])**2))
+
+def _reliability_table(p: np.ndarray, y: np.ndarray, bins: int = 10):
+    # returns list of (p_mean, y_rate, n) for evenly spaced probability bins
+    p = np.asarray(p); y = np.asarray(y)
+    m = np.isfinite(p) & np.isfinite(y)
+    p, y = p[m], y[m]
+    if len(p) == 0: return []
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    out = []
+    for i in range(bins):
+        lo, hi = edges[i], edges[i+1]
+        sel = (p >= lo) & (p < hi) if i < bins - 1 else (p >= lo) & (p <= hi)
+        if sel.sum() == 0:
+            out.append((float((lo+hi)/2), float('nan'), 0))
+        else:
+            out.append((float(p[sel].mean()), float(y[sel].mean()), int(sel.sum())))
+    return out
+
+def print_reliability(name: str, p: np.ndarray, y: np.ndarray):
+    print(f"\n=== Calibration ({name}) ===")
+    print(f"Brier = {_brier_score(p, y):.6f}")
+    rows = _reliability_table(p, y, bins=10)
+    print("  p_mean   y_rate    n")
+    for pm, yr, n in rows:
+        pm_s = f"{pm:.6f}" if np.isfinite(pm) else "nan"
+        yr_s = f"{yr:.6f}" if np.isfinite(yr) else "nan"
+        print(f"{pm_s:>8} {yr_s:>8} {n:4d}")
+
+

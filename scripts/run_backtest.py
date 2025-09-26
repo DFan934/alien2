@@ -81,8 +81,8 @@ CONFIG: Dict[str, Any] = {
 
     "horizon_bars": 20,
     "longest_lookback_bars": 60,
-    "p_gate_quantile": 0.65,
-    "full_p_quantile": 0.80,
+    "p_gate_quantile": 0.55,
+    "full_p_quantile": 0.65,
     "artifacts_root": "artifacts/a2",   # where per-fold outputs go
 
     # artefacts created by PathClusterEngine.build()
@@ -101,7 +101,11 @@ CONFIG: Dict[str, Any] = {
     "slippage_bp": 0.0,  # BrokerStub additional bp slippage
     # debug/test toggle
     "debug_no_costs": True,  # ← set True for the tiny RRC slice
-
+# dev gating options
+    "dev_scanner_loose": True,    # ← NEW
+    "dev_detector_mode": "OR",    # ← NEW; force OR even without YAML
+    "sign_check": True,           # ← NEW; report will compute AUC(1−p)
+    "min_entries_per_fold": 100,  # ← NEW; fail fast if < 100 entries
     # misc
     "out": "backtest_signals.csv",
     "atr_period": 14,
@@ -197,15 +201,27 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # prepare the prev_close column for gap detection
     df_raw['prev_close'] = df_raw['close'].shift(1)
 
-    detector = build_detectors()
+    #detector = build_detectors()
+    # BEFORE:
+    # detector = build_detectors()
+    # AFTER:
+    detector = build_detectors(dev_loose=bool(cfg.get("dev_scanner_loose", False)))
+    # Force OR mode in dev if requested
+    if cfg.get("dev_detector_mode", "").upper() in {"OR", "AND"}:
+        detector.mode = cfg["dev_detector_mode"].upper()
+
+    # Scan (async)
+    mask = await detector(df_raw)
+    pass_rate = mask.mean() * 100
+    print(f"[Scanner KPI] Bars passing filters: {mask.sum()} / {len(mask)} = {pass_rate:.2f}%")
 
     df_full = df_raw.copy()
 
     # This is the asynchronous call that needs 'await'
-    mask = await detector(df_raw)
+    #mask = await detector(df_raw)
 
-    pass_rate = mask.mean() * 100
-    print(f"[Scanner KPI] Bars passing filters: {mask.sum()} / {len(mask)} = {pass_rate:.2f}%")
+    #pass_rate = mask.mean() * 100
+    #print(f"[Scanner KPI] Bars passing filters: {mask.sum()} / {len(mask)} = {pass_rate:.2f}%")
 
     # now only keep the bars that passed
     df_raw = df_raw.loc[mask].reset_index(drop=True)
@@ -239,6 +255,23 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         debug_no_costs=bool(cfg.get("debug_no_costs", False)),
 
     )
+
+    # --- Persist label metadata for A2 report & downstream consumers ---
+    meta_path = _resolve_path(cfg.get("artifacts_root", "artifacts/a2")) / "meta.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    label_meta = {
+        "label_horizon": f"open→open log-return, H={int(cfg['horizon_bars'])} bars",
+        "label_function": "feature_engineering.labels.labeler.one_bar_ahead",
+        "label_side": "long_positive",  # y=1 iff ret_fwd > 0
+        "label_threshold": 0.0,  # decision boundary for classification
+        "sign_check": bool(cfg.get("sign_check", False)),
+        "min_entries_per_fold": int(cfg.get("min_entries_per_fold", 0)),
+        "scanner_dev_loose": bool(cfg.get("dev_scanner_loose", False)),
+        "detector_mode": detector.mode,
+    }
+    # merge into existing RUN_META for traceability
+    meta_doc = {**RUN_META, **label_meta}
+    meta_path.write_text(json.dumps(meta_doc, indent=2))
 
     _ = runner.run(
         df_full=df_full,

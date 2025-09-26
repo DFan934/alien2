@@ -36,3 +36,12 @@ def one_bar_ahead(df: pd.DataFrame, *, horizon: int = 1) -> pd.Series:
     y = np.log(fwd / open_px)
     y[-horizon:] = np.nan                       # final rows undefined
     return pd.Series(y, index=df.index, name="ret_fwd")
+
+def one_bar_ahead_binary(df: pd.DataFrame, *, horizon: int = 1, threshold: float = 0.0) -> pd.Series:
+    """
+    Binary label: 1 iff log(open(t+H)/open(t)) > threshold, else 0.
+    Returns a pd.Series of {0,1} with NaN for final `horizon` rows.
+    """
+    r = one_bar_ahead(df, horizon=horizon)  # log open→open
+    y = (r > float(threshold)).astype("float").where(~r.isna(), np.nan)
+    return y.rename("y")
