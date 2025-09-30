@@ -102,7 +102,8 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         if metric == "mahalanobis":
             byt = self._ref.tobytes()
             sha = hashlib.sha1(byt).hexdigest()
-            key = f"{self._ref.shape}-{int(time.time())}-{sha}"
+            #key = f"{self._ref.shape}-{int(time.time())}-{sha}"
+            key = f"{self._ref.shape}-{sha}"
             self._inv_cov = _inv_cov_cached(key, eps, self._ref.shape[1], byt)
         else:
             self._inv_cov = None  # type: ignore[assignment]
@@ -147,7 +148,8 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
 
         # FIX: The "fast path" now correctly handles the (indices, distances)
         # signature returned from the backend indexer.
-        if self._index is not None:
+        #if self._index is not None:
+        if self._index is not None and self._recency_w is None:
             # 1. Unpack correctly: indices first, then squared distances.
             indices, squared_distances = self._index.kneighbors(Q, k)
             # 2. Return in the consistent (distances, indices) order.

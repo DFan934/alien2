@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple, Callable, Any
 
 import numpy as np
 import pandas as pd
@@ -126,15 +126,20 @@ class WalkForwardRunner:
     # ------------------------------ core API ------------------------------
 
     def run(
-        self,
-        *,
-        df_full: pd.DataFrame,
-        df_scanned: pd.DataFrame,
-        start: str | pd.Timestamp,
-        end: str | pd.Timestamp,
-        p_gate_q: float | None = None,
-        full_p_q: float | None = None,
+            self,
+            *,
+            df_full: pd.DataFrame,
+            df_scanned: pd.DataFrame,
+            start: str | pd.Timestamp,
+            end: str | pd.Timestamp,
+            p_gate_q: float | None = None,
+            full_p_q: float | None = None,
+            # NEW (optional) Phase-2 hooks:
+            calibrator_fn: Optional[Callable[[np.ndarray, np.ndarray], Any]] = None,
+            ev_engine_overrides: Optional[Dict[str, Any]] = None,
+            persist_prob_columns: Tuple[str, str] | None = None,  # e.g., ("p_raw", "p_cal")
     ) -> Dict:
+
         start = pd.to_datetime(start)
         end = pd.to_datetime(end)
 
@@ -507,7 +512,41 @@ class WalkForwardRunner:
             # Labels for scanned test rows from FULL stream
             y_te = y_by_ts.reindex(scan_te["timestamp"].values).fillna(0).astype(int).to_numpy()
 
-            gates_passed = (p_te >= p_gate)
+
+
+            #gates_passed = (p_te >= p_gate)
+            # --- NEW: Relative Gating Logic ---
+            # NOTE: The spec assumes a 'self.config' dictionary. Since your class doesn't have one,
+            # we'll define the gate configuration here for now. You could move this to your __init__.
+            gate_cfg = {"mode": "topN_per_day", "N": 10}
+
+            # The spec uses 'p_use'. Your 'p_te' is the correct variable, as it's already calibrated.
+            p_use = p_te
+            dates = pd.to_datetime(scan_te["timestamp"]).dt.date.to_numpy()
+
+            gates_passed = np.zeros_like(p_use, dtype=bool)
+
+            if gate_cfg["mode"] == "topN_per_day":
+                N = int(gate_cfg.get("N", 10))
+                df_tmp = pd.DataFrame({"d": dates, "p": p_use, "original_index": np.arange(len(p_use))})
+                top_indices = df_tmp.groupby("d")["p"].nlargest(N).index.get_level_values(1)
+                gates_passed[df_tmp.loc[top_indices, "original_index"].values] = True
+
+            elif gate_cfg["mode"] == "quantile_per_day":
+                q = float(gate_cfg.get("quantile", 0.7))
+                df_tmp = pd.DataFrame({"d": dates, "p": p_use})
+                # compute daily thresholds, then mark entries
+                thr = df_tmp.groupby("d")["p"].transform(lambda s: s.quantile(q)).to_numpy()
+                gates_passed = p_use >= thr
+            else:
+                # absolute threshold (your old method)
+                thr = float(gate_cfg.get("p_min", 0.55))
+                gates_passed = p_use >= thr
+
+            # (Optional) minimum total entries guard
+            min_entries = 10  # Example value
+            if gates_passed.sum() < min_entries:
+                print(f"[Gate] WARN: entries={gates_passed.sum()} < {min_entries}; gating too strict for this fold")
 
             # AUC on all scanned test rows (pre-gate)
             try:
@@ -522,6 +561,8 @@ class WalkForwardRunner:
                     np.unique(y_te[mask])) > 1 else float("nan")
             except ValueError:
                 auc_entries = float("nan")
+
+
 
             if train_auc_all is not None and auc_all is not None:
                 if auc_all < 0.52:

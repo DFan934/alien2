@@ -8,9 +8,9 @@
     "test_end": "1998-10-31 23:56:00"
   },
   "gates": {
-    "p_gate": 0.02627511591962906,
-    "full_p": 0.02627511591962906,
-    "mode": "widened"
+    "p_gate": 0.55,
+    "full_p": 0.65,
+    "mode": "normal"
   },
   "prepro_dir": "artifacts\\a2\\fold_01\\prepro",
   "ev_artifacts": {

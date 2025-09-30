@@ -45,6 +45,63 @@ def _load_all_decisions(artifacts_root: Path) -> pd.DataFrame:
     out["label"] = out["label"].astype(int)
     return out.sort_values("timestamp").reset_index(drop=True)
 
+def _load_all_probs(artifacts_root: Path) -> pd.DataFrame:
+    """
+    Optional: read fold_*_probs.csv written by runner (if present).
+    Expects columns: p_raw, p_cal (optional), y, is_entry, and ideally timestamp.
+    Returns a single DataFrame with a 'fold' column.
+    """
+    root = Path(artifacts_root)
+    rows = []
+    for fold_dir in sorted(root.glob("fold_*")):
+        for name in (f"{fold_dir.name}_probs.csv", "fold_probs.csv", "probs.csv"):
+            pth = fold_dir / name
+            if pth.exists() and pth.stat().st_size > 0:
+                df = pd.read_csv(pth)
+                df["fold"] = fold_dir.name
+                # normalize types if timestamp exists
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False, errors="coerce")
+                rows.append(df)
+                break
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+def _attach_probs_to_decisions(dec: pd.DataFrame, probs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prefer merge by (fold, timestamp) if possible; otherwise align by position per-fold.
+    Returns a copy of 'dec' with optional p_raw/p_cal columns added.
+    """
+    if probs.empty or dec.empty:
+        return dec.copy()
+
+    dec2 = dec.copy()
+    if "timestamp" in probs.columns:
+        on_cols = ["fold", "timestamp"]
+        keep = ["p_raw", "p_cal", "is_entry", "y"]
+        keep = [c for c in keep if c in probs.columns]
+        m = dec2.merge(probs[["fold","timestamp"] + keep], on=on_cols, how="left", suffixes=("",""))
+        return m
+
+    # Fallback: per-fold positional alignment
+    out = []
+    for f, g in dec2.groupby("fold", sort=False):
+        gp = probs[probs["fold"] == f]
+        g = g.reset_index(drop=True)
+        gp = gp.reset_index(drop=True)
+        if len(g) == len(gp):
+            # copy through aligned columns
+            for c in ("p_raw","p_cal","is_entry","y"):
+                if c in gp.columns:
+                    g[c] = gp[c].values
+        else:
+            # lengths differ → leave untouched for this fold
+            pass
+        out.append(g)
+    return pd.concat(out, ignore_index=True)
+
+
 def _attach_nextbar_returns(decisions: pd.DataFrame, csv_path: Path) -> pd.DataFrame:
     """Attach next-bar open/close and compute 1-bar return for each decision row timestamp."""
     px = pd.read_csv(csv_path)
@@ -125,19 +182,29 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
         pass
 
     dec = _load_all_decisions(artifacts_root)
-
-
+    # Try to load optional per-fold probs (p_raw/p_cal/is_entry) and attach
+    probs = _load_all_probs(artifacts_root)
+    dec = _attach_probs_to_decisions(dec, probs)
 
     # --- NEW: p-spread telemetry on all scanned rows ---
-    p_min = float("nan")
+    '''p_min = float("nan")
     p_max = float("nan")
-    p_iqr = float("nan")
-    if not dec.empty and "p" in dec.columns and dec["p"].notna().any():
-        p_vals = dec["p"].astype(float)
-        p_min = float(p_vals.min())
-        p_max = float(p_vals.max())
+    p_iqr = float("nan")'''
+
+    prob_source = "p"
+    if "p_cal" in dec.columns and dec["p_cal"].notna().any():
+        prob_source = "p_cal"
+    elif "p_raw" in dec.columns and dec["p_raw"].notna().any():
+        prob_source = "p_raw"
+
+    # --- p-spread telemetry on all scanned rows (using chosen source) ---
+    p_min = p_max = p_iqr = float("nan")
+    if not dec.empty and prob_source in dec.columns and dec[prob_source].notna().any():
+        p_vals = dec[prob_source].astype(float).to_numpy()
+        p_min = float(np.nanmin(p_vals))
+        p_max = float(np.nanmax(p_vals))
         try:
-            q75, q25 = np.percentile(p_vals, [75, 25])
+            q75, q25 = np.nanpercentile(p_vals, [75, 25])
             p_iqr = float(q75 - q25)
         except Exception:
             pass
@@ -154,14 +221,15 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
     auc_all = float("nan")
     auc_entries = float("nan")
     try:
-        if dec["label"].nunique() > 1:
-            auc_all = float(roc_auc_score(dec["label"].to_numpy(), dec["p"].to_numpy()))
+        if dec["label"].nunique() > 1 and prob_source in dec.columns:
+            auc_all = float(roc_auc_score(dec["label"].to_numpy(), dec[prob_source].to_numpy()))
+
     except Exception:
         pass
     try:
         ent = dec[dec["gate"] == 1]
         if len(ent) > 0 and ent["label"].nunique() > 1:
-            auc_entries = float(roc_auc_score(ent["label"].to_numpy(), ent["p"].to_numpy()))
+            auc_entries = float(roc_auc_score(ent["label"].to_numpy(), ent[prob_source].to_numpy()))
     except Exception:
         pass
 
@@ -170,14 +238,18 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
     auc_entries_flip = float("nan")
     try:
         if dec["label"].nunique() > 1:
-            p_all = dec["p"].to_numpy(dtype=float)
+            #p_all = dec["p"].to_numpy(dtype=float)
+            p_all = dec[prob_source].to_numpy(dtype=float)
+
             y_all = dec["label"].to_numpy(dtype=float)
             auc_all_flip = float(roc_auc_score(y_all, 1.0 - p_all))
     except Exception:
         pass
     try:
         if len(ent) > 0 and ent["label"].nunique() > 1:
-            p_ent = ent["p"].to_numpy(dtype=float)
+            #p_ent = ent["p"].to_numpy(dtype=float)
+            p_ent = ent[prob_source].to_numpy(dtype=float)
+
             y_ent = ent["label"].to_numpy(dtype=float)
             auc_entries_flip = float(roc_auc_score(y_ent, 1.0 - p_ent))
     except Exception:
@@ -260,7 +332,7 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
     print(f"(p_min={p_min:.3f}  p_max={p_max:.3f}  p_IQR={p_iqr:.3f})")  # NEW
 
     # --- Reliability / Brier diagnostics (raw p) ---
-    try:
+    '''try:
         p_all = dec["p"].to_numpy(dtype=float)
         y_all = dec["label"].to_numpy(dtype=float)
         print_reliability("raw (all)", p_all, y_all)
@@ -273,7 +345,21 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
             y_ent = ent["label"].to_numpy(dtype=float)
             print_reliability("raw (entries)", p_ent, y_ent)
     except Exception:
-        pass
+        pass'''
+
+    # --- Reliability / Brier diagnostics (show raw & calibrated if available) ---
+    y_all = dec["label"].to_numpy(dtype=float)
+    y_ent = ent["label"].to_numpy(dtype=float) if len(ent) > 0 else np.array([])
+
+    if "p_raw" in dec.columns and dec["p_raw"].notna().any():
+        print_reliability("raw (all)", dec["p_raw"].to_numpy(dtype=float), y_all)
+        if len(ent) > 0:
+            print_reliability("raw (entries)", ent["p_raw"].to_numpy(dtype=float), y_ent)
+
+    if "p_cal" in dec.columns and dec["p_cal"].notna().any():
+        print_reliability("calibrated (all)", dec["p_cal"].to_numpy(dtype=float), y_all)
+        if len(ent) > 0:
+            print_reliability("calibrated (entries)", ent["p_cal"].to_numpy(dtype=float), y_ent)
 
     print("\n=== Drawdown ===")
     print(f"Max drawdown = {max_dd*100:.2f}%")

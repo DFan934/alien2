@@ -580,9 +580,23 @@ class EVEngine:
         # ------------------------------------------------------------
         # 1. Find nearest neighbours (density‑aware k)
         # ------------------------------------------------------------
-        k_eff = int(max(2, min(self.k_max, (len(self.centers))**0.5)))
+        #k_eff = int(max(2, min(self.k_max, (len(self.centers))**0.5)))
         # Corrected version
-        idx, dist2 = self._dist(x, k_eff)
+        #idx, dist2 = self._dist(x, k_eff)
+
+        # start with a generous k_max, but choose effective k by kernel mass
+        k_cap = int(self.k_max)
+        idx_all, dist2_all = self._dist(x, k_cap)
+
+        ker = np.exp(-0.5 * dist2_all / (self.h ** 2))
+        order = np.argsort(dist2_all)
+        ker_sorted = ker[order]
+        cum = np.cumsum(ker_sorted) / max(1e-12, ker_sorted.sum())
+        k_eff = int(np.searchsorted(cum, 0.80) + 1)  # 80% mass
+        k_eff = max(8, min(k_eff, k_cap))
+
+        idx, dist2 = idx_all[order[:k_eff]], dist2_all[order[:k_eff]]
+
         # density cut‑off – remove outliers beyond 2 h
         mask = dist2 < (2 * self.h) ** 2
         if not mask.any():
@@ -619,13 +633,115 @@ class EVEngine:
         # ------------------------------------------------------------
         # 2. Kernel estimate (Gaussian) with NEW regime-based recency weighting
         # ------------------------------------------------------------
-        recency_w = self._get_recency_weights(regime, len(dist2))
+        '''recency_w = self._get_recency_weights(regime, len(dist2))
         kernel_w = np.exp(-0.5 * dist2 / (self.h ** 2))
         w = kernel_w * recency_w # Combine kernel with recency
 
         if w.sum() < 1e-8:  # <-- add this
             w[:] = 1.0
-        w /= w.sum()
+        w /= w.sum()'''
+
+        # --- Base kernel (you can use 'ker' from the adaptive-k block above) ---
+        #kernel_w = np.asarray(ker, dtype=float)
+        '''kernel_w = ker_sorted[:k_eff].astype(float)
+
+        # --- Recency weights (your helper, if any) ---
+        recency_w = self._recency(idx) if hasattr(self, "_recency") and self._recency is not None else 1.0
+        if np.isscalar(recency_w):
+            recency_w = np.ones_like(kernel_w) * float(recency_w)
+
+        # --- Outlier down-weighting in standardized feature space ---
+        # Requires: self._scale_vec (feature stds), self.centers (neighbor feature matrix)
+        zcap = getattr(self, "outlier_z_cap", 3.0)
+        if getattr(self, "_scale_vec", None) is not None and self._scale_vec.size == self.centers.shape[1]:
+            # standardized deltas for chosen neighbors
+            diff = (self.centers[idx] - x) / (self._scale_vec + 1e-12)
+            zmax = np.max(np.abs(diff), axis=1)
+            outlier_mult = np.where(zmax > zcap, np.exp(-0.5 * (zmax - zcap)), 1.0)
+        else:
+            outlier_mult = 1.0
+
+        # --- Final neighbor weights ---
+        #w = kernel_w * recency_w * outlier_mult
+        #w_sum = float(w.sum())
+
+        # --- Recency weights (per-neighbor), robust to shape mismatch ---
+        recency_w = 1.0
+        try:
+            if hasattr(self, "_get_recency_weights") and regime is not None:
+                # Ask for a vector with k_eff points
+                recency_w = self._get_recency_weights(regime, n_points=len(kernel_w))
+        except Exception:
+            recency_w = 1.0
+
+        # Normalize to a length-k_eff vector
+        if np.isscalar(recency_w):
+            recency_w = np.ones_like(kernel_w, dtype=np.float32) * float(recency_w)
+        else:
+            recency_w = np.asarray(recency_w, dtype=np.float32).ravel()
+            if recency_w.size != kernel_w.size:
+                # Interpolate/tile to match k_eff
+                if recency_w.size >= 2:
+                    xp = np.linspace(0.0, 1.0, recency_w.size)
+                    xq = np.linspace(0.0, 1.0, kernel_w.size)
+                    recency_w = np.interp(xq, xp, recency_w).astype(np.float32)
+                else:
+                    recency_w = np.ones_like(kernel_w, dtype=np.float32) * float(
+                        recency_w[0] if recency_w.size else 1.0)
+
+        # --- Final neighbor weights ---
+        assert kernel_w.shape == outlier_mult.shape, "kernel/outlier mismatch"
+        assert recency_w.shape == kernel_w.shape, f"recency shape {recency_w.shape} ≠ k_eff {kernel_w.shape}"
+
+        w = kernel_w * recency_w * outlier_mult'''
+
+        # --- Recompute kernel AFTER all masks so lengths match -----------------
+        kernel_w = np.exp(-0.5 * dist2 / (self.h ** 2)).astype(float)  # length == len(dist2) == len(idx)
+
+        # --- Outlier down-weighting (compute AFTER final idx is fixed) ---------
+        zcap = getattr(self, "outlier_z_cap", 3.0)
+        if getattr(self, "_scale_vec", None) is not None and self._scale_vec.size == self.centers.shape[1]:
+            diff = (self.centers[idx] - x) / (self._scale_vec + 1e-12)
+            zmax = np.max(np.abs(diff), axis=1)
+            outlier_mult = np.where(zmax > zcap, np.exp(-0.5 * (zmax - zcap)), 1.0).astype(float)
+        else:
+            outlier_mult = np.ones_like(kernel_w, dtype=float)
+
+        # --- Recency weights (force same length as kernel_w) -------------------
+        try:
+            recency_w = self._get_recency_weights(regime, n_points=len(kernel_w))
+        except Exception:
+            recency_w = 1.0
+
+        if np.isscalar(recency_w):
+            recency_w = np.ones_like(kernel_w, dtype=float) * float(recency_w)
+        else:
+            recency_w = np.asarray(recency_w, dtype=float).ravel()
+            if recency_w.size != kernel_w.size:
+                # resample to match
+                xp = np.linspace(0.0, 1.0, max(2, recency_w.size))
+                xq = np.linspace(0.0, 1.0, kernel_w.size)
+                recency_w = np.interp(xq, xp, recency_w).astype(float)
+
+        # --- Final neighbor weights (all same shape) ---------------------------
+        # (Optional debug assertions while iterating)
+        # assert kernel_w.shape == dist2.shape
+        # assert kernel_w.shape == outlier_mult.shape
+        # assert kernel_w.shape == recency_w.shape
+
+        w = kernel_w * recency_w * outlier_mult
+        ws = float(w.sum())
+        w = (w / ws) if ws > 1e-12 else (np.ones_like(w) / max(1, w.size))
+
+        w_sum = float(w.sum())
+        w = (w / w_sum) if w_sum > 1e-12 else (np.ones_like(w) / max(1, w.size))
+
+        if w_sum <= 1e-12:
+            # degenerate case: fall back to uniform
+            w = np.ones_like(w) / max(1, w.size)
+        else:
+            w = w / w_sum
+
         mu_k = float(np.dot(w, self.mu[idx]))
         var_k = float(np.dot(w, self.var[idx]))
         var_down_k = float(np.dot(w, self.var_down[idx]))
@@ -644,7 +760,7 @@ class EVEngine:
                 
                 
                 '''
-        try:
+        '''try:
             if self._calibrator is not None:
                 #Use the same mapping as training (isotonic over µ) — use the module-level import
                 p_up = float(map_mu_to_prob(np.array([mu_k], dtype=float),
@@ -660,12 +776,12 @@ class EVEngine:
             p_up, p_source = 0.5, "fallback"
 
         p_up = float(np.clip(p_up, 1e-3, 1.0 - 1e-3))
-        print(f"[Cal] p_up={p_up:.3f} source={p_source}")
+        print(f"[Cal] p_up={p_up:.3f} source={p_source}")'''
 
         # --- NEW: kernel probability as a rock-solid fallback ---
         # Probability that next-bar return is > 0 using the same kernel weights.
         # y should be a 1D array of realized next-bar returns for neighbors.
-        y = np.asarray(self.mu[idx], dtype=float) # CORRECTED: Use neighbor returns from self.mu[idx]
+        '''y = np.asarray(self.mu[idx], dtype=float) # CORRECTED: Use neighbor returns from self.mu[idx]
         w = np.asarray(w, dtype=float)
         w_sum = float(w.sum()) if w.size else 0.0
 
@@ -690,7 +806,29 @@ class EVEngine:
             except Exception:
                 # Keep kernel fallback
                 p_up = p_kernel
-                p_source = "kernel"
+                p_source = "kernel"'''
+        # --- Probability (single source of truth) ---
+        # y_i should be your neighbor outcomes; if you store neighbor returns in self.mu, reuse them
+        y_neighbors = np.asarray(self.mu[idx], dtype=float)  # or whatever array holds neighbor outcomes
+        p_kernel = float(np.clip(np.sum(w * (y_neighbors > 0)) / max(1e-12, w.sum()), 1e-3, 1 - 1e-3))
+        p_up, p_source = p_kernel, "kernel"
+
+        # Optional: if your calibrator maps mu_k (local mean return) → probability, compute mu_k first:
+        mu_k = float(np.sum(w * y_neighbors))  # local mean; keep for logging and/or calibrator
+
+        if getattr(self, "_calibrator", None) is not None:
+            try:
+                # If your calibrator expects mu_k → p, feed mu_k; otherwise feed p_kernel.
+                # Choose **one** and be consistent across training & inference.
+                p_iso = float(self._calibrator.predict(np.array([[mu_k]], dtype=float))[0])
+                if np.isfinite(p_iso):
+                    p_up = float(np.clip(p_iso, 1e-3, 1 - 1e-3))
+                    p_source = "isotonic"
+            except Exception:
+                pass
+
+        # (Optional) print or log source for debugging
+        # self._dbg(f"[Cal] p_up={p_up:.3f} source={p_source} mu_k={mu_k:.5f}")
 
         # Debug visibility
         print(f"[Cal] p_up={p_up:.3f} source={p_source}")
@@ -845,12 +983,14 @@ class EVEngine:
         sig2 *= liquidity_mult
         sig2_down *= liquidity_mult
 
-        res = EVResult(
+        '''res = EVResult(
             mu=mu_final, sigma=float(var_syn), variance_down=float(var_down_syn),
             beta=beta.astype(np.float32), residual=float(residual),
             cluster_id=int(idx[0]), position_size=float(0.0),
             mu_raw=mu_raw, p_up=float(p_up), p_source=p_source
-        )
+        )'''
+
+
 
         # ------------------------------------------------------------
         # 4. Subtract transaction cost
@@ -971,14 +1111,14 @@ class EVEngine:
             map_mu_to_prob([mu_val], calibrator=self.calibrator, default_if_missing=0.5)[0]
         )'''
 
-        p_up_arr = map_mu_to_prob(
+        '''p_up_arr = map_mu_to_prob(
             mu_raw,  # raw μ (float is fine)
             calibrator=self._calibrator,  # use the injected calibrator
             default_if_missing=0.5  # neutral if none available
         )
         p_up = float(np.atleast_1d(p_up_arr)[0])
 
-        print(f"[Cal] p_up={p_up:.3f}")
+        print(f"[Cal] p_up={p_up:.3f}")'''
 
 
         # (Optional: print both raw µ and calibrated mapping without changing µ)

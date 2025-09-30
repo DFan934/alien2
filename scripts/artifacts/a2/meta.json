@@ -1,7 +1,7 @@
 {
-  "run_id": "b6dd6cb3",
+  "run_id": "dfcebd63",
   "git_sha": "n/a",
-  "started": "2025-09-26T20:10:28Z",
+  "started": "2025-09-29T13:29:41Z",
   "label_horizon": "open\u2192open log-return, H=20 bars",
   "label_function": "feature_engineering.labels.labeler.one_bar_ahead",
   "label_side": "long_positive",
@@ -9,5 +9,6 @@
   "sign_check": true,
   "min_entries_per_fold": 100,
   "scanner_dev_loose": true,
-  "detector_mode": "OR"
+  "detector_mode": "OR",
+  "use_isotonic": true
 }

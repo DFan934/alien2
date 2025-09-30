@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import json
 from scripts.a2_report import generate_report  # NEW
+from sklearn.isotonic import IsotonicRegression
 
 import logging
 import sys
@@ -270,14 +271,53 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         "detector_mode": detector.mode,
     }
     # merge into existing RUN_META for traceability
+
+    label_meta["use_isotonic"] = bool(cfg.get("use_isotonic", True))
+
     meta_doc = {**RUN_META, **label_meta}
     meta_path.write_text(json.dumps(meta_doc, indent=2))
 
-    _ = runner.run(
+    # ── µ→p isotonic calibration helper for WalkForwardRunner ──
+    def _fit_isotonic_from_val(mu_val: np.ndarray, y_val: np.ndarray, *, use_iso: bool):
+        """
+        Fit IsotonicRegression mapping local mean return mu_k → P(y=1).
+        Returns a sklearn calibrator or None.
+        """
+        if not use_iso:
+            return None
+        mu_val = np.asarray(mu_val).reshape(-1, 1)
+        y_val = np.asarray(y_val).astype(float).ravel()
+        # guards: enough samples + class diversity
+        if mu_val.shape[0] < 50 or len(np.unique(y_val[~np.isnan(y_val)])) < 2:
+            return None
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1 - 1e-6)
+        iso.fit(mu_val, y_val)
+        return iso
+
+    '''_ = runner.run(
         df_full=df_full,
         df_scanned=df_raw,  # already scanner-filtered bars above
         start=cfg["start"],
         end=cfg["end"],
+    )'''
+
+    _ = runner.run(
+        df_full=df_full,
+        df_scanned=df_raw,
+        start=cfg["start"],
+        end=cfg["end"],
+        # NEW: let the runner ask us to fit an iso calibrator from (mu_val, y_val)
+        calibrator_fn=lambda mu_val, y_val: _fit_isotonic_from_val(
+            mu_val, y_val, use_iso=bool(cfg.get("use_isotonic", True))
+        ),
+        # NEW: pass through EVEngine build kwargs the runner should use for TEST
+        ev_engine_overrides={
+            "metric": cfg.get("metric", "mahalanobis"),
+            "k": int(cfg.get("k_max", 64)),
+            "residual_threshold": float(cfg.get("residual_threshold", 0.75)),
+        },
+        # (optional) ask runner to persist both raw & calibrated p for the report
+        persist_prob_columns=("p_raw", "p_cal"),
     )
 
     # === Post-A2 report (no leakage, folds aggregated) ===

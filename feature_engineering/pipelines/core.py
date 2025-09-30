@@ -138,9 +138,20 @@ class CoreFeaturePipeline:
         self._pipe = pipe
 
         pca = pipe.named_steps["pca"]
+
+        cum_var = float(pca.explained_variance_ratio_.sum())
+        target = float(settings.pca_variance)  # e.g., 0.95
+        if cum_var + 1e-9 < target:
+            raise RuntimeError(
+                f"[FE] PCA retained variance {cum_var:.3%} < target {target:.3%} — adjust _PREDICT_COLS or pca_variance.")
+
+
         log.info("[FE] PCA n_comp=%d  cum_var=%.1f%%",
                  pca.n_components_,
                  pca.explained_variance_ratio_.sum() * 100)
+
+
+
 
         # Save PCA/scaler as .npy (consistent with meta)
         out_dir = self.parquet_root / "_fe_meta"
