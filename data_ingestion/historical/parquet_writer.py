@@ -12,6 +12,7 @@ from typing import Dict, Optional
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sqlalchemy.testing.plugin.plugin_base import logging
 
 from data_ingestion.utils import logger
 
@@ -55,6 +56,22 @@ def _load_schema(parquet_root: pathlib.Path) -> Optional[Dict[str, str]]:
         logger.warning("Corrupt schema.json detected – regenerating.")
         return None
 
+def _normalize_pandas_dtype(dtype_str: str) -> str:
+    s = str(dtype_str)
+    # normalize floats
+    if s in ("float32", "float64"):
+        return "float"  # matches PyArrow's str(pa.float32()) == "float"
+    # normalize ints (we only expect int32 in manifest, but don't die on int64)
+    if s in ("int32", "int64"):
+        return "int32"
+    # normalize strings
+    if s in ("object", "string"):
+        return "string"
+    # normalize timestamps: accept ns/us tz-aware as 'timestamp[us, tz=UTC]'
+    if s.startswith("datetime64[") and "UTC" in s:
+        return "timestamp[us, tz=UTC]"
+    return s
+
 
 def _validate_schema(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
     """Ensure df dtypes match the manifest; create it on first run."""
@@ -64,16 +81,17 @@ def _validate_schema(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
         logger.info("Saved Parquet schema manifest → %s", _schema_path(parquet_root))
         return
 
-    current = {c: str(t) for c, t in zip(df.columns, df.dtypes)}
+    current = {c: _normalize_pandas_dtype(str(t)) for c, t in zip(df.columns, df.dtypes)}
+    # Also normalize saved in case different PyArrow versions stringify differently
+    saved_norm = {k: _normalize_pandas_dtype(v) for k, v in saved.items()}
+
     mismatch = {
-        c: (current.get(c, "<missing>"), saved[c])
-        for c in saved
-        if saved[c] != current.get(c)
+        c: (current.get(c, "<missing>"), saved_norm[c])
+        for c in saved_norm
+        if saved_norm[c] != current.get(c)
     }
     if mismatch:
         raise TypeError(f"Schema mismatch vs. manifest: {mismatch}")
-
-
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
@@ -84,7 +102,10 @@ def write_partition(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
 
     _validate_schema(df, parquet_root)
 
-    if logger.isEnabledFor(logger.DEBUG):
+    import logging
+    _log = logging.getLogger(__name__)
+    if _log.isEnabledFor(logging.DEBUG):
+    #if logger.isEnabledFor(logging.DEBUG):
         col_sha = hashlib.sha1(",".join(df.columns).encode()).hexdigest()[:10]
         logger.debug("[WRITE] %s rows=%d  sha=%s → %s",
                      df["symbol"].iat[0], len(df), col_sha, parquet_root)

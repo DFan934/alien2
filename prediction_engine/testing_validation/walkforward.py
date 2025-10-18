@@ -681,7 +681,75 @@ class WalkForwardRunner:
                     "label": y_te,
                 }
             )
+
+            out_dec["decision_ts"] = out_dec["timestamp"]
+            out_dec["h"] = int(self.horizon_bars)
+
             out_dec.to_parquet(fold_dir / "decisions.parquet", index=False)
+
+            # === Phase-4: per-fold trades persistence (ADD THIS) ===================
+            # Simple, label-consistent simulator:
+            #  • decision made at time t (the scanned test bar)
+            #  • enter at next bar open (t+1 open)
+            #  • exit after H bars from decision (t+H open)
+            # This matches the open→open H labeling intent and avoids look-ahead.
+
+            H = int(self.horizon_bars)
+
+            # Build forward timestamp and open-price maps on the FULL stream
+            full_idxed = full.set_index("timestamp").sort_index()
+            open_s = full_idxed["open"]
+            ts_fwd_1 = full_idxed.index.to_series().shift(-1)  # timestamp of next bar
+            ts_fwd_H = full_idxed.index.to_series().shift(-H)  # timestamp H bars ahead
+            open_fwd_1 = open_s.shift(-1)  # next bar open
+            open_fwd_H = open_s.shift(-H)  # open H bars ahead
+
+            # Restrict to current fold’s SCANNED TEST timestamps
+            ts_decisions = pd.to_datetime(scan_te["timestamp"]).values
+
+            # Map decision bars → entry/exit timestamps and prices
+            entry_ts = ts_fwd_1.reindex(ts_decisions).values
+            exit_ts = ts_fwd_H.reindex(ts_decisions).values
+            entry_px = open_fwd_1.reindex(ts_decisions).values
+            exit_px = open_fwd_H.reindex(ts_decisions).values
+
+            # Only keep rows that (a) passed the gate and (b) have all required future bars
+            mask_gate = gates_passed.astype(bool)
+            valid_future = (~pd.isna(entry_ts)) & (~pd.isna(exit_ts)) & (~pd.isna(entry_px)) & (~pd.isna(exit_px))
+            keep = mask_gate & valid_future
+
+            if keep.any():
+                # Position sizing: 1 share (you can upgrade later)
+                qty = np.ones(int(keep.sum()), dtype=float)
+
+                # Costs (respect your debug flag); extend with your BasicCostModel if desired
+                commission = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
+                slippage = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
+
+                realized_pnl = (exit_px[keep] - entry_px[keep]) * qty - commission - slippage
+
+                trades_df = pd.DataFrame({
+                    "decision_ts": ts_decisions[keep],
+                    "entry_ts": entry_ts[keep],
+                    "exit_ts": exit_ts[keep],
+                    "entry_price": entry_px[keep],
+                    "exit_price": exit_px[keep],
+                    "qty": qty,
+                    "commission": commission,
+                    "slippage": slippage,
+                    "realized_pnl": realized_pnl,
+                    "symbol": self.symbol,
+                    "fold": int(f.idx),
+                }).sort_values("entry_ts").reset_index(drop=True)
+
+                trades_df.to_parquet(fold_dir / "trades.parquet", index=False)
+            else:
+                # Still write an empty file with the expected columns for consistency
+                pd.DataFrame(columns=[
+                    "decision_ts", "entry_ts", "exit_ts", "entry_price", "exit_price",
+                    "qty", "commission", "slippage", "realized_pnl", "symbol", "fold"
+                ]).to_parquet(fold_dir / "trades.parquet", index=False)
+            # === End Phase-4 trades persistence =====================================
 
             # Persist metrics
             metrics = {

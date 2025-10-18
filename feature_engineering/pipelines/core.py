@@ -207,18 +207,18 @@ class CoreFeaturePipeline:
         # This forward/backward fill is crucial for stability
         df = df.ffill().bfill()
 
-        # Compute trigger-context features if the columns exist
+        # ---- Trigger-context features (robust defaults when scanner data absent) ----
         if "trigger_ts" in df.columns:
             df["time_since_trigger_min"] = (
                     df["timestamp"] - df["trigger_ts"]
             ).dt.total_seconds().div(60)
+        else:
+            df["time_since_trigger_min"] = 0.0
 
-        # The column should already exist from run_backtest.py, just ensure it
         if "volume_spike_pct" not in df.columns:
             df["volume_spike_pct"] = 0.0
 
         return df
-
 
     @classmethod
     def from_artifact_dir(cls, artefact_dir: Path) -> "CoreFeaturePipeline":
@@ -320,7 +320,7 @@ class CoreFeaturePipeline:
         logger.info("Loaded %d rows, columns: %s", len(df), list(df.columns))
 
         # 2) Apply calculators sequentially.
-        logger.info("After load:        %d rows", len(df))
+        '''logger.info("After load:        %d rows", len(df))
         for calc in _CALCULATORS:
             df = calc(df)
             logger.info("After %-12s %d rows", calc.__class__.__name__, len(df))
@@ -333,6 +333,12 @@ class CoreFeaturePipeline:
         df["volume_spike_pct"] = df["volume_spike_pct"]
 
         logger.info("After ffill/bfill: %d rows", len(df))
+        '''
+
+        # AFTER
+        logger.info("After load:        %d rows", len(df))
+        df = self._calculate_base_features(df)
+        logger.info("After base feats:  %d rows", len(df))
 
         features = df[_PREDICT_COLS].astype(np.float32)
 

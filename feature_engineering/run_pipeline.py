@@ -91,8 +91,19 @@ def main() -> None:
         df.rename(columns={col: f"feat_{i}"}, inplace=True)
 
     # Reorder dataframe columns to canonical FEATURE_ORDER before writing
-    df = df[list(FEATURE_ORDER)]
+    #df = df[list(FEATURE_ORDER)]
 
+    # With this safer logic:
+    pca_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("pca_")]
+    base_cols = [c for c in ["symbol", "timestamp", "close"] if c in df.columns]
+    other_cols = [c for c in df.columns if c not in pca_cols + base_cols]
+
+    if 'FEATURE_ORDER' in globals() and set(FEATURE_ORDER).issubset(df.columns):
+        # If the schema declares an order that's actually present, use it.
+        df = df[list(FEATURE_ORDER)]
+    else:
+        # Otherwise, write PCA-first, then base, then anything extra (stable + future-proof)
+        df = df[pca_cols + base_cols + other_cols]
 
     write_feature_dataset(df, output_root)
     logger.info("Saved features → %s", output_root)

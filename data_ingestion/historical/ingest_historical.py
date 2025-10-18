@@ -54,6 +54,17 @@ class HistoricalIngestor:
                                  chunk.memory_usage(deep=True).sum() / 1e6)
                     '''
                 chunk = clean_chunk(chunk, symbol)
+
+                import pandas as pd
+                import numpy as np
+
+                # normalize dtypes before writing
+                chunk["timestamp"] = pd.to_datetime(chunk["timestamp"], utc=True)  # tz-aware; pandas keeps ns
+                for col in ["open", "high", "low", "close"]:
+                    chunk[col] = chunk[col].astype(np.float32)  # aligns to manifest ('float')
+                chunk["volume"] = chunk["volume"].astype(np.int32)
+                chunk["symbol"] = chunk["symbol"].astype("string")
+
                 write_partition(chunk, self.parquet_dir)
                 rows += len(chunk)
             logger.info("%s → %d rows (%.1fs)", symbol, rows, time.perf_counter() - t0)
