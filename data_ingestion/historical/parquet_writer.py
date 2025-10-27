@@ -8,6 +8,9 @@ import hashlib
 import json
 import pathlib
 from typing import Dict, Optional
+import os, uuid, tempfile, time
+from pathlib import Path
+from data_ingestion.manifest import Manifest, PartitionEntry, _sha_parquet
 
 import pandas as pd
 import pyarrow as pa
@@ -92,10 +95,31 @@ def _validate_schema(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
     }
     if mismatch:
         raise TypeError(f"Schema mismatch vs. manifest: {mismatch}")
+
+
+def _atomic_write_table(table: pa.Table, final_path: Path) -> None:
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=".tmp_", dir=str(final_path.parent), delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        pq.write_table(
+            table,
+            tmp_path,
+            compression="snappy",
+            use_deprecated_int96_timestamps=True,
+        )
+        os.replace(tmp_path, final_path)  # atomic on same filesystem
+    finally:
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except Exception: pass
+
+
+
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
-def write_partition(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
+'''def write_partition(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
     """Append *df* to symbol/year/month hive partition with Snappy compression."""
     if df.empty:
         return
@@ -125,4 +149,43 @@ def write_partition(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
         compression="snappy",
         use_deprecated_int96_timestamps=True,
     )
-    logger.debug("Wrote %d rows → %s", len(df), fname)
+    logger.debug("Wrote %d rows → %s", len(df), fname)'''
+
+
+def write_partition(df: pd.DataFrame, parquet_root: pathlib.Path) -> None:
+    """Append df into hive partitions (symbol/year/month/day), atomically, with manifest entry."""
+    if df.empty:
+        return
+
+    _validate_schema(df, parquet_root)
+
+    symbol = str(df["symbol"].iat[0]).upper()
+    ts = df["timestamp"].dt
+
+    year  = int(ts.year.iloc[0])
+    month = int(ts.month.iloc[0])
+    day   = int(ts.day.iloc[0])
+
+    part_dir = Path(parquet_root) / f"symbol={symbol}" / f"year={year:04d}" / f"month={month:02d}" / f"day={day:02d}"
+    part_dir.mkdir(parents=True, exist_ok=True)
+
+    # unique, append-only filename (prevents clobber on re-ingest)
+    chunk_id = uuid.uuid4().hex[:12]
+    fname = f"part-{year:04d}{month:02d}{day:02d}-{chunk_id}.parquet"
+    final_path = part_dir / fname
+
+    table = pa.Table.from_pandas(df, schema=TABLE_SCHEMA, preserve_index=False)
+
+    # atomic write
+    _atomic_write_table(table, final_path)
+
+    # manifest append
+    man = Manifest.load(Path(parquet_root))
+    sha = _sha_parquet(df)
+    entry = PartitionEntry(
+        symbol=symbol, year=year, month=month, day=day,
+        rows=int(len(df)), sha256=sha, path=str(final_path)
+    )
+    man.append(Path(parquet_root), entry)
+
+    logger.debug("Wrote %d rows → %s", len(df), final_path)

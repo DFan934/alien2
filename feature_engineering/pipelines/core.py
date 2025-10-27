@@ -52,6 +52,67 @@ _PREDICT_COLS = [
     "volume_spike_pct",
 ]
 
+
+# feature_engineering/pipelines/core.py  (near the top, after imports)
+def _assert_schema_tz_freq(df: pd.DataFrame) -> None:
+    required = {"timestamp","symbol","open","high","low","close","volume"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"[FE] Missing required columns: {sorted(missing)}")
+
+    # Enforce tz-naive UTC internally: normalize here
+    if pd.api.types.is_datetime64tz_dtype(df["timestamp"]):
+        df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    # Sort per symbol by timestamp; check monotonicity and duplicates
+    df.sort_values(["symbol", "timestamp"], inplace=True)
+    dup = df.duplicated(subset=["symbol","timestamp"]).sum()
+    if dup:
+        # policy: keep last occurrence
+        df.drop_duplicates(subset=["symbol","timestamp"], keep="last", inplace=True)
+
+    # Basic OHLC/volume sanity
+    if (df[["open","high","low","close","volume"]] < 0).any().any():
+        raise ValueError("[FE] Negative OHLC/volume found")
+
+    if not (df["low"] <= df[["open","close"]].min(axis=1)).all():
+        raise ValueError("[FE] low must be <= min(open, close)")
+    if not (df["high"] >= df[["open","close"]].max(axis=1)).all():
+        raise ValueError("[FE] high must be >= max(open, close)")
+
+    # Frequency sanity (approx 1-minute)
+    # infer per symbol; warn if median diff not ~60s
+    # Frequency sanity & detection: allow 60s or 300s (default), or pick the dominant cadence
+    diffs = df.groupby("symbol")["timestamp"].diff().dropna().dt.total_seconds()
+    if len(diffs) > 0:
+        med = float(diffs.median())
+        # Map common cadences to canonical seconds
+        candidates = [(60, 45, 75), (300, 270, 330)]
+        chosen = None
+        for sec, lo, hi in candidates:
+            if lo <= med <= hi:
+                chosen = sec
+                break
+        if chosen is None:
+            # Try a generic rounding for other clean cadences
+            rounded = int(round(med))
+            if rounded <= 0:
+                raise ValueError(f"[FE] Could not infer a positive cadence (median {med:.1f}s).")
+            chosen = rounded
+            log.warning("[FE] Non-standard cadence detected (median=%.1fs) → using %ds slots",
+                        med, chosen)
+        else:
+            log.info("[FE] Detected bar cadence: %ds (median=%.1fs)", chosen, med)
+
+        # Propagate cadence to settings for calculators to use
+        try:
+            from feature_engineering.config import settings
+            settings.bar_seconds = int(chosen)
+        except Exception:
+            # If settings is immutable in your build, stash on DataFrame for local use
+            df.attrs["bar_seconds"] = int(chosen)
+
+
 class CoreFeaturePipeline:
     """Run feature engineering in‑memory using pure Pandas/SciKit."""
 
@@ -69,11 +130,67 @@ class CoreFeaturePipeline:
             pass
 
         # --- NEW: Auto-load the fitted pipeline if it exists ---
-        pipe_path = self.parquet_root / "_fe_meta" / "pipeline.pkl"
+        '''pipe_path = self.parquet_root / "_fe_meta" / "pipeline.pkl"
+        if pipe_path.exists():
+            log.info(f"[FE] Loading pre-fitted pipeline from {pipe_path}")
+            self._pipe = joblib.load(pipe_path)
+        '''
+        # inside CoreFeaturePipeline.__init__
+        meta_dir = self.parquet_root / "_fe_meta"
+        pipe_path = meta_dir / "pipeline.pkl"
         if pipe_path.exists():
             log.info(f"[FE] Loading pre-fitted pipeline from {pipe_path}")
             self._pipe = joblib.load(pipe_path)
 
+            meta_path = meta_dir / "pca_meta.json"
+            self._predict_cols_fitted = None
+            if meta_path.exists():
+                try:
+                    meta_series = pd.read_json(meta_path, typ="series")
+                    self._predict_cols_fitted = list(meta_series.get("predict_cols", []))
+                except Exception:
+                    log.warning("[FE] Could not read pca_meta.json; will fall back to code _PREDICT_COLS")
+
+    def fit_mem(self, df_train: pd.DataFrame) -> dict:
+        """
+        Fit imputer+scaler+PCA on TRAIN ONLY. Persist artifacts and return pca_meta.
+        """
+        df = df_train.copy()
+        _assert_schema_tz_freq(df)
+
+        df_with_features = self._calculate_base_features(df)
+        X = df_with_features[_PREDICT_COLS].astype(np.float32)
+
+        pipe = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+            ("scaler", StandardScaler()),
+            ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+        ])
+        Xp = pipe.fit_transform(X)
+
+        out_dir = self.parquet_root / "_fe_meta"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(pipe, out_dir / "pipeline.pkl")
+        joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
+        pca = pipe.named_steps["pca"]
+        cum_var = float(pca.explained_variance_ratio_.sum())
+        if cum_var + 1e-9 < float(settings.pca_variance):
+            raise RuntimeError(f"[FE] PCA retained variance {cum_var:.3%} < target {settings.pca_variance:.3%}")
+
+        pca_meta = {
+            "n_components": int(pca.n_components_),
+            "explained_variance_ratio_": pca.explained_variance_ratio_.astype(float).tolist(),
+            "cum_var": cum_var,
+            "predict_cols": list(_PREDICT_COLS),
+            "created_at": pd.Timestamp.utcnow().isoformat(),
+        }
+        (out_dir / "pca_meta.json").write_text(pd.Series(pca_meta).to_json(), encoding="utf-8")
+
+        # Keep in-memory handle for immediate transform_mem use
+        self._pipe = pipe
+        return pca_meta
 
     # ------------------------------------------------------------------
     # In-memory variant – used by unit-tests & quick back-tests
@@ -93,6 +210,7 @@ class CoreFeaturePipeline:
 
         # 1) Apply calculators sequentially
         df = df_raw.copy()
+        _assert_schema_tz_freq(df)
 
         num_cols = ["open", "high", "low", "close", "volume"]
         df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
@@ -192,6 +310,16 @@ class CoreFeaturePipeline:
 
     def _calculate_base_features(self, df_raw: pd.DataFrame) -> pd.DataFrame:
         """Applies all base feature calculators and adds context features."""
+        # If assert stashed cadence on attrs (immutable settings), mirror it into settings now
+        if "bar_seconds" in df_raw.attrs:
+            try:
+                from feature_engineering.config import settings
+                settings.bar_seconds = int(df_raw.attrs["bar_seconds"])
+            except Exception:
+                pass
+
+
+
         df = df_raw.copy()
 
         # Ensure numeric types before calculations
@@ -217,6 +345,18 @@ class CoreFeaturePipeline:
 
         if "volume_spike_pct" not in df.columns:
             df["volume_spike_pct"] = 0.0
+
+        # VWAP delta: session-reset
+        if "vwap_delta" not in df.columns:
+            vwap_calc = VWAPCalculator(name="vwap_delta")
+            vwap_df = vwap_calc.transform(df)  # uses session_id internally
+            df = pd.concat([df, vwap_df], axis=1)
+
+        # RVOL: minute-of-session baseline across previous N sessions
+        if "rvol_20d" not in df.columns:
+            rvol_calc = RVOLCalculator(days=20, name="rvol_20d")
+            rvol_df = rvol_calc.transform(df)
+            df = pd.concat([df, rvol_df], axis=1)
 
         return df
 
@@ -267,8 +407,16 @@ class CoreFeaturePipeline:
         """
         Calculates all features, then TRANSFORMS using the pre-fitted pipeline.
         """
-        if not hasattr(self, '_pipe'):
-            raise RuntimeError("Pipeline has not been fitted yet. Call run_mem() first.")
+
+
+        #if not hasattr(self, '_pipe'):
+        #    raise RuntimeError("Pipeline has not been fitted yet. Call run_mem() first.")
+
+        # at the top of transform_mem, right after the docstring:
+        if not hasattr(self, "_pipe"):
+            raise RuntimeError("[FE] No fitted pipeline found. Call fit_mem() or provide artefacts.")
+        df = df_raw.copy()
+        _assert_schema_tz_freq(df)
 
         # 1) Apply all base feature calculations
         df_with_features = self._calculate_base_features(df_raw)
@@ -317,6 +465,8 @@ class CoreFeaturePipeline:
             raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
 
         df = arrow_table.to_pandas()
+        _assert_schema_tz_freq(df)
+
         logger.info("Loaded %d rows, columns: %s", len(df), list(df.columns))
 
         # 2) Apply calculators sequentially.
@@ -339,6 +489,67 @@ class CoreFeaturePipeline:
         logger.info("After load:        %d rows", len(df))
         df = self._calculate_base_features(df)
         logger.info("After base feats:  %d rows", len(df))
+
+        _assert_schema_tz_freq(df)
+
+        # If a pre-fitted pipeline exists (loaded in __init__), do a transform-only run to avoid leakage.
+        if hasattr(self, "_pipe") and self._pipe is not None:
+            logger.info("[FE] Transform-only path (fitted pipeline detected)")
+            df_features = self._calculate_base_features(df)
+
+            #X = df_features[_PREDICT_COLS].astype(np.float32)
+            #Xp = self._pipe.transform(X)
+
+            '''predict_cols = getattr(self, "_predict_cols_fitted", _PREDICT_COLS)
+
+            missing = set(predict_cols) - set(df_features.columns)
+            if missing:
+                raise RuntimeError(f"[FE] Transform columns missing from dataset: {sorted(missing)}. "
+                                   f"Either refit pipeline or align feature builders.")
+            '''
+
+            # >>> NEW: derive expected order from the fitted pipeline
+            try:
+                expected = list(self._pipe.named_steps["imputer"].feature_names_in_)
+            except Exception:
+                # Fallback if imputer not present or no names stored
+                expected = list(getattr(self._pipe, "feature_names_in_", []))
+
+            if not expected:
+                raise RuntimeError(
+                    "[FE] Loaded pipeline has no feature_names_in_; "
+                    "refit pipeline or ensure it was trained on a pandas DataFrame."
+                )
+
+            missing = [c for c in expected if c not in df_features.columns]
+            extra = [c for c in df_features.columns if
+                     c in expected and c not in expected]  # unused, but here for clarity
+            if missing:
+                raise RuntimeError(
+                    f"[FE] Transform columns missing from dataset: {missing}. "
+                    "Either refit the pipeline or realign feature builders/_PREDICT_COLS."
+                )
+
+            #X = df_features[predict_cols].astype(np.float32)  # critical: use saved order
+            # Use the exact order expected by the pipeline
+            X = df_features.loc[:, expected].astype(np.float32)
+
+            Xp = self._pipe.transform(X)
+
+            # Build output with pca_* + base cols we keep
+            pca = self._pipe.named_steps["pca"]
+            pcols = [f"pca_{i:02d}" for i in range(pca.n_components_)]
+            out = pd.DataFrame(Xp, columns=pcols, index=df_features.index)
+            keep = [c for c in ["symbol", "timestamp", "close"] if c in df_features.columns]
+            out[keep] = df_features[keep]
+            pca_meta = {
+                "n_components": int(pca.n_components_),
+                "explained_variance_ratio_": pca.explained_variance_ratio_.astype(float).tolist(),
+                "cum_var": float(pca.explained_variance_ratio_.sum()),
+                "predict_cols": list(_PREDICT_COLS),
+                "created_at": pd.Timestamp.utcnow().isoformat(),
+            }
+            return out.reset_index(drop=True), pca_meta
 
         features = df[_PREDICT_COLS].astype(np.float32)
 
@@ -383,7 +594,60 @@ class CoreFeaturePipeline:
         }
         out["close"] = df["close"].values  # keep close so cluster builder can create y
 
+        # after assembling pca_meta dict in run_mem:
+        (out_dir / "pca_meta.json").write_text(pd.Series(pca_meta).to_json(), encoding="utf-8")
+
         return out, pca_meta
+
+    # === NEW: slice helpers to avoid leakage ===
+    def fit_slice(self, symbols, start, end):
+        """
+        Load TRAIN slice from Parquet, calculate base features, then fit & persist pipeline.
+        """
+        table = ds.dataset(str(self.parquet_root), format="parquet")
+        filt = (
+                (ds.field("symbol").isin(symbols)) &
+                (ds.field("timestamp") >= pd.Timestamp(start)) &
+                (ds.field("timestamp") < pd.Timestamp(end))
+        )
+        arrow = table.to_table(filter=filt)
+        df = arrow.to_pandas(types_mapper=pd.ArrowDtype)
+        return self.fit_mem(df)
+
+    def transform_slice(self, symbols, start, end):
+        """
+        Load EVAL slice from Parquet and transform with pre-fitted pipeline; never fits.
+        """
+        if not hasattr(self, "_pipe"):
+            # Try auto-load if present
+            meta = (self.parquet_root / "_fe_meta" / "pipeline.pkl")
+            if meta.exists():
+                self._pipe = joblib.load(meta)
+            else:
+                raise RuntimeError("[FE] No fitted pipeline; call fit_slice or fit_mem first.")
+
+        table = ds.dataset(str(self.parquet_root), format="parquet")
+        filt = (
+                (ds.field("symbol").isin(symbols)) &
+                (ds.field("timestamp") >= pd.Timestamp(start)) &
+                (ds.field("timestamp") < pd.Timestamp(end))
+        )
+        arrow = table.to_table(filter=filt)
+        df = arrow.to_pandas(types_mapper=pd.ArrowDtype)
+        _assert_schema_tz_freq(df)
+
+        df_feat = self._calculate_base_features(df)
+        X = df_feat[_PREDICT_COLS].astype(np.float32)
+
+        # Transform ONLY
+        Xp = self._pipe.transform(X)
+
+        # Assemble output: pca_* + base identifiers
+        pca = self._pipe.named_steps["pca"]
+        cols = [f"pca_{i}" for i in range(pca.n_components_)]
+        out = pd.DataFrame(Xp, columns=cols, index=df_feat.index)
+        out = pd.concat([df_feat[["symbol", "timestamp"]].reset_index(drop=True), out.reset_index(drop=True)], axis=1)
+        return out
 
     # ---------------------------------------------------------------------------
     # 💡 NEW: factory that loads the *frozen* preprocessing from an artefact dir

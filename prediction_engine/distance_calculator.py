@@ -202,7 +202,17 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
                     rf_weights_path = cand
                     break
 
+        #w = np.load(rf_weights_path, allow_pickle=False) if rf_weights_path else None
+
+        # inside DistanceCalculator.from_artifacts(...)
         w = np.load(rf_weights_path, allow_pickle=False) if rf_weights_path else None
+        if metric == "rf_weighted" and w is not None:
+            w = w.astype(np.float32, copy=False)
+            s = float(w.sum())
+            if s <= 0 or not np.isfinite(s):
+                raise ValueError("rf_feature_weights sums to non-positive")
+            w /= s
+
         return cls(
             ref_arr,
             metric=metric,

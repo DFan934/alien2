@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .base import Calculator, RollingCalculatorMixin, BaseCalculator
+from ..utils.calendar import session_id
 
 
 class VWAPCalculator(RollingCalculatorMixin, BaseCalculator):
@@ -21,9 +22,22 @@ class VWAPCalculator(RollingCalculatorMixin, BaseCalculator):
 
         # Assume df is one symbol, chronologically sorted minute bars.
         # Identify session boundaries by date change (UTC)
-        day = df["timestamp"].dt.date
+        '''day = df["timestamp"].dt.date
         cum_px_vol = (df["close"] * df["volume"]).groupby(day).cumsum()
         cum_vol = df["volume"].groupby(day).cumsum().replace(0, np.nan)
         vwap = cum_px_vol / cum_vol
+        delta = (df["close"] - vwap) / vwap'''
+
+        sess = session_id(df["timestamp"])
+        cum_px_vol = (df["close"] * df["volume"]).groupby([df["symbol"], sess]).cumsum()
+        cum_vol = df["volume"].groupby([df["symbol"], sess]).cumsum().replace(0, np.nan)
+        vwap = cum_px_vol / cum_vol
         delta = (df["close"] - vwap) / vwap
+        out = pd.DataFrame({self.name: delta.astype("float32")})
+        # Handle first bars (NaN when cum_vol==0): backfill 1, else use close
+        mask = out[self.name].isna()
+        if mask.any():
+            out.loc[mask, self.name] = 0.0  # 0% deviation at first print
+        return out
+
         return pd.DataFrame({self.name: delta.astype("float32")})

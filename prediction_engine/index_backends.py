@@ -130,3 +130,70 @@ def get_index(backend: str, n_dim: int, metric: str = "euclidean", **kwargs: Any
     if backend == "faiss":
         return FaissIndex(n_dim=n_dim, metric="l2", **kwargs)
     raise ValueError(f"Unknown ANN backend: {backend}")
+
+'''
+
+
+
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import json
+from datetime import datetime
+
+@dataclass
+class IndexMeta:
+    index_type: str
+    metric: str
+    feature_sha1: str
+    dim: int
+    trained_on_date: str
+    n_items: int
+    files: list[str]
+
+def save_index_meta(root: Path, meta: IndexMeta) -> None:
+    meta_path = Path(root) / "meta.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(asdict(meta), indent=2, sort_keys=True))
+
+def load_index_meta(root: Path) -> IndexMeta | None:
+    p = Path(root) / "meta.json"
+    if not p.exists():
+        return None
+    d = json.loads(p.read_text())
+    return IndexMeta(**d)
+'''
+
+
+# --- contract/meta helpers (append at EOF) ---
+import json, hashlib
+from pathlib import Path
+from typing import Any, Dict
+
+def save_index_meta(base: Path, backend: str, *, metric: str, feature_sha1: str,
+                    dim: int, n_items: int, files: list[str] | None = None) -> Path:
+    """Create index_backends/{backend}/meta.json under *base* (usually weights dir)."""
+    files = files or []
+    meta_dir = base / "index_backends" / backend
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "index_type": backend,
+        "metric": metric,
+        "feature_sha1": feature_sha1,
+        "dim": int(dim),
+        "n_items": int(n_items),
+        "files": files,
+    }
+    p = meta_dir / "meta.json"
+    p.write_text(json.dumps(meta, indent=2, sort_keys=True))
+    return p
+
+def load_json(p: Path) -> Dict[str, Any]:
+    return json.loads(p.read_text()) if p.exists() else {}
+
+def save_json(p: Path, obj: Dict[str, Any]) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2, sort_keys=True))
+
+def sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()[:12]

@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple, Callable, Any
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
+# after: from prediction_engine.tx_cost import BasicCostModel
+from prediction_engine.market_regime import MarketRegime  # <-- ADD
 
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.ev_engine import EVEngine
@@ -253,6 +255,26 @@ class WalkForwardRunner:
             print(
                 f"[Fold {f.idx}] Found {len(feats_scan_tr)} scanned train bars and {len(feats_scan_te)} scanned test bars.")
 
+            # ---- Build per-row regime series aligned by timestamp -----------------
+            def _aligned_regime_series(base_df: pd.DataFrame, feats_df: pd.DataFrame,
+                                       fallback: str = "TREND") -> pd.Series:
+                """
+                Returns a string regime series aligned to feats_df['timestamp'].
+                If base_df has no 'regime' column, everything defaults to 'TREND'.
+                """
+                if "regime" in base_df.columns:
+                    ser = (base_df[["timestamp", "regime"]]
+                    .dropna()
+                    .drop_duplicates(subset=["timestamp"])
+                    .set_index("timestamp")["regime"])
+                    out = ser.reindex(feats_df["timestamp"]).fillna(fallback).astype(str)
+                else:
+                    out = pd.Series(fallback, index=feats_df.index)
+                return out
+
+            reg_tr = _aligned_regime_series(scan_tr, feats_scan_tr, fallback="TREND")
+            reg_te = _aligned_regime_series(scan_te, feats_scan_te, fallback="TREND")
+
             # ---- EV artefacts: build on TRAIN window only
             from scripts.rebuild_artefacts import rebuild_if_needed
 
@@ -270,6 +292,7 @@ class WalkForwardRunner:
             # Decide cost handling once and pass it into both train/test engines
             cost_model = None if self.debug_no_costs else BasicCostModel()
             ev_tr = EVEngine.from_artifacts(self.ev_artifacts_root, cost_model=cost_model)
+
             # Snapshot the EV artefacts that were just (re)built for this fold
             ev_src = Path(self.ev_artifacts_root)
             ev_dst = fold_dir / "ev"
@@ -287,16 +310,47 @@ class WalkForwardRunner:
             except Exception as _e:
                 ev_meta = {"error": f"meta read failed: {type(_e).__name__}"}
 
-            def _mu_on_feats(ev: EVEngine, feats_df: pd.DataFrame) -> np.ndarray:
+            '''def _mu_on_feats(ev: EVEngine, feats_df: pd.DataFrame) -> np.ndarray:
                 if feats_df.empty:
                     return np.array([], dtype=float)
                 pc_cols = [c for c in feats_df.columns if c.startswith("pca_")]
                 X = feats_df[pc_cols].to_numpy(dtype=np.float32)
                 # --- FIX: Access the .mu attribute by name ---
                 return np.array([ev.evaluate(x).mu for x in X], dtype=float)
+            '''
 
+            def _mu_on_feats(ev: EVEngine, feats_df: pd.DataFrame, regimes: Optional[pd.Series] = None) -> np.ndarray:
+                """
+                Evaluate EV for each row in feats_df, optionally with a per-row regime
+                (aligned by feats_df['timestamp']). If no regime is provided, default TREND.
+                """
+                if feats_df.empty:
+                    return np.array([], dtype=float)
 
-            mu_tr = _mu_on_feats(ev_tr, feats_scan_tr)
+                pc_cols = [c for c in feats_df.columns if c.startswith("pca_")]
+                X = feats_df[pc_cols].to_numpy(dtype=np.float32)
+
+                # Build an aligned regime list
+                if regimes is not None and len(regimes) == len(feats_df):
+                    reg_strings = regimes.astype(str).tolist()
+                else:
+                    reg_strings = ["TREND"] * len(feats_df)
+
+                out = []
+                for x, rstr in zip(X, reg_strings):
+                    try:
+                        reg = MarketRegime.from_string(rstr)  # if your enum has this
+                    except Exception:
+                        # Fallbacks for common enum styles
+                        try:
+                            reg = MarketRegime[rstr.upper()]
+                        except Exception:
+                            reg = MarketRegime.TREND
+                    out.append(ev.evaluate(x, regime=reg).mu)
+                return np.array(out, dtype=float)
+
+            #mu_tr = _mu_on_feats(ev_tr, feats_scan_tr)
+            mu_tr = _mu_on_feats(ev_tr, feats_scan_tr, regimes=reg_tr)
 
             # --- Calculate y_tr BEFORE you try to use it ---
             if not scan_tr.empty and "timestamp" in scan_tr.columns:
@@ -506,7 +560,9 @@ class WalkForwardRunner:
             pc_te = [c for c in feats_scan_te.columns if c.startswith("pca_")]
             X_te = feats_scan_te[pc_te].to_numpy(dtype=np.float32)
             # --- FIX: Access the .mu attribute by name ---
-            mu_te = np.array([ev_te.evaluate(x).mu for x in X_te], dtype=float)
+            #mu_te = np.array([ev_te.evaluate(x).mu for x in X_te], dtype=float)
+            mu_te = _mu_on_feats(ev_te, feats_scan_te, regimes=reg_te)
+
             p_te = map_mu_to_prob(mu_te, calibrator=iso)
 
             # Labels for scanned test rows from FULL stream

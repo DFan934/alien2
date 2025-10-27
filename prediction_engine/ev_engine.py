@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 
+import pandas as pd
 # remove: from hypothesis.extra.numpy import NDArray
 from numpy.typing import NDArray
 from sklearn.isotonic import IsotonicRegression
@@ -35,7 +36,7 @@ log = logging.getLogger(__name__)      # ← ADD
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Tuple, Dict, Any
+from typing import Iterable, Literal, Tuple, Dict, Any, Optional
 import joblib
 from prediction_engine.position_sizer import KellySizer        # NEW
 from .drift_monitor import get_monitor, DriftStatus        # NEW
@@ -56,6 +57,59 @@ from .tx_cost import BasicCostModel
 from .market_regime import MarketRegime # NEW
 from .weight_optimization import CurveParams, WeightOptimizer  # NEW
 
+# --- begin: curve param coercion helper (add after CurveParams import) ---
+from dataclasses import fields as _dc_fields
+
+# detect the tail field name in CurveParams
+_TAIL_FIELD = next((f.name for f in _dc_fields(CurveParams) if f.name in ("tail_len", "tail")), None)
+
+def _coerce_curve_params_dict(data: dict) -> dict:
+    """
+    Coerce flexible JSON into CurveParams kwargs.
+    Accepts flat dicts or {"params": {...}}.
+    Maps aliases onto the actual CurveParams fields.
+    """
+    if "params" in data and isinstance(data["params"], dict):
+        data = dict(data["params"])  # unwrap
+
+    # map incoming aliases to our dataclass field names
+    aliases = {
+        "tail_len_days": _TAIL_FIELD,   # <— the important one
+        "tail_len": _TAIL_FIELD,
+        "tail": _TAIL_FIELD,
+        "a": "alpha",
+        "shape": "shape_params",
+    }
+
+    norm = {}
+    for k, v in data.items():
+        kk = aliases.get(k, k)
+        if kk is None:
+            continue
+        norm[kk] = v
+
+    wanted = {f.name for f in _dc_fields(CurveParams)}
+    out = {k: norm[k] for k in list(norm.keys()) if k in wanted}
+
+    out.setdefault("family", "uniform")
+    if _TAIL_FIELD and _TAIL_FIELD in wanted:
+        out.setdefault(_TAIL_FIELD, 20)
+    if "alpha" in wanted:
+        out.setdefault("alpha", 1.0)
+    return out
+
+
+# --- ADD: lightweight ANN index artifact helpers ---
+from datetime import datetime
+def _load_json(p: Path) -> dict:
+    return json.loads(p.read_text()) if p.exists() else {}
+
+def _save_json(p: Path, obj: dict) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2, sort_keys=True))
+
+def _sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()[:12]
 
 
 __all__: Tuple[str, ...] = ("EVEngine", "EVResult")
@@ -63,7 +117,32 @@ __all__: Tuple[str, ...] = ("EVEngine", "EVResult")
 
 
 
+# ev_engine.py — near the top, after imports/config
+from dataclasses import dataclass
 
+@dataclass
+class SynthGateParams:
+    residual_tau: float = 0.25         # conservative until learned from validation
+    min_beta_nz: int = 2               # require at least 2 active betas
+    sign_flip_gain: float = 1.5        # if flipping sign, require >=1.5x magnitude vs kernel
+    prefer_kernel_when_tied: bool = True
+
+GATE = SynthGateParams()
+
+
+# ev_engine.py — after the SynthGateParams dataclass and GATE assignment
+
+# at top
+from typing import Optional
+
+def _beta_nz(beta: Optional[np.ndarray], eps: float = 1e-6) -> int:
+    if beta is None:
+        return 0
+    return int(np.count_nonzero(beta > eps))
+
+
+#def _beta_nz(beta: np.ndarray, eps: float = 1e-6) -> int:
+#    return int(np.count_nonzero(beta > eps))
 
 
 # ---------------------------------------------------------------------------
@@ -73,26 +152,28 @@ __all__: Tuple[str, ...] = ("EVEngine", "EVResult")
 
 @dataclass(slots=True, frozen=True)
 class EVResult:
-    mu: float  # µ – expected return/ share
-    sigma: float  # full variance (σ²)
-    variance_down: float  # downside variance for Sortino / Kelly denom
-    beta: NDArray[np.float32] = field(repr=False)
+    # core outputs
+    mu: float                      # final expected return per share (after path choice)
+    sigma: float                   # final variance (σ²)
+    variance_down: float           # downside variance (Sortino / Kelly)
+
+    # synthesis diagnostics
     residual: float
+    beta: Optional[NDArray[np.float32]] = field(default=None, repr=False)
+    path: str = "kernel"           # "synth" | "kernel"
+    k_used: int = 0
+    metric: str = "euclidean"
 
-    cluster_id: int  # closest centroid index
-    outcome_probs: Dict[str, float] = field(default_factory=dict)   # flat dict
-    #regime_curves: Dict[str, CurveParams] | None = None,
+    # cluster / outcomes / sizing
+    cluster_id: int = -1
+    outcome_probs: Dict[str, float] = field(default_factory=dict)
     position_size: float = 0.0
-    drift_ticket: int = -1            # NEW – link to DriftMonitor
-    # NEW – Kelly size
 
-    # NEW ↓
+    # drift / calibration
+    drift_ticket: int = -1
     mu_raw: float = 0.0
     p_up: float = 0.5
-    p_source: str = "kernel"  # <-- ADD THIS LINE
-
-
-
+    p_source: str = "kernel"
 
 
 # ------------------------------------------------------------------
@@ -186,6 +267,7 @@ class EVEngine:
         cluster_regime: np.ndarray | None = None,
         _scale_vec: np.ndarray | None = None,  # internal
         _n_feat_schema: int | None = None,  # internal
+        _center_age_days: np.ndarray | None = None,
 
     ) -> None:
         self.centers = np.ascontiguousarray(centers, dtype=np.float32)
@@ -220,6 +302,9 @@ class EVEngine:
         # NEW: Store regime-specific curves and outcome probabilities
         self.regime_curves = regime_curves or {}
         self.outcome_probs = outcome_probs or {}
+        self._center_age_days = (
+            np.asarray(_center_age_days, dtype=np.float32) if _center_age_days is not None else None
+        )
 
         # Build distance helper – inject recency weights per current regime
         # Pull the active regime (enum) and its CurveParams
@@ -235,13 +320,25 @@ class EVEngine:
 
         self._cost = cost_model
 
-        self._dist = DistanceCalculator(
+        '''self._dist = DistanceCalculator(
             ref = self.centers,
             metric = metric,
             rf_weights = rf_weights,
+        )'''
+
+        # --- REPLACE the existing DistanceCalculator construction with: ---
+        self._dist = DistanceCalculator(
+            ref=self.centers,
+            metric=metric,
+            rf_weights=rf_weights,
         )
+        # best-effort: if the calculator exposes a backend name, keep it for logs
+        self._index_backend = getattr(self._dist, "_ann_backend", "sklearn" if metric == "euclidean" else "none")
 
         #self._cost: BasicCostModel = cost_model or BasicCostModel()
+
+        # --- ADD: remember which index backend the distance helper is using
+        #self._index_backend = "none"
 
         # --- COST MODEL SANITY (NEW) ---
         # If no cost model is provided, do not silently construct one.
@@ -309,7 +406,7 @@ class EVEngine:
             )
 
 
-            if residual > self.residual_threshold:  # kernel fallback
+            '''if residual > self.residual_threshold:  # kernel fallback
                 beta[:] = 0.0
                 beta[0] = 1.0
                 mu_syn, var_syn, var_down_syn = mu_k, var_k, var_down_k
@@ -317,6 +414,17 @@ class EVEngine:
                 mu_syn = float(beta @ self.mu[idx])
                 var_syn = float(beta @ self.var[idx])
                 var_down_syn = float(beta @ self.var_down[idx])
+            '''
+
+            '''mu_syn = float(beta @ self.mu[idx])
+            var_syn = float(beta @ self.var[idx])
+            var_down_syn = float(beta @ self.var_down[idx])
+            '''
+
+            # Means combine linearly, variances combine with β² assuming independence
+            mu_syn = float(beta @ self.mu[idx])
+            var_syn = float((beta ** 2) @ self.var[idx])
+            var_down_syn = float((beta ** 2) @ self.var_down[idx])
 
             print(f"[EV] synth residual={residual:.5g}  α={self.alpha:.2f}")
             print(f"[EV] β (first 5)={np.round(beta[:5], 4).tolist()}")
@@ -329,7 +437,8 @@ class EVEngine:
         cls,
         artefact_dir: Path | str,
         *,
-        metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
+        #metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
+        metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "rf_weighted",
         k: int | None = None,
         cost_model: object | None = None,
         calibrator: Any | None=None,
@@ -349,6 +458,32 @@ class EVEngine:
 
         stats_path = artefact_dir / "cluster_stats.npz"
         stats = np.load(stats_path, allow_pickle=True)
+
+        # --- NEW: optional centroid ages/dates ---------------------------------
+        age_days_file = artefact_dir / "center_age_days.npy"
+        date_file = artefact_dir / "center_dates.npy"
+
+        center_age_days = None
+        if age_days_file.exists():
+            center_age_days = np.load(age_days_file).astype(np.float32)
+        elif date_file.exists():
+            # Compute age in days vs file mtime (proxy) or “trained_on_date” if you prefer
+            dates = np.load(date_file)
+            # Safe fallback: treat all ages as equal if dates are missing/non-parsable
+            try:
+                # Use artifact meta trained_on_date if present
+                meta_path = artefact_dir / "meta.json"
+                ref_ts = None
+                if meta_path.exists():
+                    _meta = json.loads(meta_path.read_text())
+                    ref_ts = pd.Timestamp(_meta.get("trained_on_date"))
+                ref_ts = ref_ts or pd.Timestamp.utcnow()
+                center_age_days = (ref_ts - pd.to_datetime(dates)).days.astype(np.float32)
+            except Exception:
+                center_age_days = None
+
+        # Store on engine (even if None)
+
         regime_arr = stats["regime"] if "regime" in stats.files else np.full(len(stats["mu"]), "ANY", dtype="U10")
 
         # ─── load all per‐regime curves ────────────────────
@@ -360,13 +495,33 @@ class EVEngine:
 
 
         # NEW: Load all available regime-specific weighting curves
-        regime_curves: dict[str, CurveParams] = {}
+        '''regime_curves: dict[str, CurveParams] = {}
         for regime_dir in artefact_dir.glob("regime=*"):
             regime_name = regime_dir.name.split("=")[-1]
             params_file = regime_dir / "curve_params.json"
             if params_file.exists():
                 params_data = json.loads(params_file.read_text())["params"]
                 regime_curves[regime_name] = CurveParams(**params_data)
+        '''
+
+        # --- Load per-regime recency curves (accept both flat and {"params": {...}}) ---
+        # --- Load per-regime recency curves (tolerant loader) ---
+        regime_curves: dict[str, CurveParams] = {}
+        for regime_dir in artefact_dir.glob("regime=*"):
+            regime_name = regime_dir.name.split("=")[-1]
+            params_file = regime_dir / "curve_params.json"
+            if not params_file.exists():
+                continue
+            raw = json.loads(params_file.read_text())
+            try:
+                kwargs = _coerce_curve_params_dict(raw)
+                regime_curves[regime_name] = CurveParams(**kwargs)
+            except Exception as e:
+                log.warning(
+                    "[EVEngine] Failed to parse curve_params for regime=%s at %s: %s. "
+                    "Using uniform weights for this regime.",
+                    regime_name, str(params_file), e
+                )
 
         # -------- sanity-check required arrays --------------------
 
@@ -475,19 +630,72 @@ class EVEngine:
                 # ignore parsing errors
                 pass
 
+        #cov_inv = None
+        #rf_w = None
+        # --- ADD: RF-weighted metric guards and normalization ---
+        # --- ADD: Mahalanobis covariance sanity (optional) ---
         cov_inv = None
-        rf_w = None
         if metric == "mahalanobis":
-            cov_inv = np.load(artefact_dir / "centroid_cov_inv.npy")
-        elif metric == "rf_weighted":
+            cov_path = artefact_dir / "centroid_cov_inv.npy"
+            if not cov_path.exists():
+                raise FileNotFoundError("centroid_cov_inv.npy missing for Mahalanobis metric")
+            cov_inv = np.load(cov_path).astype(np.float32)
+
+        rf_w = None
+        if metric == "rf_weighted":
+            rf_path = artefact_dir / "rf_feature_weights.npy"
+            if not rf_path.exists():
+                raise FileNotFoundError(
+                    f"rf_feature_weights.npy missing in {artefact_dir}; "
+                    "train must persist RF importances next to centers."
+                )
+            rf_w = np.load(rf_path, allow_pickle=False).astype(np.float32)
+            if rf_w.ndim != 1 or rf_w.shape[0] != n_feat_schema:
+                raise RuntimeError(
+                    f"RF weight length {rf_w.shape} ≠ feature schema length {n_feat_schema}"
+                )
+            s = float(rf_w.sum())
+            if not np.isfinite(s) or s <= 0:
+                raise RuntimeError("RF weights sum to non-positive; retrain weights.")
+            rf_w /= s  # normalise → Σw=1
+
+            # optional: enforce feature order integrity for RF weights, via meta
+            rf_meta = _load_json(artefact_dir / "rf_weights_meta.json")
+            feat_sha = _sha1_list(feature_names)
+            expected_sha = rf_meta.get("feature_sha1")
+            if expected_sha and expected_sha != feat_sha:
+                raise RuntimeError(
+                    f"RF weights feature_sha mismatch: {expected_sha} vs {feat_sha}."
+                )
+
+        #elif metric == "mahalanobis":
+        #    cov_inv = np.load(artefact_dir / "centroid_cov_inv.npy")
+        '''elif metric == "rf_weighted":
             rf_file = artefact_dir / "rf_feature_weights.npy"
             rf_w = np.load(rf_file, allow_pickle=False)
+        '''
         #if not rf_path.exists():
         #        raise FileNotFoundError("RF weights file missing for rf_weighted metric")
 
+        # --- ADD: ANN index contract (metadata only if no FAISS file) ---
+        index_root = artefact_dir / "index_backends"
+        backend = "sklearn" if metric == "euclidean" else "none"
+        meta_path = index_root / backend / "meta.json"
+
+        # create/refresh contract if missing
+        if not meta_path.exists():
+            _save_json(meta_path, {
+                "index_type": backend,
+                "metric": metric,
+                "feature_sha1": _sha1_list(feature_names),
+                "dim": int(centers.shape[1]),
+                "trained_on_date": datetime.utcnow().isoformat(),
+                "n_items": int(centers.shape[0]),
+                "files": []  # fill when you add a real FAISS/Annoy index file
+            })
 
         #return cls(
-        engine = cls(
+        '''engine = cls(
             centers=centers,
             mu=stats["mu"],
             var=stats["var"],
@@ -504,9 +712,32 @@ class EVEngine:
             cost_model=cost_model,
             calibrator=calibrator,
             #residual_threshold=residual_threshold,
-            residual_threshold=tau_sq_p75,
-
+            #residual_threshold=tau_sq_p75,
+            #residual_threshold=0.35,
+            residual_threshold=1.5,
             _scale_vec=scale_vec,
+            _n_feat_schema=n_feat_schema,
+            cluster_regime=regime_arr,
+        )'''
+
+        engine = cls(
+            centers=centers,
+            mu=stats["mu"],
+            var=stats["var"],
+            var_down=stats["var_down"],
+            blend_alpha=blend_alpha,
+            h=h,
+            _center_age_days=center_age_days,
+            metric=metric,
+            cov_inv=cov_inv,
+            rf_weights=rf_w,
+            k=k,
+            outcome_probs=outcome_probs,
+            regime_curves={**regime_curves, **curves},
+            cost_model=cost_model,
+            calibrator=calibrator,
+            residual_threshold=1.5,  # keep your current gate
+            _scale_vec=np.asarray(schema.get("scales", []), dtype=np.float32),
             _n_feat_schema=n_feat_schema,
             cluster_regime=regime_arr,
         )
@@ -526,28 +757,41 @@ class EVEngine:
 
         return getattr(self, "_feature_names", None)
 
-    def _get_recency_weights(self, regime: MarketRegime, n_points: int) -> np.ndarray:
-        """NEW: Generate recency weights based on the current market regime."""
-        #curve = self.regime_curves.get(regime.name.lower())
-        # Allow either lower- or upper-case keys ("trend" / "TREND")
-
-        # ─── If no regime filtering, use uniform recency weights ───
-        if regime is None:
-            # uniform weights when skipping regime curves
-            return np.ones(n_points, dtype=np.float32)
+    def _get_recency_weights(self, regime: MarketRegime, ages_days: np.ndarray) -> np.ndarray:
+        """
+        Compute recency weights from *ages_days* using the active regime curve.
+        If no curve, return ones.
+        """
+        if ages_days is None or ages_days.size == 0:
+            return np.ones(0, dtype=np.float32)
 
         curve = (
-             self.regime_curves.get(regime.name.lower())
-            or self.regime_curves.get("all")
-                )
+                    self.regime_curves.get(regime.name.lower()) if regime is not None else None
+                ) or self.regime_curves.get("all")
 
-        #curve = (self.regime_curves.get(regime.name.lower())
-        #        or self.regime_curves.get(regime.name.upper())
-        #        or self.regime_curves.get(regime.name.capitalize()))
         if not curve:
-            return np.ones(n_points)  # Fallback to uniform weights
+            return np.ones_like(ages_days, dtype=np.float32)
 
-        return WeightOptimizer._weights(n_points, curve)
+        fam = getattr(curve, "family", "exp")
+        # Common params (fall back safely)
+        alpha = float(getattr(curve, "alpha", 1.0))
+        tail = float(getattr(curve, "tail_len_days", 20.0))
+        x = np.asarray(ages_days, dtype=np.float32).clip(min=0)
+
+        if fam == "exp":
+            w = np.exp(-(x / max(1e-6, tail)) * alpha)
+        elif fam == "linear":
+            w = np.maximum(0.0, 1.0 - (x / max(1e-6, tail)) * alpha)
+        elif fam == "sigmoid":
+            # center at tail/2 with slope alpha
+            z = (x - 0.5 * tail) / max(1e-6, tail / max(1.0, alpha))
+            w = 1.0 / (1.0 + np.exp(z))
+        else:
+            w = np.ones_like(x)
+
+        # normalise but avoid all-zeros
+        s = float(w.sum())
+        return (w / s) if s > 1e-12 else np.ones_like(w) / max(1, w.size)
 
     # ------------------------------------------------------------------
     # Core API
@@ -698,6 +942,25 @@ class EVEngine:
         # --- Recompute kernel AFTER all masks so lengths match -----------------
         kernel_w = np.exp(-0.5 * dist2 / (self.h ** 2)).astype(float)  # length == len(dist2) == len(idx)
 
+        # --- NEW: recency weights from ages (per neighbor) --------------------
+        if self._center_age_days is not None:
+            ages_k = self._center_age_days[idx]  # length == len(idx)
+        else:
+            ages_k = None
+
+        try:
+            recency_w = self._get_recency_weights(regime, ages_k) if ages_k is not None else 1.0
+        except Exception:
+            recency_w = 1.0
+
+        if np.isscalar(recency_w):
+            recency_w = np.ones_like(kernel_w, dtype=float) * float(recency_w)
+        # shapes now: kernel_w == outlier_mult == recency_w == (k,)
+
+        '''w = kernel_w * outlier_mult * recency_w
+        ws = float(w.sum())
+        w = (w / ws) if ws > 1e-12 else (np.ones_like(w) / max(1, w.size))
+        '''
         # --- Outlier down-weighting (compute AFTER final idx is fixed) ---------
         zcap = getattr(self, "outlier_z_cap", 3.0)
         if getattr(self, "_scale_vec", None) is not None and self._scale_vec.size == self.centers.shape[1]:
@@ -813,10 +1076,26 @@ class EVEngine:
         p_kernel = float(np.clip(np.sum(w * (y_neighbors > 0)) / max(1e-12, w.sum()), 1e-3, 1 - 1e-3))
         p_up, p_source = p_kernel, "kernel"
 
+        # --- Try isotonic only if available; fall back if it looks degenerate ---
+        if getattr(self, "_calibrator", None) is not None:
+            try:
+                p_iso = float(self._calibrator.predict(np.array([[mu_k]], dtype=float))[0])
+                # Keep within (1e-3, 1-1e-3)
+                p_iso = float(np.clip(p_iso, 1e-3, 1.0 - 1e-3))
+
+                # Reject isotonic if it is near-constant or wildly off kernel
+                # (heuristics; tighten as you validate)
+                if (0.1 <= p_iso <= 0.9) and (abs(p_iso - p_kernel) <= 0.40):
+                    p_up, p_source = p_iso, "isotonic"
+                else:
+                    # leave kernel
+                    pass
+            except Exception:
+                pass
         # Optional: if your calibrator maps mu_k (local mean return) → probability, compute mu_k first:
         mu_k = float(np.sum(w * y_neighbors))  # local mean; keep for logging and/or calibrator
 
-        if getattr(self, "_calibrator", None) is not None:
+        '''if getattr(self, "_calibrator", None) is not None:
             try:
                 # If your calibrator expects mu_k → p, feed mu_k; otherwise feed p_kernel.
                 # Choose **one** and be consistent across training & inference.
@@ -825,7 +1104,7 @@ class EVEngine:
                     p_up = float(np.clip(p_iso, 1e-3, 1 - 1e-3))
                     p_source = "isotonic"
             except Exception:
-                pass
+                pass'''
 
         # (Optional) print or log source for debugging
         # self._dbg(f"[Cal] p_up={p_up:.3f} source={p_source} mu_k={mu_k:.5f}")
@@ -882,7 +1161,7 @@ class EVEngine:
         # -----------------------------------------------------------------
         # NEW · decide whether to call analogue_synth
         # -----------------------------------------------------------------
-        nearest_d2 = float(dist2.min())
+        '''nearest_d2 = float(dist2.min())
         use_synth = nearest_d2 > self.tau_dist
         if use_synth:
             (mu_syn, var_syn, var_down_syn,
@@ -900,12 +1179,163 @@ class EVEngine:
             mu_syn, var_syn, var_down_syn = mu_k, var_k, var_down_k
 
         mu_final = float(mu_net)  # use cost-adjusted µ for decisions
+        '''
+
+
 
         # ... your sizing code ...
         # kelly = self._sizer.size(mu_final, var_down_syn)   # example
         # position_size = max(0.0, min(kelly, 0.4))          # cap 40%
 
+        # -----------------------------------------------------------------
+        # Analogue Synthesis (compute once), then select path by residual
+        # -----------------------------------------------------------------
+        # 1) Compute the synthetic candidate using the cached heavy math.
+        mu_syn, var_syn, var_down_syn, beta, residual = self._synth_cache(
+            tuple(x), tuple(idx.tolist()), mu_k, var_k, var_down_k
+        )
 
+        # --- Additional guards on top of residual threshold ---
+        beta_nz = int(np.sum(beta > 1e-6)) if isinstance(beta, np.ndarray) else 0
+        sign_flip = np.sign(mu_syn) != np.sign(mu_k) and (mu_k != 0.0)
+
+        use_synth = True
+
+        # 1) residual gate (primary)
+        if residual > self.residual_threshold:
+            use_synth = False
+
+        # 2) require some sparsity: at least a couple of active neighbours
+        if use_synth and beta_nz < GATE.min_beta_nz:
+            use_synth = False
+
+        # 3) protect against destructive sign flips:
+        #    only allow synth to flip sign if it beats kernel magnitude by a margin
+        if use_synth and sign_flip:
+            if abs(mu_syn) < GATE.sign_flip_gain * abs(mu_k):
+                use_synth = False
+
+        # 4) tie-breaker: prefer kernel when nearly equal
+        if use_synth and GATE.prefer_kernel_when_tied:
+            if abs(mu_syn - mu_k) < 0.25 * max(1e-12, abs(mu_k)):
+                use_synth = False
+
+        final_path = "synth" if use_synth else "kernel"
+
+        # Pick path-specific components for the rest of the computation
+        mu_raw_path = mu_syn if use_synth else mu_k
+        var_path = var_syn if use_synth else var_k
+        var_down_path = var_down_syn if use_synth else var_down_k
+
+        # If not using synth, drop β from the result to keep objects light
+        if not use_synth:
+            beta = None
+
+        # === Residual-gated path selection (strict) ===
+        nz = _beta_nz(beta)
+        agree_sign = (np.sign(mu_syn) == np.sign(mu_k)) or (abs(mu_k) < 1e-12)
+
+        # If synth flips sign, demand a margin multiplier (e.g., 1.5×)
+        if np.sign(mu_syn) != np.sign(mu_k) and abs(mu_k) >= 1e-12:
+            sign_ok = (abs(mu_syn) >= GATE.sign_flip_gain * abs(mu_k))
+        else:
+            sign_ok = True
+
+        resid_ok = (residual <= self.residual_threshold)
+        beta_ok = (nz >= GATE.min_beta_nz)
+        mag_tie = (abs(mu_syn) <= 1.05 * abs(mu_k))  # ~5% tie band
+
+        use_synth = bool(resid_ok and beta_ok and sign_ok and (agree_sign or sign_ok))
+
+        # Prefer kernel on ties if configured
+        if GATE.prefer_kernel_when_tied and use_synth and mag_tie:
+            use_synth = False
+
+        final_path = "synth" if use_synth else "kernel"
+
+        # Choose path-specific μ/σ²
+        mu_raw_path = mu_syn if use_synth else mu_k
+        var_path = var_syn if use_synth else var_k
+        var_down_path = var_down_syn if use_synth else var_down_k
+
+        # If not using synth, avoid carrying β for logging payload bloat
+        if not use_synth:
+            beta = None
+
+        # Always have a local numeric beta vector for downstream math
+        beta_arr = beta if isinstance(beta, np.ndarray) else np.zeros(len(idx), dtype=np.float32)
+
+
+
+        '''# 2) Decide the path by residual (low residual ⇒ accept synth)
+        use_synth = bool(residual <= self.residual_threshold)
+        final_path = "synth" if use_synth else "kernel"
+
+        # 3) Choose raw μ/σ² from the chosen path
+        mu_raw_path = mu_syn if use_synth else mu_k
+        var_path = var_syn if use_synth else var_k
+        var_down_path = var_down_syn if use_synth else var_down_k
+
+        # If we didn’t use synth, avoid bloating logs/result with a long β vector
+        if not use_synth:
+            beta = None
+        '''
+
+
+        # 4) Compute transaction costs (reuse existing cost model if present)
+        #    This block mirrors your earlier cost logic, but applies to the CHOSEN μ.
+        price = getattr(self, "last_price", None)
+        if self._cost is not None and price is not None and price > 0:
+            try:
+                usd_ps_oneway = float(self._cost.estimate())  # $/share one-way
+                cost_frac_rt = (usd_ps_oneway / float(price)) * 2.0
+            except Exception:
+                cost_frac_rt = 0.0
+        else:
+            cost_frac_rt = 0.0
+
+        mu_raw = float(mu_raw_path)  # keep raw μ from chosen path
+        mu_net = float(mu_raw - cost_frac_rt)  # subtract round-trip cost (fractional)
+
+        # 5) Gentle residual shrink (applies regardless of path)
+        shrink = 1.0 / (1.0 + residual / max(self.residual_threshold, 1e-6))
+        mu_net *= shrink
+
+        # 6) Position sizing uses downside variance from the CHOSEN path
+        pos_size = self._sizer.size(mu_net, float(var_down_path) ** 0.5, adv_percentile)
+
+        # 7) Single-source-of-truth probability (you computed p_up/p_source above)
+        #    (keep your existing computation of p_up / p_source just prior to cost)
+
+        # 8) One-line diagnostic log for quick grep-based analysis
+        '''log.info(
+            "EV path=%s k=%d metric=%s resid=%.3e mu_k=%.6g mu_s=%.6g mu=%+.6g p=%.3f src=%s",
+            final_path, int(idx.size), self.metric, residual, mu_k, mu_syn, mu_net, p_up, p_source
+        )'''
+
+        '''log.info(
+            "EV path=%s k=%d metric=%s index_backend=%s resid=%.3e mu_k=%.6g mu_s=%.6g mu=%+.6g p=%.3f src=%s",
+            final_path, int(idx.size), self.metric, getattr(self, "_index_backend", "none"),
+            residual, mu_k, mu_syn, mu_net, p_up, p_source
+        )'''
+
+        curve_used = (
+                         self.regime_curves.get(regime.name.lower()) if regime is not None else None
+                     ) or self.regime_curves.get("all")
+
+        rec_fam = getattr(curve_used, "family", "uniform")
+        rec_tail = getattr(curve_used, "tail_len_days", 0)
+
+        log.info(
+            "EV path=%s k=%d metric=%s index_backend=%s resid=%.3e mu_k=%.6g mu_s=%.6g mu=%+.6g p=%.3f src=%s "
+            "regime=%s recency_family=%s tail_len_days=%s",
+            final_path, int(idx.size), self.metric, getattr(self._dist, "_ann_backend", "sklearn"),
+            residual, mu_k, mu_syn, mu_net, p_up, p_source,
+            getattr(regime, "name", "NONE"), rec_fam, rec_tail
+        )
+
+        # We’ll carry on to outcome-prob blending (probs_k/probs_syn) which you have
+        # below, then construct EVResult with the chosen path + diagnostics.
 
         '''# ------------------------------------------------------------
         # 3. Synthetic analogue via inverse‑difference weights
@@ -966,10 +1396,10 @@ class EVEngine:
         var_syn = float(beta @ self.var[idx])  # <— one-liner
         var_down_syn = float(beta @ self.var_down[idx])'''
 
-        alpha = self.alpha
-        mu = alpha * mu_syn + (1 - alpha) * mu_k
-        sig2 = alpha ** 2 * var_syn + (1 - alpha) ** 2 * var_k
-        sig2_down = alpha ** 2 * var_down_syn + (1 - alpha) ** 2 * var_down_k
+        #alpha = self.alpha
+        #mu = alpha * mu_syn + (1 - alpha) * mu_k
+        #sig2 = alpha ** 2 * var_syn + (1 - alpha) ** 2 * var_k
+        #sig2_down = alpha ** 2 * var_down_syn + (1 - alpha) ** 2 * var_down_k
 
 
         #if adv_percentile is None:
@@ -978,10 +1408,10 @@ class EVEngine:
         #    liquidity_mult = 1.0 + 0.5 * min(max((adv_percentile - 5) / 15, 0.0), 1.0)
 
         # Always use flat volatility during debugging
-        liquidity_mult = 1.0
+        #liquidity_mult = 1.0
 
-        sig2 *= liquidity_mult
-        sig2_down *= liquidity_mult
+        #sig2 *= liquidity_mult
+        #sig2_down *= liquidity_mult
 
         '''res = EVResult(
             mu=mu_final, sigma=float(var_syn), variance_down=float(var_down_syn),
@@ -1043,7 +1473,7 @@ class EVEngine:
         # ------------------------------------------------------------
         # 4. Keep RAW µ for trading math; do NOT overwrite with calibration
         # ------------------------------------------------------------
-        mu_raw = mu  # <- preserve the model’s raw expected edge
+        #mu_raw = mu  # <- preserve the model’s raw expected edge
 
 
         # 5) Transaction cost and net edge (from RAW µ)
@@ -1133,7 +1563,7 @@ class EVEngine:
         # ------------------------------------------------------------
         # 7) Kelly position size (based on mu_net, as before)
         # ------------------------------------------------------------
-        pos_size = self._sizer.size(mu_net, sig2_down ** 0.5, adv_percentile)
+        #pos_size = self._sizer.size(mu_net, sig2_down ** 0.5, adv_percentile)
 
         # ------------------------------------------------------------
         # Drift-monitor logging uses the calibrated probability
@@ -1211,10 +1641,20 @@ class EVEngine:
                 probs_k[label] += w[i] * prob
 
         # Synthetic analogue-weighted probabilities
-        probs_syn = {label: 0.0 for label in all_labels}
+        '''probs_syn = {label: 0.0 for label in all_labels}
         for i, cluster_idx in enumerate(idx):
             for label, prob in self.outcome_probs.get(str(cluster_idx), {}).items():
                 probs_syn[label] += beta[i] * prob
+        '''
+
+        # Synthetic analogue-weighted probabilities (safe when kernel-path)
+        probs_syn = {label: 0.0 for label in all_labels}
+        for i, cluster_idx in enumerate(idx):
+            bi = float(beta_arr[i])  # 0.0 if we’re on kernel path
+            if bi == 0.0:
+                continue
+            for label, prob in self.outcome_probs.get(str(int(cluster_idx)), {}).items():
+                probs_syn[label] += bi * float(prob)
 
         # Final blend
         for label in all_labels:
@@ -1268,17 +1708,20 @@ class EVEngine:
               f"mu_net={mu_net:+.6f}")'''
 
         return EVResult(
-            mu_net,  # mu
-            sig2,  # sigma
-            sig2_down,  # variance_down
-            beta,  # beta array
-            residual,  # residual
-            int(idx[0]),  # cluster_id
-            blended_probs,  # outcome_probs
-            pos_size,  # position_size
-            ticket_id,  # drift_ticket
-            mu_raw=mu_raw,
-            p_up=p_up,
+            mu=mu_net,
+            sigma=float(var_path),
+            variance_down=float(var_down_path),
+            residual=float(residual),
+            beta=(beta.astype(np.float32) if isinstance(beta, np.ndarray) else None),
+            path=final_path,
+            k_used=int(idx.size),
+            metric=str(self.metric),
+            cluster_id=int(idx[0]),
+            outcome_probs=blended_probs,
+            position_size=float(pos_size),
+            drift_ticket=int(ticket_id),
+            mu_raw=float(mu_raw),
+            p_up=float(p_up),
             p_source=p_source,
         )
 
