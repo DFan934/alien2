@@ -1,7 +1,7 @@
 {
-  "run_id": "4e3bec98",
+  "run_id": "c2d4cf90",
   "git_sha": "n/a",
-  "started": "2025-10-17T11:59:07Z",
+  "started": "2025-10-30T13:33:24Z",
   "label_horizon": "open\u2192open log-return, H=20 bars",
   "label_function": "feature_engineering.labels.labeler.one_bar_ahead",
   "label_side": "long_positive",

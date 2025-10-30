@@ -19,8 +19,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import logging
 log = logging.getLogger(__name__)
+# AFTER: from typing import List, Tuple
+from typing import Literal, Optional
 
-from feature_engineering.pipelines.dataset_loader import load_parquet_dataset
+from feature_engineering.pipelines.dataset_loader import load_parquet_dataset, open_parquet_dataset
 from feature_engineering.utils import logger, timeit
 from feature_engineering.config import settings
 from feature_engineering.calculators import (
@@ -48,7 +50,8 @@ _PREDICT_COLS = [
     "vwap_delta", "rvol_20d", "ema_9_dist", "ema_20_dist", "roc_10",
     "atr_14", "adx_14",
     # trigger-context features:
-    "time_since_trigger_min",
+    #"time_since_trigger_min",
+    "latency_sec",
     "volume_spike_pct",
 ]
 
@@ -113,6 +116,31 @@ def _assert_schema_tz_freq(df: pd.DataFrame) -> None:
             df.attrs["bar_seconds"] = int(chosen)
 
 
+def _zscore_per_symbol(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """
+    Return a copy where `cols` are standardized within each symbol:
+    z = (x - mean_symbol) / std_symbol  (std=1 if degenerate).
+    """
+    out = df.copy()
+    def _z(g: pd.DataFrame) -> pd.DataFrame:
+        mu = g[cols].mean()
+        sig = g[cols].std(ddof=0).replace(0, 1.0)
+        g[cols] = (g[cols] - mu) / sig
+        return g
+    out = out.groupby("symbol", group_keys=False).apply(_z)
+    # keep NaNs from rolling calcs consistent
+    return out
+
+
+def _as_utc(s: pd.Series) -> pd.Series:
+    """Return a tz-aware UTC datetime64 series from possibly-naive/aware input."""
+    s = pd.to_datetime(s, utc=False, errors="coerce")
+    # if tz-naive → localize UTC; if tz-aware but not UTC → convert to UTC
+    if getattr(s.dt, "tz", None) is None:
+        return s.dt.tz_localize("UTC")
+    return s.dt.tz_convert("UTC")
+
+
 class CoreFeaturePipeline:
     """Run feature engineering in‑memory using pure Pandas/SciKit."""
 
@@ -128,6 +156,11 @@ class CoreFeaturePipeline:
             # Allow creation if the intention is to use run_mem, which creates subdirs.
             # raise FileNotFoundError(self.parquet_root)
             pass
+
+        # ADD these lines immediately after self.parquet_root = Path(parquet_root)
+        self._pipe: Optional[Pipeline] = None
+        self._predict_cols_fitted: Optional[list[str]] = None
+        self._normalization_mode_fitted: Optional[str] = None
 
         # --- NEW: Auto-load the fitted pipeline if it exists ---
         '''pipe_path = self.parquet_root / "_fe_meta" / "pipeline.pkl"
@@ -148,10 +181,29 @@ class CoreFeaturePipeline:
                 try:
                     meta_series = pd.read_json(meta_path, typ="series")
                     self._predict_cols_fitted = list(meta_series.get("predict_cols", []))
+                    # AFTER: self._predict_cols_fitted = list(meta_series.get("predict_cols", []))
+                    self._normalization_mode_fitted = meta_series.get("normalization_mode", "global")
+                    log.info("[FE] Loaded fitted normalization_mode=%s", self._normalization_mode_fitted)
+
                 except Exception:
                     log.warning("[FE] Could not read pca_meta.json; will fall back to code _PREDICT_COLS")
 
-    def fit_mem(self, df_train: pd.DataFrame) -> dict:
+        # Hard fallback if meta missing or empty
+        '''if not self._predict_cols_fitted:
+            self._predict_cols_fitted = list(_PREDICT_COLS)
+        if not hasattr(self, "_normalization_mode_fitted") or self._normalization_mode_fitted is None:
+            self._normalization_mode_fitted = "global"
+        '''
+        # REPLACE the two fallback lines with these:
+        if not (getattr(self, "_predict_cols_fitted", None)):
+            self._predict_cols_fitted = list(_PREDICT_COLS)
+        if not (getattr(self, "_normalization_mode_fitted", None)):
+            self._normalization_mode_fitted = "global"
+
+    #def fit_mem(self, df_train: pd.DataFrame) -> dict:
+    def fit_mem(self, df_train: pd.DataFrame, *,
+                    normalization_mode: Literal["global", "per_symbol"] = "global") -> dict:
+
         """
         Fit imputer+scaler+PCA on TRAIN ONLY. Persist artifacts and return pca_meta.
         """
@@ -159,20 +211,51 @@ class CoreFeaturePipeline:
         _assert_schema_tz_freq(df)
 
         df_with_features = self._calculate_base_features(df)
+
+        # === NEW: normalization branch ===
+        feats_df = df_with_features[_PREDICT_COLS].astype(np.float32)
+        if normalization_mode == "per_symbol":
+            # standardize within each symbol BEFORE PCA; pipeline will skip global scaler
+            df_norm = _zscore_per_symbol(df_with_features, _PREDICT_COLS)
+            feats_df = df_norm[_PREDICT_COLS].astype(np.float32)
+
         X = df_with_features[_PREDICT_COLS].astype(np.float32)
 
-        pipe = Pipeline(steps=[
+        '''pipe = Pipeline(steps=[
             ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
             ("scaler", StandardScaler()),
             ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
-        ])
-        Xp = pipe.fit_transform(X)
+        ])'''
+
+        # === NEW: build pipeline depending on normalization_mode ===
+        if normalization_mode == "global":
+            pipe = Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+                ("scaler", StandardScaler()),
+                ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+            ])
+        else:  # per_symbol
+            pipe = Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+                ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+            ])
+
+        Xp = pipe.fit_transform(feats_df)
+
+        #Xp = pipe.fit_transform(X)
+        log.info("[FE] normalization_mode=%s", normalization_mode)
 
         out_dir = self.parquet_root / "_fe_meta"
         out_dir.mkdir(parents=True, exist_ok=True)
+        #joblib.dump(pipe, out_dir / "pipeline.pkl")
+        #joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        #joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
         joblib.dump(pipe, out_dir / "pipeline.pkl")
-        joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        if "scaler" in pipe.named_steps:
+            joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
         joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
 
         pca = pipe.named_steps["pca"]
         cum_var = float(pca.explained_variance_ratio_.sum())
@@ -184,6 +267,7 @@ class CoreFeaturePipeline:
             "explained_variance_ratio_": pca.explained_variance_ratio_.astype(float).tolist(),
             "cum_var": cum_var,
             "predict_cols": list(_PREDICT_COLS),
+            "normalization_mode": normalization_mode,  # << NEW
             "created_at": pd.Timestamp.utcnow().isoformat(),
         }
         (out_dir / "pca_meta.json").write_text(pd.Series(pca_meta).to_json(), encoding="utf-8")
@@ -195,10 +279,8 @@ class CoreFeaturePipeline:
     # ------------------------------------------------------------------
     # In-memory variant – used by unit-tests & quick back-tests
     # ------------------------------------------------------------------
-    def run_mem(
-            self,
-            df_raw: pd.DataFrame,
-    ) -> tuple[pd.DataFrame, dict]:
+    def run_mem(self, df_raw: pd.DataFrame, *, normalization_mode: Literal["global","per_symbol"] = "global") -> tuple[pd.DataFrame, dict]:
+
         """
         Lightweight wrapper around `run()` that skips Arrow/Parquet loading
         and instead receives a *clean* DataFrame (with the same columns
@@ -208,6 +290,11 @@ class CoreFeaturePipeline:
 
         log.info("[FE] run_mem start – rows=%d", len(df_raw))
 
+        # Ensure trigger_ts exists (scanner may not have set it yet)
+        if "trigger_ts" not in df_raw.columns:
+            df_raw = df_raw.copy()
+            df_raw["trigger_ts"] = df_raw["timestamp"]
+
         # 1) Apply calculators sequentially
         df = df_raw.copy()
         _assert_schema_tz_freq(df)
@@ -215,6 +302,7 @@ class CoreFeaturePipeline:
         num_cols = ["open", "high", "low", "close", "volume"]
         df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
 
+        # Drop stray cols if present
         for col in ("Date", "Time"):
             if col in df.columns:
                 df.drop(columns=col, inplace=True)
@@ -231,14 +319,35 @@ class CoreFeaturePipeline:
 
         # ─── compute trigger context features ──────────────────────────────
         # assumes snapshot had 'trigger_ts' and 'volume_spike_pct'
-        df["time_since_trigger_min"] = (
-            df["timestamp"] - df["trigger_ts"]
-        ).dt.total_seconds().div(60)
-        df["volume_spike_pct"] = df["volume_spike_pct"]
+        #df["time_since_trigger_min"] = (
+        #    df["timestamp"] - df["trigger_ts"]
+        #).dt.total_seconds().div(60)
+
+        # REPLACE the raw subtraction with a guarded delta in seconds:
+        '''delta_sec = (
+            (df["timestamp"] - df["trigger_ts"]).dt.total_seconds().astype("float32")
+            if "trigger_ts" in df.columns
+            else pd.Series(0.0, index=df.index, dtype="float32")
+        )'''
+        # REPLACE the raw subtraction with tz-aligned version
+        if "trigger_ts" not in df.columns:
+            df["trigger_ts"] = df["timestamp"]
+
+        ts_utc = _as_utc(df["timestamp"])
+        tr_utc = _as_utc(df["trigger_ts"])
+        delta_sec = (ts_utc - tr_utc).dt.total_seconds().astype("float32")
+        #df["latency_sec"] = delta_sec
+
+        # Example: if you were previously doing
+        # df["latency_sec"] = (df["timestamp"] - df["trigger_ts"]).dt.total_seconds().astype("float32")
+        # then do:
+        #df["latency_sec"] = delta_sec
+
+        #df["volume_spike_pct"] = df["volume_spike_pct"]
 
         df_with_features = self._calculate_base_features(df_raw)
 
-
+        '''
         # Select only the features to use for PCA
         #features = df[_PREDICT_COLS].astype(np.float32)
         features = df_with_features[_PREDICT_COLS].astype(np.float32)
@@ -252,6 +361,33 @@ class CoreFeaturePipeline:
             ]
         )
         transformed = pipe.fit_transform(features)
+        '''
+
+        # === NEW: normalization branch ===
+        feats_df = df_with_features[_PREDICT_COLS].astype(np.float32)
+        if normalization_mode == "per_symbol":
+            df_norm = _zscore_per_symbol(df_with_features, _PREDICT_COLS)
+            feats_df = df_norm[_PREDICT_COLS].astype(np.float32)
+
+        # === NEW: build pipeline depending on normalization_mode ===
+        if normalization_mode == "global":
+            pipe = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+                    ("scaler", StandardScaler()),
+                    ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+                ]
+            )
+        else:
+            pipe = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+                    ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+                ]
+            )
+
+        transformed = pipe.fit_transform(feats_df)
+
 
         self._pipe = pipe
 
@@ -274,12 +410,22 @@ class CoreFeaturePipeline:
         # Save PCA/scaler as .npy (consistent with meta)
         out_dir = self.parquet_root / "_fe_meta"
         out_dir.mkdir(exist_ok=True)
+        #np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
+        #np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
+
         np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
-        np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
+        if "scaler" in pipe.named_steps:
+            np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
+
 
         # ALSO persist the actual fitted objects for eval-time transform (A2)
-        joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        #joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        #joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
+        if "scaler" in pipe.named_steps:
+            joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
         joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
 
         joblib.dump(pipe, out_dir / "pipeline.pkl")
 
@@ -294,6 +440,7 @@ class CoreFeaturePipeline:
 
         df_pca["symbol"] = df_with_features["symbol"].values
         df_pca["timestamp"] = df_with_features["timestamp"].values
+        log.info("[FE] normalization_mode=%s", normalization_mode)
 
         pca_meta = {
             "n_components": int(n_comp),
@@ -301,7 +448,19 @@ class CoreFeaturePipeline:
             "pca_path": str(out_dir / "pca_components.npy"),
             "scale_path": str(out_dir / "scaler_scale.npy"),
             "predict_cols": _PREDICT_COLS,
+            "normalization_mode": normalization_mode,  # << NEW
+
         }
+
+        # Persist meta so transform-only paths can recover predict_cols & normalization_mode
+        try:
+            (out_dir / "pca_meta.json").write_text(pd.Series({
+                **pca_meta,
+                "created_at": pd.Timestamp.utcnow().isoformat(),
+            }).to_json(), encoding="utf-8")
+        except Exception as e:
+            log.warning("[FE] Could not persist pca_meta.json: %s", e)
+
         #out["close"] = df["close"].values  # keep close so cluster builder can create y
 
         return df_pca, pca_meta
@@ -336,12 +495,24 @@ class CoreFeaturePipeline:
         df = df.ffill().bfill()
 
         # ---- Trigger-context features (robust defaults when scanner data absent) ----
-        if "trigger_ts" in df.columns:
+        '''if "trigger_ts" in df.columns:
             df["time_since_trigger_min"] = (
                     df["timestamp"] - df["trigger_ts"]
             ).dt.total_seconds().div(60)
         else:
             df["time_since_trigger_min"] = 0.0
+        '''
+
+        if "trigger_ts" not in df.columns:
+            df["trigger_ts"] = df["timestamp"]
+
+        ts_utc = _as_utc(df["timestamp"])
+        tr_utc = _as_utc(df["trigger_ts"])
+        delta_sec = (ts_utc - tr_utc).dt.total_seconds().astype("float32")
+        df["latency_sec"] = delta_sec
+
+        df["time_since_trigger_min"] = (delta_sec / 60.0).astype("float32")
+
 
         if "volume_spike_pct" not in df.columns:
             df["volume_spike_pct"] = 0.0
@@ -417,12 +588,92 @@ class CoreFeaturePipeline:
             raise RuntimeError("[FE] No fitted pipeline found. Call fit_mem() or provide artefacts.")
         df = df_raw.copy()
         _assert_schema_tz_freq(df)
+        # AFTER features/raw copy and BEFORE any use of 'trigger_ts'
+        if "trigger_ts" not in df_raw.columns:
+            df_raw = df_raw.copy()
+            df_raw["trigger_ts"] = df_raw["timestamp"]
 
         # 1) Apply all base feature calculations
         df_with_features = self._calculate_base_features(df_raw)
 
+        # --- Back-compat & schema alignment guard ---------------------------------
+        # Ensure both names exist so we can satisfy either schema
+        '''if "latency_sec" in df_with_features and "time_since_trigger_min" not in df_with_features:
+            df_with_features["time_since_trigger_min"] = (
+                    df_with_features["latency_sec"] / 60.0
+            ).astype("float32")
+
+        if "time_since_trigger_min" in df_with_features and "latency_sec" not in df_with_features:
+            df_with_features["latency_sec"] = (
+                    df_with_features["time_since_trigger_min"] * 60.0
+            ).astype("float32")
+        '''
+        # in transform_mem (after computing base features)
+        if "latency_sec" in df_with_features and "time_since_trigger_min" not in df_with_features:
+            df_with_features["time_since_trigger_min"] = (df_with_features["latency_sec"] / 60.0).astype("float32")
+        if "time_since_trigger_min" in df_with_features and "latency_sec" not in df_with_features:
+            df_with_features["latency_sec"] = (df_with_features["time_since_trigger_min"] * 60.0).astype("float32")
+
+        # Prefer the feature order the fitted pipeline was actually trained on
+        expected = list(getattr(self._pipe, "feature_names_in_", [])) \
+                   or list(getattr(self, "_predict_cols_fitted", [])) \
+                   or list(_PREDICT_COLS)  # final fallback only
+
+        # Add any missing expected cols with neutral defaults
+        for c in expected:
+            if c not in df_with_features:
+                df_with_features[c] = 0.0
+
+        # Drop extras and enforce dtype/order to match training
+        features = df_with_features[expected].astype(np.float32)
+        # --------------------------------------------------------------------------
+
+        # then:
+        transformed = self._pipe.transform(features)
+
+        # AFTER: df_with_features = self._calculate_base_features(df_raw)
+
+        # === NEW: respect the fitted normalization mode ===
+        #predict_cols = getattr(self, "_predict_cols_fitted", _PREDICT_COLS)
+        #predict_cols = getattr(self, "_predict_cols_fitted", None) or _PREDICT_COLS
+
+        # after df_with_features = self._calculate_base_features(df_raw)
+        predict_cols = getattr(self, "_predict_cols_fitted", None) or _PREDICT_COLS
+
+        # Back-compat guard: if minutes col is requested, synthesize it from latency_sec
+        if "time_since_trigger_min" in predict_cols and "time_since_trigger_min" not in df_with_features.columns:
+            if "latency_sec" in df_with_features.columns:
+                df_with_features["time_since_trigger_min"] = (
+                        df_with_features["latency_sec"] / 60.0
+                ).astype("float32")
+
+        features_df = df_with_features[predict_cols].astype(np.float32)
+
+        missing = [c for c in predict_cols if c not in df_with_features.columns]
+        if missing:
+            # Try code defaults once more (covers old metas)
+            fallback = _PREDICT_COLS
+            missing_fb = [c for c in fallback if c not in df_with_features.columns]
+            if not missing_fb:
+                predict_cols = fallback
+            else:
+                raise RuntimeError(
+                    "[FE] Transform columns missing from dataset.\n"
+                    f"  requested: {predict_cols}\n"
+                    f"  missing:   {missing}\n"
+                    f"  available: {sorted(df_with_features.columns.tolist())[:60]}..."
+                )
+
+        norm_mode = getattr(self, "_normalization_mode_fitted", "global")
+        if norm_mode == "per_symbol":
+            df_norm = _zscore_per_symbol(df_with_features, list(predict_cols))
+            features_df = df_norm[predict_cols].astype(np.float32)
+
+        # Use features_df for transform in the expected order
+        features = features_df
+
         # 2) Select only the features to use for PCA
-        features = df_with_features[_PREDICT_COLS].astype(np.float32)
+        #features = df_with_features[_PREDICT_COLS].astype(np.float32)
 
         # 3) Transform using the fitted pipeline
         transformed = self._pipe.transform(features)
@@ -438,10 +689,12 @@ class CoreFeaturePipeline:
     # ---------------------------------------------------------------------
     @timeit("pipeline‑run")
     def run(
-        self,
-        symbols: List[str],
-        start: _dt.date,
-        end: _dt.date,
+            self,
+            symbols: List[str],
+            start: _dt.date,
+            end: _dt.date,
+            *,
+            normalization_mode: Literal["global", "per_symbol"] = "global",
     ) -> Tuple[pd.DataFrame, dict]:
         """Return features DataFrame + PCA metadata.
         Outputs ONLY pca_1 … pca_k (+ symbol, timestamp), NOT raw features.
@@ -449,7 +702,8 @@ class CoreFeaturePipeline:
 
         logger.info("Loading Parquet slice …")
         try:
-            dataset = load_parquet_dataset(self.parquet_root)
+            dataset = open_parquet_dataset(self.parquet_root)
+
         except (FileNotFoundError, pa.ArrowInvalid) as exc:
             raise RuntimeError(f"Failed to open dataset: {exc}") from exc
 
@@ -461,6 +715,7 @@ class CoreFeaturePipeline:
             (ds.field("symbol").isin(symbols))
         )
         arrow_table = dataset.to_table(filter=date_filter)
+
         if arrow_table.num_rows == 0:
             raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
 
@@ -489,6 +744,32 @@ class CoreFeaturePipeline:
         logger.info("After load:        %d rows", len(df))
         df = self._calculate_base_features(df)
         logger.info("After base feats:  %d rows", len(df))
+
+        # === NEW: normalization branch ===
+        feats_df = df[_PREDICT_COLS].astype(np.float32)
+        if normalization_mode == "per_symbol":
+            df_norm = _zscore_per_symbol(df, _PREDICT_COLS)
+            feats_df = df_norm[_PREDICT_COLS].astype(np.float32)
+
+        # === NEW: build pipeline depending on normalization_mode ===
+        if normalization_mode == "global":
+            pipe = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+                    ("scaler", StandardScaler()),
+                    ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+                ]
+            )
+        else:
+            pipe = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy=settings.impute_strategy)),
+                    ("pca", PCA(n_components=settings.pca_variance, svd_solver="full")),
+                ]
+            )
+
+        transformed = pipe.fit_transform(feats_df)
+        log.info("[FE] normalization_mode=%s", normalization_mode)
 
         _assert_schema_tz_freq(df)
 
@@ -548,6 +829,7 @@ class CoreFeaturePipeline:
                 "cum_var": float(pca.explained_variance_ratio_.sum()),
                 "predict_cols": list(_PREDICT_COLS),
                 "created_at": pd.Timestamp.utcnow().isoformat(),
+                "normalization_mode": normalization_mode,
             }
             return out.reset_index(drop=True), pca_meta
 
@@ -570,12 +852,23 @@ class CoreFeaturePipeline:
 
         out_dir = self.parquet_root / "_fe_meta"
         out_dir.mkdir(exist_ok=True)
-        np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
-        np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
+        #np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
+        #np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
 
         # ALSO persist the actual fitted objects for eval-time transform (A2)
-        joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        #joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
+        #joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
+
+        np.save(out_dir / "pca_components.npy", pipe.named_steps["pca"].components_)
+        if "scaler" in pipe.named_steps:
+            np.save(out_dir / "scaler_scale.npy", pipe.named_steps["scaler"].scale_)
+
+        if "scaler" in pipe.named_steps:
+            joblib.dump(pipe.named_steps["scaler"], out_dir / "scaler.pkl")
         joblib.dump(pipe.named_steps["pca"], out_dir / "pca.pkl")
+
+
         # ADD THIS LINE to save the whole pipeline object
         joblib.dump(pipe, out_dir / "pipeline.pkl")
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 # after: from prediction_engine.calibration import load_calibrator, calibrate_isotonic
-from ledger import PortfolioLedger, equity_curve_from_trades
+#from ledger import PortfolioLedger, equity_curve_from_trades
 import glob
 
 import pyarrow.dataset as ds
@@ -32,9 +32,27 @@ from typing import Any, Dict, List
 from prediction_engine.testing_validation.walkforward import WalkForwardRunner
 
 from prediction_engine.calibration import load_calibrator, map_mu_to_prob
-
-#import pandas as pd
-
+# Optional: only needed when building a portfolio equity curve in Phase-4.
+# Keep import lazy-safe so tests can import this module without the ledger package.
+try:
+    from ledger import PortfolioLedger, equity_curve_from_trades  # type: ignore
+except Exception:  # ModuleNotFoundError or anything else
+    PortfolioLedger = None  # not used in this file; stub to avoid NameError
+    def equity_curve_from_trades(trades_df):
+        """
+        Minimal fallback: build an equity curve from realized PnL if present.
+        Returns a Pandas Series indexed by exit_ts with cumulative equity (starting at 0).
+        Used only in Phase-4; tests that import this module won't touch it.
+        """
+        import pandas as _pd
+        if not isinstance(trades_df, _pd.DataFrame):
+            return _pd.Series(dtype=float)
+        if "exit_ts" not in trades_df.columns or "realized_pnl" not in trades_df.columns:
+            return _pd.Series(dtype=float)
+        df = trades_df[["exit_ts", "realized_pnl"]].copy()
+        df["exit_ts"] = _pd.to_datetime(df["exit_ts"], utc=True, errors="coerce")
+        df = df.dropna(subset=["exit_ts", "realized_pnl"]).sort_values("exit_ts")
+        return df.set_index("exit_ts")["realized_pnl"].cumsum().rename("equity")
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel  # NEW
@@ -54,6 +72,11 @@ from prediction_engine.calibration import load_calibrator, calibrate_isotonic  #
 # ─── global run metadata ─────────────────────────────────────────────
 import uuid, subprocess, datetime as dt
 
+
+
+
+
+
 from universes import StaticUniverse, FileUniverse
 
 RUN_ID = uuid.uuid4().hex[:8]          # short random id
@@ -69,6 +92,15 @@ RUN_META = {
     "git_sha": GIT_SHA,
     "started": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
 }
+
+# AFTER: RUN_META = {...}
+# ---- Step-3: mode toggle for backtest runner ----
+BACKTEST_MODE: str = "CLI"  # or "NOCLI" to auto-run all symbols across entire time range
+
+from feature_engineering.pipelines.dataset_loader import load_parquet_dataset  # reuse loader types
+import pyarrow.dataset as ds
+
+
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -87,6 +119,68 @@ def discover_parquet_symbols(parquet_root: Path) -> list[str]:
         if p.is_dir():
             syms.append(p.name.split("=", 1)[-1].upper())
     return sorted(set(syms))
+
+
+# AFTER: def discover_parquet_symbols(parquet_root: Path) -> list[str]:
+def _discover_time_bounds_all(input_root: Path) -> tuple[pd.Timestamp, pd.Timestamp]:
+    dataset = ds.dataset(str(input_root), format="parquet", partitioning="hive", exclude_invalid_files=True)
+    scanner = dataset.scanner(columns=["timestamp"])
+    tbl = scanner.to_table()
+    s = pd.to_datetime(tbl.column("timestamp").to_pandas(), utc=True)
+    return s.min(), s.max()
+
+
+# AFTER: def _discover_time_bounds_all(input_root: Path) -> tuple[pd.Timestamp, pd.Timestamp]:
+from dataclasses import dataclass
+from typing import List, Tuple, Literal
+
+@dataclass(frozen=True)
+class ResolvedUniverseWindow:
+    symbols: List[str]
+    start: str
+    end: str
+    partitions: str  # e.g., "BBY:2, RRC:1"
+
+def _partition_counts_str(input_root: Path, symbols: List[str]) -> str:
+    parts = []
+    for s in symbols:
+        p = input_root / f"symbol={s}"
+        n = len(list(p.glob("year=*/month=*")))
+        parts.append((s, n))
+    parts.sort(key=lambda x: x[0])
+    return ", ".join([f"{s}:{n}" for s, n in parts])
+
+def resolve_universe_window_for_tests(
+    parquet_root: str | Path,
+    cfg: dict,
+    mode: Literal["CLI","NOCLI"] = "CLI",
+) -> ResolvedUniverseWindow:
+    """
+    Pure, side-effect-free resolver used by tests to check Step-3 wiring.
+    Decides symbols/start/end the same way the runner does, and returns a partition summary.
+    Does NOT kick off a backtest.
+    """
+    root = Path(parquet_root)
+    if mode.upper() == "NOCLI":
+        syms = discover_parquet_symbols(root)
+        start_ts, end_ts = _discover_time_bounds_all(root)
+        start_str = start_ts.strftime("%Y-%m-%d")
+        end_str   = end_ts.strftime("%Y-%m-%d")
+    else:
+        # CLI mode: take what's in cfg if provided, else discover symbols; keep dates if provided
+        syms = cfg.get("universe").symbols if hasattr(cfg.get("universe"), "symbols") else cfg.get("symbols")
+        if not syms:
+            syms = discover_parquet_symbols(root)
+        start_str = cfg.get("start") or "1900-01-01"
+        end_str   = cfg.get("end")   or "2100-01-01"
+
+    return ResolvedUniverseWindow(
+        symbols=list(syms),
+        start=start_str,
+        end=end_str,
+        partitions=_partition_counts_str(root, syms),
+    )
+
 
 
 from typing import Tuple
@@ -528,6 +622,16 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
     log = logging.getLogger("backtest")
+
+    # AFTER: log = logging.getLogger("backtest")
+    if BACKTEST_MODE.upper() == "NOCLI":
+        parquet_root = _resolve_path(cfg.get("parquet_root", "parquet"))
+        all_syms = discover_parquet_symbols(parquet_root)
+        start_ts, end_ts = _discover_time_bounds_all(parquet_root)
+        cfg = {**cfg, "universe": StaticUniverse(all_syms),
+               "start": start_ts.strftime("%Y-%m-%d"),
+               "end": end_ts.strftime("%Y-%m-%d")}
+        print(f"[Phase-3] NOCLI mode: {len(all_syms)} symbols, {cfg['start']} → {cfg['end']}")
 
     # Resolve universe → list[str]
     symbols_requested = _resolve_universe(cfg.get("universe", []))

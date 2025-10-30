@@ -8,9 +8,9 @@
     "test_end": "1998-10-31 23:57:00"
   },
   "gates": {
-    "p_gate": 0.028795811518324606,
-    "full_p": 0.028795811518324606,
-    "mode": "widened"
+    "p_gate": 0.55,
+    "full_p": 0.65,
+    "mode": "normal"
   },
   "prepro_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\fold_01\\prepro",
   "ev_artifacts": {
