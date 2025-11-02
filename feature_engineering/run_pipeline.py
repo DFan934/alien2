@@ -12,6 +12,7 @@ You may still override paths or symbol/date subsets with flags, but nothing
 is required.
 """
 from __future__ import annotations
+from universes import resolve_universe, UniverseError
 
 import argparse
 from pathlib import Path
@@ -102,6 +103,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--normalization", choices=["global", "per_symbol"], default="global",
                    help="Feature normalization mode (Step-2): global or per_symbol")
 
+    p.add_argument(
+        "--universe",
+        help="Universe definition (comma list like 'RRC,BBY' or a path to .txt/.csv or a JSON dict for PIT). "
+             "If omitted, uses --symbols or auto-discovers all symbols under input_root."
+    )
+
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -113,7 +120,7 @@ def main() -> None:
     output_root  = Path(args.output_root).expanduser().resolve()
 
     # AFTER: input_root = ..., output_root = ...
-    if PIPELINE_MODE.upper() == "NOCLI":
+    '''if PIPELINE_MODE.upper() == "NOCLI":
         # Run **all symbols** and **entire time range**
         symbols = _discover_symbols(input_root)
         start_ts, end_ts = _discover_time_bounds(input_root)
@@ -126,7 +133,53 @@ def main() -> None:
         end_str = args.end or "2100-01-01"
         normalization = args.normalization
 
-    symbols = args.symbols or _discover_symbols(input_root)
+    symbols = args.symbols or _discover_symbols(input_root)'''
+
+    if PIPELINE_MODE.upper() == "NOCLI":
+        # Run **all symbols** over **entire** time range unless a universe is explicitly provided.
+        if args.universe:
+            # Build a tiny CONFIG and resolve via our single entry point
+            cfg = {
+                "universe": args.universe if not ("," in args.universe) else [s.strip() for s in
+                                                                              args.universe.split(",")],
+                "universe_max_size": 10000,
+            }
+            try:
+                symbols = resolve_universe(cfg, as_of=None)
+            except NotImplementedError as e:
+                raise RuntimeError(
+                    "SP500Universe(as_of=...) not implemented yet in Phase 2.x; use Static/File universe.") from e
+            except UniverseError as e:
+                raise RuntimeError(f"Invalid --universe: {e}") from e
+        else:
+            symbols = _discover_symbols(input_root)
+
+        start_ts, end_ts = _discover_time_bounds(input_root)
+        start_str, end_str = start_ts.isoformat(), end_ts.isoformat()
+        logger.info("[Phase-3] NOCLI mode: %d symbols, %s → %s", len(symbols), start_str, end_str)
+        normalization = "per_symbol"  # default for NOCLI, can be changed
+    else:
+        if args.universe:
+            cfg = {
+                "universe": args.universe if not ("," in args.universe) else [s.strip() for s in
+                                                                              args.universe.split(",")],
+                "universe_max_size": 10000,
+                "as_of": None,
+            }
+            try:
+                symbols = resolve_universe(cfg, as_of=cfg.get("as_of"))
+            except NotImplementedError as e:
+                raise RuntimeError(
+                    "SP500Universe(as_of=...) not implemented yet in Phase 2.x; use Static/File universe.") from e
+            except UniverseError as e:
+                raise RuntimeError(f"Invalid --universe: {e}") from e
+        else:
+            symbols = args.symbols or _discover_symbols(input_root)
+
+        start_str = args.start or "1900-01-01"
+        end_str = args.end or "2100-01-01"
+        normalization = args.normalization
+
     logger.info("Discovered %d symbols", len(symbols))
     logger.info("[Universe] %d symbols", len(symbols))
     logger.info("[Window]   %s → %s", start_str, end_str)

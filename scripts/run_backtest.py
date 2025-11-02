@@ -10,6 +10,7 @@ Outputs
 • Console summary of cumulative P&L + risk metrics
 """
 from __future__ import annotations
+from data_ingestion.manifest import summarize_partitions_fast
 
 import asyncio
 # after: from prediction_engine.calibration import load_calibrator, calibrate_isotonic
@@ -77,14 +78,53 @@ import uuid, subprocess, datetime as dt
 
 
 
-from universes import StaticUniverse, FileUniverse
+#from universes import StaticUniverse, FileUniverse
+#from universes import resolve_universe, UniverseError
+
+from universes.providers import StaticUniverse, FileUniverse
+import universes.providers as U
+
+
+import hashlib, json
+
+def _stable_universe_hash(symbols: list[str]) -> str:
+    """Stable SHA1 over sorted symbols; safe for logs & meta."""
+    payload = json.dumps(sorted([str(s).upper() for s in symbols]), separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+def _universe_source_label(cfg: dict) -> str:
+    u = cfg.get("universe")
+    try:
+        # StaticUniverse / FileUniverse instances (providers module)
+        if isinstance(u, U.StaticUniverse):
+            return "static:list"
+        if isinstance(u, U.FileUniverse):
+            return f"file:{getattr(u, 'path', '(unknown)')}"
+        # raw shapes users might pass
+        if isinstance(u, (list, tuple)):
+            return "static:list"
+        if isinstance(u, str):
+            return f"file:{u}"
+        if isinstance(u, dict) and u.get("type", "").lower() == "sp500":
+            return f"sp500:{u.get('as_of','')}"
+    except Exception:
+        pass
+    return "unknown"
+
+
 
 RUN_ID = uuid.uuid4().hex[:8]          # short random id
 try:
-    GIT_SHA = subprocess.check_output(
+    '''GIT_SHA = subprocess.check_output(
         ["git", "rev-parse", "--short", "HEAD"],
         cwd=Path(__file__).parents[2],  # repo root
+    ).decode().strip()'''
+    GIT_SHA = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=Path(__file__).parents[2],
+        stderr=subprocess.DEVNULL,
     ).decode().strip()
+
 except Exception:
     GIT_SHA = "n/a"
 RUN_META = {
@@ -262,7 +302,7 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
     return decisions_path, trades_path
 
 
-def _resolve_universe(obj) -> List[str]:
+'''def _resolve_universe(obj) -> List[str]:
     # Accept StaticUniverse, FileUniverse, or a plain list of strings
     if isinstance(obj, StaticUniverse):
         return obj.list()
@@ -271,6 +311,11 @@ def _resolve_universe(obj) -> List[str]:
     if isinstance(obj, (list, tuple)):
         return sorted({str(s).strip().upper() for s in obj})
     raise TypeError(f"Unsupported universe type: {type(obj)}")
+'''
+
+
+
+
 
 
 def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
@@ -521,7 +566,14 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
 
     # 2) Walk-forward runner (unchanged, but pass symbol)
-    resolved_parquet_root = _resolve_path(cfg["parquet_root"])
+    #resolved_parquet_root = _resolve_path(cfg["parquet_root"])
+
+    try:
+        parquet_root_value = cfg["parquet_root"]
+    except KeyError as e:
+        # Make tests (and callers) get a controlled failure rather than KeyError
+        raise RuntimeError("Missing required config: 'parquet_root'") from e
+    resolved_parquet_root = _resolve_path(parquet_root_value)
 
     # --- Phase 3: ensure fresh artifacts for this symbol ---
     am = ArtifactManager(
@@ -634,9 +686,90 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print(f"[Phase-3] NOCLI mode: {len(all_syms)} symbols, {cfg['start']} → {cfg['end']}")
 
     # Resolve universe → list[str]
-    symbols_requested = _resolve_universe(cfg.get("universe", []))
+    #symbols_requested = _resolve_universe(cfg.get("universe", []))
+
+    # Resolve universe → list[str] (Step-2.2 single entry point)
+    '''try:
+        symbols_requested = resolve_universe(cfg, as_of=cfg.get("as_of"))
+    except NotImplementedError as e:
+        # Clean error if someone asks for SP500 PIT before it exists
+        raise RuntimeError("SP500Universe(as_of=...) not implemented in Phase 2. Use Static/File universe.") from e
+    except UniverseError as e:
+        raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
+    '''
+
+    # Resolve universe → list[str] (Step-2.2 single entry point)
+    try:
+        symbols_requested = U.resolve_universe(cfg, as_of=cfg.get("as_of"))
+    except NotImplementedError as e:
+        # Clean error if someone asks for SP500 PIT before it exists
+        raise RuntimeError("SP500Universe(as_of=...) not implemented in Phase 2. Use Static/File universe.") from e
+    except U.UniverseError as e:
+        #raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
+        raise RuntimeError("Universe is empty: Resolved universe is empty")
+
+    print(f"[Universe] size = {len(symbols_requested)} | {symbols_requested}")
+
+    # --- Phase-2.5: provenance header -------------------------------------------
+    uhash = _stable_universe_hash(symbols_requested)
+    usrc = _universe_source_label(cfg)
+    win_s, win_e = str(cfg["start"]), str(cfg["end"])
+    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+
+    print(f"[Run] universe_hash={uhash} | source={usrc} | window={win_s}→{win_e} | artifacts={arte_root}")
+
+    #if not symbols_requested:
+    #    raise ValueError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
+
+    # --- Phase-2.6: guardrails ---------------------------------------------------
     if not symbols_requested:
-        raise ValueError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
+        raise RuntimeError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
+
+    max_size = int(cfg.get("universe_max_size", 10_000))
+    if len(symbols_requested) > max_size:
+        raise RuntimeError(
+            f"Universe too large: {len(symbols_requested)} > {max_size}. "
+            "Lower CONFIG['universe_max_size'] or reduce the universe."
+        )
+
+    # Optional but recommended: fast coverage precheck (zero parquet reads)
+    if bool(cfg.get("strict_universe", False)):
+        rep = summarize_partitions_fast(
+            cfg.get("parquet_root", "parquet"),
+            symbols_requested,
+            cfg["start"],
+            cfg["end"],
+        )
+        ratio = rep["coverage"]["ratio"]
+        need = float(cfg.get("universe_min_coverage", 0.90))
+        if ratio < need:
+            have, tot = rep["coverage"]["have_data"], rep["coverage"]["total"]
+            empties = rep["coverage"]["empty_symbols"]
+            raise RuntimeError(
+                f"Coverage {ratio * 100:.1f}% ({have}/{tot}) below required {need * 100:.0f}% "
+                f"for window {cfg['start']}–{cfg['end']}. "
+                f"Empty symbols: {empties}"
+            )
+    else:
+        # Soft warning if provided
+        try:
+            rep = summarize_partitions_fast(
+                cfg.get("parquet_root", "parquet"),
+                symbols_requested,
+                cfg["start"],
+                cfg["end"],
+            )
+            ratio = rep["coverage"]["ratio"]
+            need = float(cfg.get("universe_min_coverage", 0.90))
+            if ratio < need:
+                have, tot = rep["coverage"]["have_data"], rep["coverage"]["total"]
+                empties = rep["coverage"]["empty_symbols"]
+                print(f"[WARN] Coverage {ratio * 100:.1f}% ({have}/{tot}) < {need * 100:.0f}% "
+                      f"for window {cfg['start']}–{cfg['end']}. Empty: {empties}")
+        except Exception:
+            # If manifest scan isn’t available for some reason, continue
+            pass
+    # ---------------------------------------------------------------------------
 
     # Intersect with symbols present in parquet
     project_root = Path(__file__).resolve().parents[2]  # repo root
@@ -669,7 +802,16 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     for sym in symbols:
         sym_cfg = {**cfg, "symbol": sym}  # pass symbol to runner
         log.info(f"=== Running backtest for {sym} ===")
-        res = await _run_one_symbol(sym, sym_cfg)
+        #res = await _run_one_symbol(sym, sym_cfg)
+        for sym in symbols:
+            try:
+                res = await _run_one_symbol(sym, {**cfg, "symbol": sym})
+            except RuntimeError:
+                raise
+            except Exception as e:
+                # keep header output stable/once and fail in a controlled way
+                raise RuntimeError(f"Backtest aborted for {sym}") from e
+
         results.append(res)
 
 

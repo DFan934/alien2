@@ -210,6 +210,12 @@ class CoreFeaturePipeline:
         df = df_train.copy()
         _assert_schema_tz_freq(df)
 
+        # Phase-2.4: explicitly tolerate missing days per symbol.
+        # If a symbol has zero rows in the slice, we simply don't see it here.
+        # If a symbol is present but has gaps, calculators will operate on what's there.
+        if df.empty:
+            raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
+
         df_with_features = self._calculate_base_features(df)
 
         # === NEW: normalization branch ===
@@ -298,6 +304,14 @@ class CoreFeaturePipeline:
         # 1) Apply calculators sequentially
         df = df_raw.copy()
         _assert_schema_tz_freq(df)
+
+        # Phase-2.4: explicitly tolerate missing days per symbol.
+        # If a symbol has zero rows in the slice, we simply don't see it here.
+        # If a symbol is present but has gaps, calculators will operate on what's there.
+        if df.empty:
+            raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
+
+
 
         num_cols = ["open", "high", "low", "close", "volume"]
         df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
@@ -588,6 +602,13 @@ class CoreFeaturePipeline:
             raise RuntimeError("[FE] No fitted pipeline found. Call fit_mem() or provide artefacts.")
         df = df_raw.copy()
         _assert_schema_tz_freq(df)
+
+        # Phase-2.4: explicitly tolerate missing days per symbol.
+        # If a symbol has zero rows in the slice, we simply don't see it here.
+        # If a symbol is present but has gaps, calculators will operate on what's there.
+        if df.empty:
+            raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
+
         # AFTER features/raw copy and BEFORE any use of 'trigger_ts'
         if "trigger_ts" not in df_raw.columns:
             df_raw = df_raw.copy()
@@ -722,7 +743,22 @@ class CoreFeaturePipeline:
         df = arrow_table.to_pandas()
         _assert_schema_tz_freq(df)
 
+        # Phase-2.4: explicitly tolerate missing days per symbol.
+        # If a symbol has zero rows in the slice, we simply don't see it here.
+        # If a symbol is present but has gaps, calculators will operate on what's there.
+        if df.empty:
+            raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
+
         logger.info("Loaded %d rows, columns: %s", len(df), list(df.columns))
+
+        # Phase-2.4: per-symbol coverage snapshot for this slice
+        per_sym_counts = df.groupby("symbol", as_index=False)["timestamp"].count().rename(columns={"timestamp": "rows"})
+        try:
+            # Compact "sym:rows" line for quick eyeballing
+            snap = ", ".join([f"{r.symbol}:{int(r.rows)}" for r in per_sym_counts.itertuples()])
+            logger.info("[Slice] rows by symbol → %s", snap)
+        except Exception:
+            pass
 
         # 2) Apply calculators sequentially.
         '''logger.info("After load:        %d rows", len(df))
@@ -772,6 +808,12 @@ class CoreFeaturePipeline:
         log.info("[FE] normalization_mode=%s", normalization_mode)
 
         _assert_schema_tz_freq(df)
+
+        # Phase-2.4: explicitly tolerate missing days per symbol.
+        # If a symbol has zero rows in the slice, we simply don't see it here.
+        # If a symbol is present but has gaps, calculators will operate on what's there.
+        if df.empty:
+            raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
 
         # If a pre-fitted pipeline exists (loaded in __init__), do a transform-only run to avoid leakage.
         if hasattr(self, "_pipe") and self._pipe is not None:
@@ -928,6 +970,12 @@ class CoreFeaturePipeline:
         arrow = table.to_table(filter=filt)
         df = arrow.to_pandas(types_mapper=pd.ArrowDtype)
         _assert_schema_tz_freq(df)
+
+        # Phase-2.4: explicitly tolerate missing days per symbol.
+        # If a symbol has zero rows in the slice, we simply don't see it here.
+        # If a symbol is present but has gaps, calculators will operate on what's there.
+        if df.empty:
+            raise ValueError("Selected slice returned zero rows – adjust dates/symbols.")
 
         df_feat = self._calculate_base_features(df)
         X = df_feat[_PREDICT_COLS].astype(np.float32)

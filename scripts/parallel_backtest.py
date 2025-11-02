@@ -8,6 +8,9 @@ from typing import Dict, List
 
 import dask.dataframe as dd
 import pandas as pd
+from universes import resolve_universe, UniverseError
+import universes.providers as U
+from pathlib import Path
 
 from scanner.detectors import GapDetector, HighRVOLDetector, CompositeDetector
 from scanner.backtest_loop import BacktestScannerLoop
@@ -20,7 +23,10 @@ from scanner.utils import time_align_minute
 CONFIG: Dict[str, object] = {
     # Raw hive-partitioned minute parquet dataset (symbol=…/year=…/month=…)
     "parquet_root": "parquet/minute_bars",
-    "symbols": ["RRC"],
+    #"symbols": ["RRC"],
+    "universe": ["RRC"],  # OR "path/to/universe.csv" OR {"type":"sp500","as_of":"YYYY-MM-DD"}
+    "universe_max_size": 5000,
+
     "start": "1998-08-26",
     "end":   "1998-11-26",
 
@@ -59,8 +65,26 @@ def main(cfg: Dict[str, object]) -> None:
     log = logging.getLogger("parallel_backtest")
 
     root     = Path(cfg["parquet_root"])
-    symbols  = cfg["symbols"]
+    #symbols  = cfg["symbols"]
+
+    try:
+        #symbols = resolve_universe(cfg, as_of=cfg.get("as_of"))
+        symbols = U.resolve_universe(cfg, as_of=cfg.get("as_of"))
+
+    except NotImplementedError as e:
+        raise RuntimeError("SP500Universe(as_of=...) not implemented in Phase 2. Use Static/File universe.") from e
+    except UniverseError as e:
+        raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
+
+    print(f"[Universe] size = {len(symbols)} | {symbols}")
+
     start, end = cfg["start"], cfg["end"]
+
+    # ---- Phase-2.2 acceptance: bail early if no parquet exists (test expects RuntimeError)
+    parquet_root = Path(cfg.get("parquet_root", "parquet"))
+    # If there are no parquet files at all, raise before Dask tries to scan
+    if not parquet_root.exists() or not any(parquet_root.rglob("*.parquet")):
+        raise RuntimeError(f"No parquet files found under {parquet_root!s}")
 
     # 1) lazy-load slice with Dask ------------------------------------------------
     log.info("Loading parquet slice via Dask …")

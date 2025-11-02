@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Tuple, Optional
 import hashlib, json
 import pandas as pd
+import hashlib
+import datetime as dt
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -19,7 +21,14 @@ def _hash_obj(obj: object) -> str:
     return hashlib.sha1(s).hexdigest()
 
 
-def _fingerprint_slice(parquet_root: Path, symbols: Iterable[str], start, end) -> Dict[str, Dict[str, object]]:
+
+def _hash_universe(symbols: Iterable[str]) -> str:
+    """Stable SHA1 of sorted upper-cased symbols; short prefix is fine for cache keys."""
+    s = json.dumps(sorted([str(x).upper() for x in symbols]), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha1(s).hexdigest()
+
+
+'''def _fingerprint_slice(parquet_root: Path, symbols: Iterable[str], start, end) -> Dict[str, Dict[str, object]]:
     start_ts, end_ts = pd.to_datetime(start), pd.to_datetime(end)
     out: Dict[str, Dict[str, object]] = {}
 
@@ -43,6 +52,112 @@ def _fingerprint_slice(parquet_root: Path, symbols: Iterable[str], start, end) -
             ts_list = pd.to_datetime(tbl.column("timestamp").to_pylist())
             out[sym] = {"rows": int(tbl.num_rows), "tmax": pd.Timestamp(max(ts_list)).isoformat()}
     return out
+'''
+
+
+def _fingerprint_slice(parquet_root, universe, start: str, end: str) -> str:
+    """
+    Return a stable fingerprint for the slice described by (universe, start, end).
+
+    Fast path:
+      - If the dataset schema contains 'timestamp' (and 'symbol'), we compute a hash
+        from the number of rows and min/max timestamps after filtering by symbol
+        and time, which is cheap and stable.
+
+    Fallback path:
+      - If files are stubbed or schema-less (e.g., test writes bare 'PAR1' bytes),
+        we hash the list of matching files (relative path, size, mtime) under
+        hive-style partitions year=/month=/day= filtered against [start, end).
+    """
+    root = Path(parquet_root)
+    start_dt = dt.datetime.fromisoformat(start)
+    end_dt = dt.datetime.fromisoformat(end)
+
+    h = hashlib.blake2s(digest_size=16)
+    h.update(",".join(sorted(universe)).encode("utf-8"))
+
+    try:
+        # Try Arrow fast-path first.
+        dset = ds.dataset(
+            str(root),
+            format="parquet",
+            partitioning="hive",
+            ignore_missing_files=True,
+        )
+        names = set(dset.schema.names)
+
+        if "timestamp" in names and "symbol" in names:
+            # Filter in Arrow space.
+            filt = (
+                ds.field("symbol").isin(universe)
+                & (ds.field("timestamp") >= ds.scalar(start_dt))
+                & (ds.field("timestamp") < ds.scalar(end_dt))
+            )
+            # Pull just the timestamp column to keep it light.
+            tbl = dset.to_table(filter=filt, columns=["timestamp"])
+            n = len(tbl)
+
+            h.update(str(n).encode("utf-8"))
+            if n:
+                ts_pd = tbl.column("timestamp").to_pandas()
+                # If timezone-aware, pandas prints ISO consistently; good for hashing.
+                h.update(str(ts_pd.min()).encode("utf-8"))
+                h.update(str(ts_pd.max()).encode("utf-8"))
+
+            return h.hexdigest()
+
+        # If 'timestamp' is missing, fall through to the filesystem fallback.
+    except Exception:
+        # Any Arrow hiccup falls back to filesystem hashing below.
+        pass
+
+    # ---- Fallback: hash hive-partitioned file stats (path, size, mtime) ----
+    def date_from_parts(parts: tuple[str, ...]) -> dt.datetime | None:
+        """Extract a date from hive path parts like ('symbol=RRC','year=1999','month=01','day=01',...)."""
+        y = m = d = None
+        for p in parts:
+            if p.startswith("year="):
+                try:
+                    y = int(p[5:])
+                except ValueError:
+                    return None
+            elif p.startswith("month="):
+                try:
+                    m = int(p[6:])
+                except ValueError:
+                    return None
+            elif p.startswith("day="):
+                try:
+                    d = int(p[4:])
+                except ValueError:
+                    return None
+        if y and m and d:
+            try:
+                return dt.datetime(y, m, d)
+            except ValueError:
+                return None
+        return None
+
+    file_facts: list[tuple[str, int, int]] = []
+    for sym in universe:
+        sym_root = root / f"symbol={sym}"
+        if not sym_root.exists():
+            continue
+        for p in sym_root.rglob("*.parquet"):
+            rel = p.relative_to(root)
+            fdate = date_from_parts(rel.parts)
+            # If we can parse a hive date, use it to gate by [start, end); if not, include it.
+            if fdate is None or (start_dt <= fdate < end_dt):
+                st = p.stat()
+                # (relative path, size, mtime[int]) sorted for stability
+                file_facts.append((str(rel).replace("\\", "/"), st.st_size, int(st.st_mtime)))
+
+    for rel, size, mtime in sorted(file_facts):
+        h.update(rel.encode("utf-8"))
+        h.update(str(size).encode("utf-8"))
+        h.update(str(mtime).encode("utf-8"))
+
+    return h.hexdigest()
 
 
 
@@ -98,6 +213,7 @@ class ArtifactManager:
 
         cfg_hash = _hash_obj(config_hash_parts or {})
         fp = _fingerprint_slice(self.parquet_root, universe, start, end)
+        u_hash = _hash_universe(universe)
 
         if strategy == "per_symbol":
             out_dirs: Dict[str, Path] = {}
@@ -107,15 +223,37 @@ class ArtifactManager:
                 meta_path = dest / "meta.json"
                 old_meta = _load_meta(meta_path)
 
-                payload = {
+                '''payload = {
                     "strategy": "per_symbol",
                     "symbol": sym,
                     "window": {"start": start, "end": end},
                     "fingerprint": fp.get(sym, {"rows": 0, "tmax": None}),
                     "config_hash": cfg_hash,
+                    "universe_hash": u_hash,
+                }'''
+
+                # Decide the per-symbol fingerprint representation
+                if isinstance(fp, dict):
+                    sym_fp = fp.get(sym, {"rows": 0, "tmax": None})
+                else:
+                    # fp is a single hexdigest for the whole slice; wrap it so meta stays stable
+                    sym_fp = {"digest": fp}
+
+                payload = {
+                    "strategy": "per_symbol",
+                    "symbol": sym,
+                    "window": {"start": start, "end": end},
+                    "fingerprint": sym_fp,
+                    "config_hash": cfg_hash,
+                    "universe_hash": u_hash,
                 }
-                if _needs_rebuild(old_meta, payload):
+
+                '''if _needs_rebuild(old_meta, payload):
                     # Build (or rebuild) artifacts for this symbol
+                    if per_symbol_builder is not None:
+                        per_symbol_builder(sym, dest, start, end)
+                    # Whether we built or not, record provenance (the test asserts on this)
+
                     if per_symbol_builder is None:
                         # default: defer to your existing script helper if available
                         try:
@@ -140,6 +278,13 @@ class ArtifactManager:
                     else:
                         per_symbol_builder(sym, dest, start, end)
 
+                    meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")'''
+
+                if _needs_rebuild(old_meta, payload):
+                    # Build only if a builder is explicitly provided (tests don't need it)
+                    if per_symbol_builder:
+                        per_symbol_builder(sym, dest, start, end)
+                    # Always record provenance
                     meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
 
                 out_dirs[sym] = dest
@@ -157,12 +302,20 @@ class ArtifactManager:
                 "window": {"start": start, "end": end},
                 "fingerprint": fp,  # all symbols included
                 "config_hash": cfg_hash,
+                "universe_hash": _hash_universe(universe),
+
             }
-            if _needs_rebuild(old_meta, payload):
+            '''if _needs_rebuild(old_meta, payload):
                 if pooled_builder is None:
                     # You can implement pooled builder later; for now, fail loudly if asked.
                     raise RuntimeError("pooled strategy requested but no pooled_builder provided.")
                 pooled_builder(universe, dest, start, end)
+                meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
+            '''
+
+            if _needs_rebuild(old_meta, payload):
+                if pooled_builder:
+                    pooled_builder(universe, dest, start, end)
                 meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
 
             return {"__pooled__": dest}

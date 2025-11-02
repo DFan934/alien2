@@ -1,2 +1,16 @@
-from .providers import StaticUniverse, FileUniverse, resolve_universe
-__all__ = ["StaticUniverse", "FileUniverse", "resolve_universe"]
+# universes/__init__.py
+from .providers import (
+    UniverseError,
+    StaticUniverse,
+    FileUniverse,
+    SP500Universe,
+    resolve_universe,
+)
+
+__all__ = [
+    "UniverseError",
+    "StaticUniverse",
+    "FileUniverse",
+    "SP500Universe",
+    "resolve_universe",
+]

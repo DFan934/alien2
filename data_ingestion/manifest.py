@@ -81,6 +81,93 @@ class Manifest:
         self.partitions = parts
         self.save(root)
 
+
+
+# === Phase 2.3: fast, file-system-only partition summary =====================
+
+from datetime import datetime as _dt
+
+def _iter_partition_dirs(root: Path, symbol: str):
+    """Yield (year, month, day, dirpath) for existing hive directories; no file IO."""
+    sym_root = root / f"symbol={symbol}"
+    if not sym_root.exists():
+        return
+    for ydir in sym_root.glob("year=*"):
+        try:
+            y = int(ydir.name.split("=", 1)[1])
+        except Exception:
+            continue
+        for mdir in ydir.glob("month=*"):
+            try:
+                m = int(mdir.name.split("=", 1)[1])
+            except Exception:
+                continue
+            for ddir in mdir.glob("day=*"):
+                try:
+                    d = int(ddir.name.split("=", 1)[1])
+                except Exception:
+                    continue
+                yield (y, m, d, ddir)
+
+def summarize_partitions_fast(
+    root: str | Path,
+    symbols: list[str],
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+) -> dict:
+    """
+    Return a JSON-serializable summary WITHOUT reading parquet files.
+    Counts *.parquet files by (symbol, year, month, day) within [start, end].
+    """
+    root = Path(root)
+    start = pd.to_datetime(start, utc=True).normalize()
+    end   = pd.to_datetime(end,   utc=True).normalize()
+
+    per_symbol = {}
+    have_data = 0
+
+    for s in symbols:
+        month_counts: dict[tuple[int,int], int] = {}
+        total_files = 0
+
+        for (y, m, d, ddir) in _iter_partition_dirs(root, s):
+            dt = pd.Timestamp(f"{y:04d}-{m:02d}-{d:02d}", tz="UTC")
+            if not (start <= dt <= end):
+                continue
+            cnt = sum(1 for _ in ddir.glob("*.parquet"))
+            if cnt == 0:
+                continue
+            month_counts[(y, m)] = month_counts.get((y, m), 0) + cnt
+            total_files += cnt
+
+        if total_files > 0:
+            have_data += 1
+
+        # stable, JSON-friendly shape
+        per_symbol[s] = {
+            "total_files": int(total_files),
+            "by_month": [
+                {"year": y, "month": m, "files": int(c)}
+                for (y, m), c in sorted(month_counts.items())
+            ],
+        }
+
+    coverage_ratio = (have_data / max(1, len(symbols)))
+
+    return {
+        "symbols": symbols,
+        "window": {"start": str(start), "end": str(end)},
+        "coverage": {
+            "have_data": int(have_data),
+            "total": int(len(symbols)),
+            "ratio": float(coverage_ratio),
+            "empty_symbols": [s for s, rec in per_symbol.items() if rec["total_files"] == 0],
+        },
+        "summary": per_symbol,
+        "generated_at": _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
 # ------------------------------- helpers -----------------------------------
 def _sha_parquet(df: pd.DataFrame) -> str:
     """Row-wise SHA256 over a deterministic subset (timestamp,symbol,open,high,low,close,volume)."""

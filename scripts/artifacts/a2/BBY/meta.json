@@ -7,9 +7,9 @@
       "end": "1999-01-01"
     },
     "fingerprint": {
-      "rows": 52504,
-      "tmax": "1998-12-31T15:59:00"
+      "digest": "cc1379e38b5daf3e91f711143af59dd2"
     },
-    "config_hash": "e3bfae79fd9c3d85bd1abb6701ed9bb7ac100996"
+    "config_hash": "e3bfae79fd9c3d85bd1abb6701ed9bb7ac100996",
+    "universe_hash": "8b19724f352a43a0d5610586002a1483db5422ce"
   }
 }

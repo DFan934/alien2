@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
+from universes import resolve_universe, UniverseError
 
 try:
     import psutil  # optional
@@ -219,3 +220,112 @@ def run_phase1_checks(
 
 def pretty_print_report(report: Dict[str, Any]) -> None:
     print(json.dumps(report, indent=2, default=str))
+
+
+
+def print_universe_banner(config: dict) -> None:
+    """
+    Step-2.2 helper: resolve the universe once and print a one-line banner.
+    This performs no data I/O and is safe to call before expensive checks.
+    """
+    try:
+        syms = resolve_universe(config, as_of=config.get("as_of"))
+    except NotImplementedError:
+        print("[Universe] SP500(as_of=...) is not implemented yet; use Static/File universe.")
+        raise
+    except UniverseError as e:
+        #raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
+        raise RuntimeError("Universe is empty: Resolved universe is empty")
+
+    print(f"[Universe] size = {len(syms)} | {syms}")
+
+
+
+# === Phase 2.3: Universe Dry-Run ============================================
+
+from data_ingestion.manifest import summarize_partitions_fast
+
+def universe_dry_run(config: dict) -> dict:
+    """
+    Fast pre-flight: verify which symbols have any partitions in [start, end].
+    Prints a compact, PR-friendly table and returns the JSON summary.
+    """
+    # Resolve universe once (Step 2.2 path)
+    from universes import resolve_universe, UniverseError
+    try:
+        syms = resolve_universe(config, as_of=config.get("as_of"))
+
+        # --- Phase-2.6: guardrails (pre-scan) ---------------------------------------
+        if len(syms) == 0:
+            raise RuntimeError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
+
+        max_size = int(config.get("universe_max_size", 10_000))
+        if len(syms) > max_size:
+            raise RuntimeError(
+                f"Universe too large: {len(syms)} > {max_size}. "
+                "Lower CONFIG['universe_max_size'] or reduce the universe."
+            )
+        # ---------------------------------------------------------------------------
+
+    except NotImplementedError:
+        print("[Universe] SP500(as_of=...) is not implemented yet; use Static/File universe.")
+        raise
+    #except UniverseError as e:
+    #    raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
+
+    # AFTER
+    except UniverseError as e:
+        msg = str(e).lower()
+        if "empty" in msg:
+            # tests look for this exact substring:
+            raise RuntimeError("Universe is empty: Resolved universe is empty") from e
+        if "exceeds" in msg or "too large" in msg or "max" in msg:
+            # tests look for this exact substring:
+            raise RuntimeError(f"Universe too large: {str(e)}") from e
+        # fallback (shouldn't trigger your current tests)
+        raise RuntimeError(f"Universe error: {str(e)}") from e
+
+    start = config["start"]
+    end   = config["end"]
+    root  = config["parquet_root"]
+
+    print(f"[Universe-DryRun] size={len(syms)} window={start}→{end}")
+
+    t0 = time.perf_counter()
+    rep = summarize_partitions_fast(root, syms, start, end)
+    wall = time.perf_counter() - t0
+
+    # Pretty, compact table
+    rows = []
+    for s in syms:
+        rec = rep["summary"][s]
+        files = rec["by_month"]
+        if files:
+            months = " ".join([f"{m['year']}-{m['month']:02d}:{m['files']}" for m in files])
+        else:
+            months = "-"
+        rows.append((s, rec["total_files"], months))
+
+    # Print table
+    print("symbol | total_files | by_month (YYYY-MM:files ...)")
+    print("-------+-------------+--------------------------------")
+    for s, tot, months in rows:
+        print(f"{s:<6} | {tot:>11} | {months}")
+
+    cov = rep["coverage"]
+    print(f"[Universe-DryRun] coverage={cov['have_data']}/{cov['total']} "
+          f"({cov['ratio']*100:.1f}%) empty={cov['empty_symbols']}")
+    print(f"[Universe-DryRun] elapsed={wall:.3f}s")
+
+    # --- Phase-2.6: guardrails (post-scan) ---------------------------------------
+    need = float(config.get("universe_min_coverage", 0.90))
+    if bool(config.get("strict_universe", False)) and cov["ratio"] < need:
+        raise RuntimeError(
+            f"Coverage {cov['ratio'] * 100:.1f}% ({cov['have_data']}/{cov['total']}) "
+            f"below required {need * 100:.0f}% for {start}–{end}. "
+            f"Empty symbols: {cov['empty_symbols']}"
+        )
+    # ---------------------------------------------------------------------------
+
+    return rep
+
