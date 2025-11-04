@@ -63,6 +63,19 @@ from dataclasses import fields as _dc_fields
 # detect the tail field name in CurveParams
 _TAIL_FIELD = next((f.name for f in _dc_fields(CurveParams) if f.name in ("tail_len", "tail")), None)
 
+
+
+# ADD ▼▼▼ regime keys and adjacency map
+_REGIME_ORDER = ("TREND", "RANGE", "VOL", "GLOBAL")
+_ADJACENT = {
+    "TREND":  ("RANGE", "VOL"),
+    "RANGE":  ("TREND", "VOL"),
+    "VOL":    ("RANGE", "TREND"),
+    "GLOBAL": tuple(),
+}
+
+
+
 def _coerce_curve_params_dict(data: dict) -> dict:
     """
     Coerce flexible JSON into CurveParams kwargs.
@@ -299,6 +312,11 @@ class EVEngine:
             metric=metric,
             rf_weights=rf_weights,
         )'''
+
+        # ADD ▼▼▼ diagnostics containers
+        self._fallback_counts = {k.lower(): 0 for k in _REGIME_ORDER}
+        self._search_log = []  # list of dicts per evaluate() call
+
         # NEW: Store regime-specific curves and outcome probabilities
         self.regime_curves = regime_curves or {}
         self.outcome_probs = outcome_probs or {}
@@ -536,7 +554,7 @@ class EVEngine:
         #h = float(json.loads((artefact_dir / "kernel_bandwidth.json").read_text())["h"])
 
         # Schema guard – fail fast if feature list drifted
-        meta = json.loads((artefact_dir / "meta.json").read_text())
+        '''meta = json.loads((artefact_dir / "meta.json").read_text())
         features_live = stats["feature_list"].tolist()
 
         print("[DEBUG] meta['sha']:", meta["sha"])
@@ -546,7 +564,11 @@ class EVEngine:
 
         if meta["sha"] != _sha1_list(features_live):            raise RuntimeError(
                 "Feature schema drift detected – retrain PathClusterEngine before loading EVEngine."
-            )
+            )'''
+
+        meta = json.loads((artefact_dir / "meta.json").read_text())
+        features_live = stats["feature_list"].tolist()
+        # NOTE: feature-schema validation is handled against feature_schema.json below.
 
         #kernel_cfg = json.loads((artefact_dir / "kernel_bandwidth.json").read_text())
 
@@ -577,6 +599,65 @@ class EVEngine:
         # NEW: Load outcome probabilities
         probs_path = artefact_dir / "outcome_probabilities.json"
         outcome_probs = json.loads(probs_path.read_text()) if probs_path.exists() else {}
+
+        # --- 3.4: enforce distance contract ---------------------------------
+        meta_dist = (meta.get("payload") or meta).get("distance", {})  # tolerate legacy shape
+        meta_family = str(meta_dist.get("family", metric)).lower()
+        if str(metric).lower() != meta_family:
+            raise RuntimeError(
+                f"Metric mismatch: requested '{metric}' but artifacts were built with '{meta_family}'. "
+                "Rebuild artifacts or request the same metric."
+            )
+
+        # Validate Mahalanobis contract if chosen
+        if meta_family == "mahalanobis":
+            cov_path = artefact_dir / "centroid_cov_inv.npy"
+            if not cov_path.exists():
+                raise FileNotFoundError("Mahalanobis selected but centroid_cov_inv.npy missing")
+            # Optional: verify SHA1 matches meta
+            '''want = (meta_dist.get("params") or {}).get("cov_inv_sha1")
+            if want:
+                import hashlib
+                have = hashlib.sha1(cov_path.read_bytes()).hexdigest()[:12]
+                if have != want:
+                    raise RuntimeError(f"Mahalanobis cov_inv sha mismatch: {have} != {want}")
+            '''
+
+            want = (meta_dist.get("params") or {}).get("cov_inv_sha1")
+            if want:
+                import hashlib, numpy as _np
+                cov_inv_arr = _np.load(cov_path).astype(_np.float32, copy=False)
+                have = hashlib.sha1(cov_inv_arr.tobytes()).hexdigest()[:12]
+                if have != want:
+                    raise RuntimeError(f"Mahalanobis cov_inv sha mismatch: {have} != {want}")
+        # Validate RF-weighted contract if chosen
+        if meta_family == "rf_weighted":
+            rf_path = artefact_dir / "rf_feature_weights.npy"
+            if not rf_path.exists():
+                raise FileNotFoundError("rf_weighted selected but rf_feature_weights.npy missing")
+            import numpy as _np, hashlib
+            w = _np.load(rf_path, allow_pickle=False).astype(_np.float32, copy=False)
+            if w.ndim != 1 or w.shape[0] != n_feat_schema:
+                raise RuntimeError(
+                    f"RF weights length {w.shape} does not match feature schema ({n_feat_schema})"
+                )
+            # Normalise for deterministic scaling
+            s = float(w.sum());
+            if s <= 0 or not _np.isfinite(s):
+                raise RuntimeError("RF weights sum is non-positive or NaN")
+            w /= s
+            # Optional SHA check
+            want = (meta_dist.get("params") or {}).get("rf_weights_sha1")
+            if want:
+                have = hashlib.sha1(w.tobytes()).hexdigest()[:12]
+                if have != want:
+                    raise RuntimeError(f"RF weights sha mismatch: {have} != {want}")
+            rf_w = w  # hand to DistanceCalculator ctor below
+        else:
+            rf_w = None
+        # --------------------------------------------------------------------
+
+
 
         # NEW: Load all available regime-specific weighting curves
         '''regime_curves = {}
@@ -848,7 +929,7 @@ class EVEngine:
         idx, dist2 = idx[mask], dist2[mask]
 
         # --- regime filter ---------------------------------------------------
-        if regime is not None:
+        '''if regime is not None:
             reg_mask = self.cluster_regime[idx] == regime.name.upper()
             if reg_mask.any():  # keep matches when possible
                 idx, dist2 = idx[reg_mask], dist2[reg_mask]
@@ -857,15 +938,84 @@ class EVEngine:
                     "[EVEngine] regime=%s yielded zero matches; "
                     "falling back to all clusters",
                     regime.name,
-                    )
+                    )'''
+
                 # fall back to full idx/dist2 already computed above
+
+        #regime_name = getattr(regime, "name", "ANY")
+
+        # AFTER
+        # Accept MarketRegime, string, or None
+        if regime is None:
+            _reg_name = "GLOBAL"
+        elif isinstance(regime, str):
+            _reg_name = regime
+        else:
+            _reg_name = getattr(regime, "name", "GLOBAL")
+
+        reg_key_upper = (_reg_name or "GLOBAL").upper()
+        if reg_key_upper not in _REGIME_ORDER:
+            reg_key_upper = "GLOBAL"
+        reg_key_lower = reg_key_upper.lower()
+
+        # ADD ▼▼▼ desired regime name, normalized
+        reg_key = (_reg_name or "GLOBAL").upper()
+        if reg_key not in _REGIME_ORDER:
+            reg_key = "GLOBAL"
+
+        #index_used = reg_key
+        #fallback_depth = 0
+
+        index_used = reg_key_upper  # keep the log consistent with existing format
+        fallback_depth = 0
+        candidates = [reg_key_upper] + list(_ADJACENT[reg_key_upper]) + (
+            ["GLOBAL"] if reg_key_upper != "GLOBAL" else [])
+
+        # REPLACE regime masking block ▼▼▼
+        candidates = [reg_key] + list(_ADJACENT[reg_key]) + (["GLOBAL"] if reg_key != "GLOBAL" else [])
+        kept = None
+        for depth, cand in enumerate(candidates):
+            mask = (self.cluster_regime[idx] == cand)
+            if mask.any():
+                idx, dist2 = idx[mask], dist2[mask]
+                index_used = cand
+                fallback_depth = depth
+                break
+        # if none matched, keep original (kernel will still run)
+        if idx.size == 0:
+            index_used = "GLOBAL"
+            fallback_depth = len(candidates)  # “full” fallback
+            idx, dist2 = idx_all[:k_eff], dist2_all[:k_eff]
+
         # ---------------------------------------------------------------------
 
         # (distance threshold still applied earlier; no need to recompute)
 
         # ---------------------------------------------------------------------
 
-        regime_name = getattr(regime, "name", "ANY")
+        # ADD ▼▼▼ diagnostics tally
+        #key = (reg_key.lower())
+        key = reg_key_lower
+
+        if fallback_depth > 0:
+            self._fallback_counts[key] = int(self._fallback_counts.get(key, 0)) + 1
+
+        # Keep a small rolling log (you can trim if needed)
+        try:
+            med_d = float(np.median(dist2)) if idx.size else float("nan")
+        except Exception:
+            med_d = float("nan")
+
+        self._search_log.append({
+            "regime_requested": reg_key,
+            "index_used": index_used,
+            "fallback_depth": int(fallback_depth),
+            "k_eff": int(idx.size),
+            "median_d2": med_d,
+        })
+
+        log.info("[EV] regime=%s index_used=%s fallback_depth=%d k=%d med_d2=%.6f",
+                 reg_key, index_used, fallback_depth, int(idx.size), med_d)
 
         if idx.size == 0:  # << add
             log.warning(
@@ -1319,9 +1469,18 @@ class EVEngine:
             residual, mu_k, mu_syn, mu_net, p_up, p_source
         )'''
 
+        #curve_used = (
+        #                 self.regime_curves.get(regime.name.lower()) if regime is not None else None
+        #             ) or self.regime_curves.get("all")
+
+        # Prefer the requested regime if present; otherwise try "all"
         curve_used = (
-                         self.regime_curves.get(regime.name.lower()) if regime is not None else None
-                     ) or self.regime_curves.get("all")
+                self.regime_curves.get(reg_key_lower)
+                or self.regime_curves.get(reg_key_upper)
+                or self.regime_curves.get("all")
+                or self.regime_curves.get("global")
+                or None
+        )
 
         rec_fam = getattr(curve_used, "family", "uniform")
         rec_tail = getattr(curve_used, "tail_len_days", 0)

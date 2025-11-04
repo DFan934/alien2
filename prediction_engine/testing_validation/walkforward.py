@@ -15,6 +15,7 @@ from prediction_engine.market_regime import MarketRegime  # <-- ADD
 from feature_engineering.pipelines.core import CoreFeaturePipeline
 from prediction_engine.ev_engine import EVEngine
 from prediction_engine.calibration import calibrate_isotonic, map_mu_to_prob
+from prediction_engine.prediction_engine.artifacts.loader import resolve_artifact_paths, load_calibrator, read_distance_contract
 
 import shutil
 import platform
@@ -288,9 +289,30 @@ class WalkForwardRunner:
                 fitted_pipeline_dir=prepro_dir,  # ← ensures SAME PCA basis
             )
 
+            # --- 3.6: resolve artefact paths & distance contract for traceability ---
+            paths = resolve_artifact_paths(
+                artifacts_root=self.ev_artifacts_root,
+                symbol=self.symbol,
+                strategy="pooled",  # or "per_symbol" if you run that mode in this runner
+            )
+            dist_family, dist_params = read_distance_contract(paths["meta"])
+
+            # Optional: load symbol calibrator resolved by the loader (overrides fold-trained iso if present)
+            #cal_from_store = load_calibrator(paths.get("calibrator", ""))
+            # prefer fold-trained calibrator if it exists; else use stored symbol calibrator
+
+            # Optional: load symbol calibrator resolved by the loader (overrides fold-trained iso if present)
+            cal_from_store = load_calibrator(paths.get("calibrator", ""))
+
+            # Ensure 'iso' exists even if no fold-trained calibrator is produced in this run
+            iso = locals().get("iso", None)
+
+            calibrator_for_fold = iso if iso is not None else cal_from_store
+
             #ev_tr = EVEngine.from_artifacts(self.ev_artifacts_root)
             # Decide cost handling once and pass it into both train/test engines
             cost_model = None if self.debug_no_costs else BasicCostModel()
+            #ev_tr = EVEngine.from_artifacts(self.ev_artifacts_root, cost_model=cost_model)
             ev_tr = EVEngine.from_artifacts(self.ev_artifacts_root, cost_model=cost_model)
 
             # Snapshot the EV artefacts that were just (re)built for this fold
@@ -522,6 +544,30 @@ class WalkForwardRunner:
                 },
             }
 
+            manifest["artifact_sources"] = {
+                "strategy": "pooled",
+                "core_dir": paths.get("core_dir"),
+                "scaler": paths.get("scaler"),
+                "pca": paths.get("pca"),
+                "clusters": paths.get("clusters"),
+                "feature_schema": paths.get("feature_schema"),
+                "ann": {
+                    "trend": paths.get("ann_trend"),
+                    "range": paths.get("ann_range"),
+                    "vol": paths.get("ann_vol"),
+                    "global": paths.get("ann_global"),
+                },
+                "calibrator": {
+                    "path": paths.get("calibrator"),
+                    "scope": paths.get("calibrator_scope"),
+                    "used_in_fold": bool(calibrator_for_fold is not None),
+                },
+                "distance_contract": {
+                    "family": dist_family,
+                    "params": dist_params,
+                },
+            }
+
             cal_path = calib_dir / "iso_calibrator.pkl"
             manifest["calibrator_path"] = str(cal_path) if cal_path.exists() else None
             manifest["feature_cols_path"] = str(prepro_dir / "feature_cols.json")
@@ -531,7 +577,9 @@ class WalkForwardRunner:
             # ---- TEST evaluation on SCANNED test rows ----
             #ev_te = EVEngine.from_artifacts(self.ev_artifacts_root, calibrator=iso)
             #cost_model = None if self.debug_no_costs else BasicCostModel()
-            ev_te = EVEngine.from_artifacts(self.ev_artifacts_root, calibrator=iso, cost_model=cost_model)
+            #ev_te = EVEngine.from_artifacts(self.ev_artifacts_root, calibrator=iso, cost_model=cost_model)
+            ev_te = EVEngine.from_artifacts(self.ev_artifacts_root, calibrator=calibrator_for_fold,
+                                            cost_model=cost_model)
 
             if feats_scan_te.empty:
                 #(fold_dir / "decisions.parquet").write_bytes(b"")

@@ -10,7 +10,6 @@ Outputs
 • Console summary of cumulative P&L + risk metrics
 """
 from __future__ import annotations
-from data_ingestion.manifest import summarize_partitions_fast
 
 import asyncio
 # after: from prediction_engine.calibration import load_calibrator, calibrate_isotonic
@@ -383,10 +382,20 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
     table = dataset.to_table(filter=filt)
     if table.num_rows == 0:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
+    '''df = table.to_pandas()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["symbol"] = str(symbol)'''
+
     df = table.to_pandas()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    # ▼ NEW: enforce unique timestamps after IO and any tz fiddling
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+
     df["symbol"] = str(symbol)
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return df.reset_index(drop=True)
+
+    #return df.sort_values("timestamp").reset_index(drop=True)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -566,14 +575,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
 
     # 2) Walk-forward runner (unchanged, but pass symbol)
-    #resolved_parquet_root = _resolve_path(cfg["parquet_root"])
-
-    try:
-        parquet_root_value = cfg["parquet_root"]
-    except KeyError as e:
-        # Make tests (and callers) get a controlled failure rather than KeyError
-        raise RuntimeError("Missing required config: 'parquet_root'") from e
-    resolved_parquet_root = _resolve_path(parquet_root_value)
+    resolved_parquet_root = _resolve_path(cfg["parquet_root"])
 
     # --- Phase 3: ensure fresh artifacts for this symbol ---
     am = ArtifactManager(
@@ -591,16 +593,62 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         "residual_threshold": float(cfg.get("residual_threshold", 0.75)),
         "scanner_dev_loose": bool(cfg.get("dev_scanner_loose", False)),
         "detector_mode": cfg.get("dev_detector_mode", "OR"),
+        # INSERT INTO cfg_hash_parts (same dict), AFTER detector_mode:
+        "regime_settings": cfg.get("regime_settings", {"modes": ["TREND", "RANGE", "VOL"]}),
+        "gating_flags": {
+            "p_gate_quantile": float(cfg.get("p_gate_quantile", 0.55)),
+            "full_p_quantile": float(cfg.get("full_p_quantile", 0.65)),
+            "sign_check": bool(cfg.get("sign_check", False)),
+        },
+        "distance_family": cfg.get("metric", "mahalanobis"),
+
+    }
+
+    # INSERT AFTER cfg_hash_parts definition
+    schema_hash_parts = {
+        # Feature schema identity: either a version tag or explicit feature list.
+        # If you have a concrete list, pass it in config as 'feature_schema_list'.
+        "feature_schema_version": cfg.get("feature_schema_version", "v1"),
+        "feature_schema_list": cfg.get("feature_schema_list", []),
+
+        # Label identity: horizon & function
+        "label_horizon_bars": int(cfg.get("horizon_bars", 20)),
+        "label_function": "open_to_open_log_return",  # keep stable string id used across runs
+
+        # Distance family (affects neighbor geometry)
+        "distance_family": cfg.get("metric", "mahalanobis"),
+        # Regime settings and gating flags (impact template selection)
+        "regime_settings": cfg.get("regime_settings", {"modes": ["TREND", "RANGE", "VOL"]}),
+        "gating_flags": {
+            "p_gate_quantile": float(cfg.get("p_gate_quantile", 0.55)),
+            "full_p_quantile": float(cfg.get("full_p_quantile", 0.65)),
+            "sign_check": bool(cfg.get("sign_check", False)),
+        },
     }
 
     # Ensure artifacts/<SYM>/... are (re)built if data/knobs changed
-    am.fit_or_load(
+    '''am.fit_or_load(
         universe=[sym],
         start=str(cfg["start"]),
         end=str(cfg["end"]),
         strategy="per_symbol",
         config_hash_parts=cfg_hash_parts,
         # per_symbol_builder=your_callable  # optional: override if you want
+        # INSERT INSIDE am.fit_or_load(...) ARGUMENTS, AFTER config_hash_parts=cfg_hash_parts,
+        schema_hash_parts=schema_hash_parts,
+
+    )'''
+
+    # Example of passing builders
+    from scripts.rebuild_artefacts import build_pooled_core, fit_symbol_calibrator
+    am.fit_or_load(
+        universe=[sym], start=cfg["start"], end=cfg["end"],
+        strategy="pooled",
+        config_hash_parts=cfg_hash_parts,
+        schema_hash_parts=schema_hash_parts,
+        pooled_builder=lambda syms, out_dir, s, e: build_pooled_core(syms, out_dir, s, e, am.parquet_root,
+                                                                     n_clusters=int(cfg.get("k_max", 64))),
+        calibrator_builder=lambda sym, pooled_dir, s, e: fit_symbol_calibrator(sym, pooled_dir, s, e, am.parquet_root),
     )
 
     runner = WalkForwardRunner(
@@ -705,8 +753,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         # Clean error if someone asks for SP500 PIT before it exists
         raise RuntimeError("SP500Universe(as_of=...) not implemented in Phase 2. Use Static/File universe.") from e
     except U.UniverseError as e:
-        #raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
-        raise RuntimeError("Universe is empty: Resolved universe is empty")
+        raise RuntimeError(f"Invalid universe in CONFIG: {e}") from e
 
     print(f"[Universe] size = {len(symbols_requested)} | {symbols_requested}")
 
@@ -718,58 +765,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     print(f"[Run] universe_hash={uhash} | source={usrc} | window={win_s}→{win_e} | artifacts={arte_root}")
 
-    #if not symbols_requested:
-    #    raise ValueError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
-
-    # --- Phase-2.6: guardrails ---------------------------------------------------
     if not symbols_requested:
-        raise RuntimeError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
-
-    max_size = int(cfg.get("universe_max_size", 10_000))
-    if len(symbols_requested) > max_size:
-        raise RuntimeError(
-            f"Universe too large: {len(symbols_requested)} > {max_size}. "
-            "Lower CONFIG['universe_max_size'] or reduce the universe."
-        )
-
-    # Optional but recommended: fast coverage precheck (zero parquet reads)
-    if bool(cfg.get("strict_universe", False)):
-        rep = summarize_partitions_fast(
-            cfg.get("parquet_root", "parquet"),
-            symbols_requested,
-            cfg["start"],
-            cfg["end"],
-        )
-        ratio = rep["coverage"]["ratio"]
-        need = float(cfg.get("universe_min_coverage", 0.90))
-        if ratio < need:
-            have, tot = rep["coverage"]["have_data"], rep["coverage"]["total"]
-            empties = rep["coverage"]["empty_symbols"]
-            raise RuntimeError(
-                f"Coverage {ratio * 100:.1f}% ({have}/{tot}) below required {need * 100:.0f}% "
-                f"for window {cfg['start']}–{cfg['end']}. "
-                f"Empty symbols: {empties}"
-            )
-    else:
-        # Soft warning if provided
-        try:
-            rep = summarize_partitions_fast(
-                cfg.get("parquet_root", "parquet"),
-                symbols_requested,
-                cfg["start"],
-                cfg["end"],
-            )
-            ratio = rep["coverage"]["ratio"]
-            need = float(cfg.get("universe_min_coverage", 0.90))
-            if ratio < need:
-                have, tot = rep["coverage"]["have_data"], rep["coverage"]["total"]
-                empties = rep["coverage"]["empty_symbols"]
-                print(f"[WARN] Coverage {ratio * 100:.1f}% ({have}/{tot}) < {need * 100:.0f}% "
-                      f"for window {cfg['start']}–{cfg['end']}. Empty: {empties}")
-        except Exception:
-            # If manifest scan isn’t available for some reason, continue
-            pass
-    # ---------------------------------------------------------------------------
+        raise ValueError("Universe is empty. Provide at least one symbol via CONFIG['universe'].")
 
     # Intersect with symbols present in parquet
     project_root = Path(__file__).resolve().parents[2]  # repo root
@@ -802,16 +799,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     for sym in symbols:
         sym_cfg = {**cfg, "symbol": sym}  # pass symbol to runner
         log.info(f"=== Running backtest for {sym} ===")
-        #res = await _run_one_symbol(sym, sym_cfg)
-        for sym in symbols:
-            try:
-                res = await _run_one_symbol(sym, {**cfg, "symbol": sym})
-            except RuntimeError:
-                raise
-            except Exception as e:
-                # keep header output stable/once and fail in a controlled way
-                raise RuntimeError(f"Backtest aborted for {sym}") from e
-
+        res = await _run_one_symbol(sym, sym_cfg)
         results.append(res)
 
 

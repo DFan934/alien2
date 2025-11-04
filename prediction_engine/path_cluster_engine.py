@@ -20,6 +20,7 @@ import json
 import hashlib
 import warnings
 from sklearn.impute import SimpleImputer
+import sklearn  # for __version__ in meta
 
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -104,10 +105,20 @@ class PathClusterEngine:
         imputer = SimpleImputer(strategy="mean")
         X = imputer.fit_transform(X)
 
-    # --------------------------------------------------------------#
+        # ---- Determine effective number of clusters (guard against tiny train sets)
+        n_samples = int(X.shape[0])
+        k_req = int(n_clusters)
+        k_eff = max(1, min(k_req, n_samples))
+        if k_eff < k_req:
+            warnings.warn(
+                f"[PathClusterEngine] Requested n_clusters={k_req} but only n_samples={n_samples}; "
+                f"using k_eff={k_eff}."
+            )
+
+        # --------------------------------------------------------------#
     # 1. K-Means                                                    #
     # --------------------------------------------------------------#
-        km = KMeans(
+        '''km = KMeans(
             n_clusters=n_clusters,
             n_init="auto",
             max_iter=300,
@@ -126,13 +137,41 @@ class PathClusterEngine:
         mu = np.zeros(n_clusters, dtype=np.float32)
         var = np.zeros(n_clusters, dtype=np.float32)
         var_down = np.zeros(n_clusters, dtype=np.float32)
+        '''
+
+        # ---- Fit clusters (guarded)
+        X32 = X.astype(np.float32)
+
+        if k_eff == 1:
+            # Trivial single-cluster fallback
+            centers = X32.mean(axis=0, keepdims=True).astype(np.float32)
+            labels = np.zeros(n_samples, dtype=int)
+        else:
+            km = KMeans(
+                n_clusters=k_eff,
+                n_init="auto",
+                max_iter=300,
+                random_state=random_state,
+            ).fit(X32)
+            centers = km.cluster_centers_.astype(np.float32)
+            labels = km.labels_.astype(int)
+
+        # Persist centroids
+        np.save(out_dir / "centers.npy", centers)
+
+        # Outcome stats arrays sized by the effective k
+        cluster_regime = np.full(k_eff, "ANY", dtype="U10")  # default placeholder
+        mu = np.zeros(k_eff, dtype=np.float32)
+        var = np.zeros(k_eff, dtype=np.float32)
+        var_down = np.zeros(k_eff, dtype=np.float32)
+
         global_mu = float(y_numeric.mean())
         global_var = float(np.var(y_numeric))
         neg_all = y_numeric[y_numeric < 0]
         global_var_down = float(np.var(neg_all)) if neg_all.size else global_var
         outcome_probs: dict[str, dict[str, float]] = {}
 
-        for c in range(n_clusters):
+        for c in range(k_eff):
             idx = labels == c
             vals = y_numeric[idx]
             tiny = vals.size < 3
@@ -186,12 +225,20 @@ class PathClusterEngine:
         # ------------------------------------------------------------------
         # 5. Meta / schema hash ---------------------------------------------
         sha = hashlib.sha1("|".join(feature_names).encode()).hexdigest()[:12]
-        meta = {
+        '''meta = {
             "n_clusters": int(n_clusters),
             "features": feature_names,
             "sha": _sha1_list(feature_names),
             "sklearn_version": km.__module__.split(".")[0] + " " + km.__module__.split(".")[1],
+        }'''
+        meta = {
+            "n_clusters": int(k_eff),  # actual used
+            "k_requested": int(k_req),  # what caller asked for
+            "features": feature_names,
+            "sha": _sha1_list(feature_names),
+            "sklearn_version": sklearn.__version__,
         }
+
         with open(out_dir / "meta.json", "w", encoding="utf-8") as mf:
             json.dump(meta, mf, indent=2)
 

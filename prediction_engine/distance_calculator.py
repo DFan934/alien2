@@ -174,9 +174,20 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
         # Partition and sort to get the top k results
         idx = np.argpartition(dist2, kth=k - 1, axis=1)[:, :k]
         part = np.take_along_axis(dist2, idx, axis=1)
-        order = np.argsort(part, axis=1)
+        #order = np.argsort(part, axis=1)
+        #sorted_idx = np.take_along_axis(idx, order, axis=1)
+
+
+        #sorted_dist2 = np.take_along_axis(part, order, axis=1)
+
+        # Deterministic tie-break: add tiny epsilon scaled by stable index rank
+        # so equal distances sort by index (stable across runs)
+        _eps = 1e-12
+        part_stable = part + _eps * idx.astype(part.dtype)
+
+        order = np.argsort(part_stable, axis=1, kind="mergesort")  # stable sort
         sorted_idx = np.take_along_axis(idx, order, axis=1)
-        sorted_dist2 = np.take_along_axis(part, order, axis=1)
+        sorted_dist2 = np.take_along_axis(part, order, axis=1)  # keep original distances
 
         return sorted_dist2, sorted_idx
     # ------------------------------------------------------------------

@@ -1,0 +1,33 @@
+{
+  "payload": {
+    "strategy": "pooled",
+    "symbols": [
+      "BBY"
+    ],
+    "window": {
+      "start": "1998-08-26",
+      "end": "1999-01-01"
+    },
+    "fingerprint": "cc1379e38b5daf3e91f711143af59dd2",
+    "config_hash": "f3844e794e4e8309f16bbd1458ce3568ce85adee",
+    "schema_hash": "b347e5e4977cc95438d86ed1b196e4a98196d813",
+    "universe_hash": "8b19724f352a43a0d5610586002a1483db5422ce",
+    "distance": {
+      "family": "mahalanobis",
+      "params": {
+        "k_max": 64,
+        "feature_schema_path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\feature_schema.json"
+      }
+    },
+    "paths": {
+      "scaler": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\scaler.pkl",
+      "pca": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\pca.pkl",
+      "clusters": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\clusters.pkl",
+      "feature_schema": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\feature_schema.json",
+      "calibrators_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\calibrators"
+    },
+    "calibration": {
+      "report": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\pooled\\calibrators\\calibration_report.json"
+    }
+  }
+}

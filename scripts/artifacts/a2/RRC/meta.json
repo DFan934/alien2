@@ -9,7 +9,8 @@
     "fingerprint": {
       "digest": "22d17863095441fd8e83e76a3d35547e"
     },
-    "config_hash": "e3bfae79fd9c3d85bd1abb6701ed9bb7ac100996",
+    "config_hash": "f3844e794e4e8309f16bbd1458ce3568ce85adee",
+    "schema_hash": "b347e5e4977cc95438d86ed1b196e4a98196d813",
     "universe_hash": "cb8cefc51414e8aa0ec5fb15c75e4fc8ca2a5fb9"
   }
 }

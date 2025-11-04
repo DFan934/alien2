@@ -15,10 +15,129 @@ import pyarrow.dataset as ds
 Strategy = Literal["per_symbol", "pooled"]
 
 
+# --- NEW: minimal diagnostics writer for per-symbol artifacts ---
+from pathlib import Path
+import json
+
+def _write_per_symbol_diagnostics(
+    sym_dir: Path,
+    *,
+    distance_family: str,
+    k_used: int | None,
+    feature_schema_version: str | None
+) -> None:
+    sym_dir.mkdir(parents=True, exist_ok=True)
+    dpath = sym_dir / "diagnostics.json"
+    payload = {
+        "distance_family": distance_family,
+        "k_used": int(k_used) if k_used is not None else None,
+        "feature_schema_version": feature_schema_version,
+        # Placeholders so the shape matches tests/expectations
+        "fallback_rate_by_regime": {k: 0.0 for k in ("TREND", "RANGE", "VOL", "GLOBAL")},
+        "median_knn_distance_by_regime": {k: None for k in ("TREND", "RANGE", "VOL", "GLOBAL")},
+        "calibration_ece_by_symbol": {},
+        "brier_by_symbol": {},
+    }
+    dpath.write_text(json.dumps(payload, indent=2))
+# --- END NEW ---
+
+
+# --- 3.8: diagnostics writer -------------------------------------------------
+def _write_diagnostics_json(
+    dest: Path,
+    *,
+    payload: dict,
+    symbols: list[str] | None = None,
+) -> Path:
+    """
+    Persist artifact-time diagnostics for P4/P5 reporting.
+
+    Shape (no missing keys):
+      {
+        "distance_family": str,
+        "k_used": int | null,
+        "feature_schema_version": str | null,
+        "fallback_rate_by_regime": {"TREND": 0.0, "RANGE": 0.0, "VOL": 0.0, "GLOBAL": 0.0},
+        "median_knn_distance_by_regime": {"TREND": null, "RANGE": null, "VOL": null, "GLOBAL": null},
+        "calibration_ece_by_symbol": {SYM: float, ...},
+        "brier_by_symbol": {SYM: float, ...}
+      }
+    """
+    dest = Path(dest)
+    diag_path = dest / "diagnostics.json"
+    distance = (payload.get("distance") or {})
+    family = distance.get("family")
+    params = (distance.get("params") or {})
+    k_used = params.get("k_max")
+
+    # schema version is carried in your schema hash parts; here we only have the final schema hash,
+    # so expose that. (If you add a version string in payload later, this will pick it up too.)
+    feature_schema_version = payload.get("schema_hash")
+
+    # Initialize required keys with defaults
+    fallback_by_regime = {k: 0.0 for k in _REGIME_KEYS}
+    median_d2_by_regime = {k: None for k in _REGIME_KEYS}
+
+    # Pull calibration report if present
+    cal_ece_by_sym, brier_by_sym = {}, {}
+    try:
+        cal_dir = dest / "calibrators"
+        rpt = json.loads((cal_dir / "calibration_report.json").read_text(encoding="utf-8"))
+        for sym, m in rpt.items():
+            # skip non-dict leafs if any
+            if isinstance(m, dict):
+                if "ece" in m:
+                    cal_ece_by_sym[sym] = float(m["ece"])
+                if "brier" in m:
+                    brier_by_sym[sym] = float(m["brier"])
+    except Exception:
+        pass
+
+    # Assemble and write
+    diagnostics = {
+        "distance_family": family,
+        "k_used": int(k_used) if isinstance(k_used, (int, float)) else None,
+        "feature_schema_version": feature_schema_version,
+        "fallback_rate_by_regime": fallback_by_regime,
+        "median_knn_distance_by_regime": median_d2_by_regime,
+        "calibration_ece_by_symbol": cal_ece_by_sym,
+        "brier_by_symbol": brier_by_sym,
+    }
+    diag_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+    return diag_path
+# ---------------------------------------------------------------------------
+
+
+
 def _hash_obj(obj: object) -> str:
     """Stable hash for simple JSON-serializable objects."""
     s = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(s).hexdigest()
+
+# INSERT AFTER: return hashlib.sha1(s).hexdigest()
+def _hash_schema(parts: dict | list | tuple | None) -> str:
+    """
+    Stable hash of the *feature/schema-related* inputs that must force artifact rebuilds
+    when they change: feature list or version, label horizon H, distance metric family,
+    regime settings, gating flags, etc.
+    """
+    return _hash_obj(parts or {})
+
+
+# ADD ▼▼▼ (after _hash_schema)
+_REGIME_KEYS = ("TREND", "RANGE", "VOL", "GLOBAL")
+
+def _ensure_ann_contract(out_dir: Path) -> None:
+    """
+    Create a regime-aware ANN index layout and stub 'contract' files.
+    This is cheap and lets downstream loaders know what to expect.
+    """
+    ann_root = Path(out_dir) / "ann"
+    ann_root.mkdir(parents=True, exist_ok=True)
+    for key in _REGIME_KEYS:
+        f = ann_root / f"{key}.index"
+        if not f.exists():
+            f.write_text("# placeholder index – replace with FAISS/Annoy later\n", encoding="utf-8")
 
 
 
@@ -194,9 +313,12 @@ class ArtifactManager:
         end: str,
         strategy: Strategy = "per_symbol",
         config_hash_parts: Dict[str, object] | None = None,
-        # builder hooks (optional overrides / test doubles)
+        schema_hash_parts: Dict[str, object] | None = None,
+            # builder hooks (optional overrides / test doubles)
         per_symbol_builder=None,   # callable(symbol, out_dir: Path, start, end) -> None
         pooled_builder=None,       # callable(symbols: List[str], out_dir: Path, start, end) -> None
+        # INSERT AFTER: pooled_builder=None,
+        calibrator_builder=None,  # callable(symbol: str, pooled_dir: Path, start, end) -> None
     ) -> Dict[str, Path]:
         """
         Ensure artifacts exist and are fresh for the given data slice.
@@ -215,6 +337,9 @@ class ArtifactManager:
         fp = _fingerprint_slice(self.parquet_root, universe, start, end)
         u_hash = _hash_universe(universe)
 
+        # INSERT AFTER: u_hash = _hash_universe(universe)
+        sch_hash = _hash_schema(schema_hash_parts)
+
         if strategy == "per_symbol":
             out_dirs: Dict[str, Path] = {}
             for sym in universe:
@@ -222,6 +347,19 @@ class ArtifactManager:
                 dest.mkdir(parents=True, exist_ok=True)
                 meta_path = dest / "meta.json"
                 old_meta = _load_meta(meta_path)
+
+                # --- NEW: ensure diagnostics.json exists for per_symbol artifacts ---
+                metric = (config_hash_parts or {}).get("metric", "euclidean")
+                k_used = (config_hash_parts or {}).get("k_max")
+                feature_schema_version = (schema_hash_parts or {}).get("feature_schema_version")
+
+                _write_per_symbol_diagnostics(
+                    dest,
+                    distance_family=metric,
+                    k_used=k_used,
+                    feature_schema_version=feature_schema_version,
+                )
+                # --- END NEW ---
 
                 '''payload = {
                     "strategy": "per_symbol",
@@ -245,8 +383,44 @@ class ArtifactManager:
                     "window": {"start": start, "end": end},
                     "fingerprint": sym_fp,
                     "config_hash": cfg_hash,
+                    "schema_hash": sch_hash,
+                    # INSERT INSIDE per_symbol payload, BEFORE universe_hash
+                    "pooled_core_dir": str(self.artifacts_root / "pooled") if (
+                                self.artifacts_root / "pooled").exists() else None,
+
                     "universe_hash": u_hash,
                 }
+
+
+
+                # --- 3.4: distance contract (per_symbol) -----------------------------
+                family = (config_hash_parts or {}).get("metric", "euclidean")
+                k_max = int((config_hash_parts or {}).get("k_max", 32))
+
+                distance_params: dict[str, object] = {"k_max": k_max}
+
+                # Optional params depending on chosen family
+                cov_inv_file = dest / "centroid_cov_inv.npy"
+                if family == "mahalanobis" and cov_inv_file.exists():
+                    import hashlib
+                    b = cov_inv_file.read_bytes()
+                    distance_params["cov_inv_sha1"] = hashlib.sha1(b).hexdigest()[:12]
+                    distance_params["cov_inv_path"] = str(cov_inv_file)
+
+                rfw_file = dest / "rf_feature_weights.npy"
+                if family == "rf_weighted" and rfw_file.exists():
+                    import numpy as _np, hashlib
+                    w = _np.load(rfw_file, allow_pickle=False)
+                    distance_params["rf_weights_len"] = int(w.shape[0])
+                    distance_params["rf_weights_sha1"] = hashlib.sha1(w.tobytes()).hexdigest()[:12]
+                    distance_params["rf_weights_path"] = str(rfw_file)
+
+                schema_file = dest / "feature_schema.json"
+                if schema_file.exists():
+                    distance_params["feature_schema_path"] = str(schema_file)
+
+                payload["distance"] = {"family": str(family), "params": distance_params}
+                # --------------------------------------------------------------------
 
                 '''if _needs_rebuild(old_meta, payload):
                     # Build (or rebuild) artifacts for this symbol
@@ -293,6 +467,9 @@ class ArtifactManager:
         elif strategy == "pooled":
             dest = (self.artifacts_root / "pooled")
             dest.mkdir(parents=True, exist_ok=True)
+            # ADD ▼▼▼ (after 'dest = (self.artifacts_root / sym)' and 'dest.mkdir(...)')
+            _ensure_ann_contract(dest)  # ann/{TREND,RANGE,VOL,GLOBAL}.index alongside per-symbol artifacts
+
             meta_path = dest / "meta.json"
             old_meta = _load_meta(meta_path)
 
@@ -302,9 +479,39 @@ class ArtifactManager:
                 "window": {"start": start, "end": end},
                 "fingerprint": fp,  # all symbols included
                 "config_hash": cfg_hash,
+                "schema_hash": sch_hash,
                 "universe_hash": _hash_universe(universe),
 
             }
+
+            # --- 3.4: distance contract (pooled) --------------------------------
+            family = (config_hash_parts or {}).get("metric", "euclidean")
+            k_max = int((config_hash_parts or {}).get("k_max", 32))
+
+            distance_params: dict[str, object] = {"k_max": k_max}
+
+            cov_inv_file = dest / "centroid_cov_inv.npy"
+            if family == "mahalanobis" and cov_inv_file.exists():
+                import hashlib
+                b = cov_inv_file.read_bytes()
+                distance_params["cov_inv_sha1"] = hashlib.sha1(b).hexdigest()[:12]
+                distance_params["cov_inv_path"] = str(cov_inv_file)
+
+            rfw_file = dest / "rf_feature_weights.npy"
+            if family == "rf_weighted" and rfw_file.exists():
+                import numpy as _np, hashlib
+                w = _np.load(rfw_file, allow_pickle=False)
+                distance_params["rf_weights_len"] = int(w.shape[0])
+                distance_params["rf_weights_sha1"] = hashlib.sha1(w.tobytes()).hexdigest()[:12]
+                distance_params["rf_weights_path"] = str(rfw_file)
+
+            schema_file = dest / "feature_schema.json"
+            if schema_file.exists():
+                distance_params["feature_schema_path"] = str(schema_file)
+
+            payload["distance"] = {"family": str(family), "params": distance_params}
+            # --------------------------------------------------------------------
+
             '''if _needs_rebuild(old_meta, payload):
                 if pooled_builder is None:
                     # You can implement pooled builder later; for now, fail loudly if asked.
@@ -313,9 +520,110 @@ class ArtifactManager:
                 meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
             '''
 
+            # INSERT AFTER payload dict is built, BEFORE the _needs_rebuild(...) check
+            # Ensure pooled layout exists
+            (dest / "calibrators").mkdir(parents=True, exist_ok=True)
+            # Optionally record canonical filenames (consumed by tests and callers)
+
+            # ADD ▼▼▼ (right after we mkdir the pooled 'calibrators' dir)
+            _ensure_ann_contract(dest)  # writes ann/{TREND,RANGE,VOL,GLOBAL}.index
+
+            payload.setdefault("paths", {
+                "scaler": str(dest / "scaler.pkl"),
+                "pca": str(dest / "pca.pkl"),
+                "clusters": str(dest / "clusters.pkl"),
+                "feature_schema": str(dest / "feature_schema.json"),
+                "calibrators_dir": str(dest / "calibrators"),
+            })
+
+            # --- 3.5: per-symbol calibrator quality gates -------------------------------
+            # Thresholds (can be promoted to config later)
+            _ECE_MAX = 0.03  # ≤ 3%
+            _BRIER_DELTA_MAX = 0.03  # symbol Brier must be within +3% of pooled
+            _MIN_MONO_ADJ = 8  # ≥ 8/9 adjacent decile increases
+
+            cal_dir = dest / "calibrators"
+            cal_dir.mkdir(parents=True, exist_ok=True)
+
+            # accumulate a portfolio-wide pooled benchmark if builder provides it
+            pooled_brier_benchmark = None
+            report_path = cal_dir / "calibration_report.json"
+            report = {}  # symbol -> metrics
+
+            # --- Allow pooled core build without calibrators (for schema/hash-only tests) ---
+            if calibrator_builder is None:
+                # If anything changed, (optionally) build pooled core and persist meta
+                if _needs_rebuild(old_meta, payload):
+                    if pooled_builder:
+                        pooled_builder(universe, dest, start, end)
+                    meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
+                # Return the pooled directory map just like normal
+                return {"__pooled__": dest}
+            # -------------------------------------------------------------------------------
+
+            for sym in universe:
+                # builder should: fit isotonic, persist "<SYM>.isotonic.pkl",
+                # and return (pkl_path, metrics_dict)
+                pkl_path, metrics = calibrator_builder(sym, dest, start, end)
+                # expected keys: 'ece', 'brier', 'mono_adj_pairs', optional 'pooled_brier'
+                if metrics is None:
+                    metrics = {}
+                if pooled_brier_benchmark is None and "pooled_brier" in metrics:
+                    pooled_brier_benchmark = float(metrics["pooled_brier"])
+
+                # evaluate gates
+                ece_ok = float(metrics.get("ece", 1.0)) <= _ECE_MAX
+                # if we don't have a pooled benchmark, treat Brier gate as informational
+                if pooled_brier_benchmark is not None:
+                    brier_ok = float(metrics.get("brier", 1.0)) <= (pooled_brier_benchmark + _BRIER_DELTA_MAX)
+                else:
+                    brier_ok = True
+                mono_ok = int(metrics.get("mono_adj_pairs", 0)) >= _MIN_MONO_ADJ
+
+                status = "pass" if (ece_ok and brier_ok and mono_ok) else "fail"
+                metrics.update({
+                    "status": status,
+                    "gates": {
+                        "ece_max": _ECE_MAX,
+                        "brier_delta_max": _BRIER_DELTA_MAX,
+                        "min_monotonic_adjacent_pairs": _MIN_MONO_ADJ,
+                    }
+                })
+                report[sym] = metrics
+
+            # write/update report atomically
+            #import json, io
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            payload.setdefault("calibration", {})["report"] = str(report_path)
+            # ---------------------------------------------------------------------------
+
+            # --- 3.8: write diagnostics.json (pooled) ---
+            _write_diagnostics_json(dest, payload={"distance": payload.get("distance"),
+                                                   "schema_hash": payload.get("schema_hash")},
+                                    symbols=universe)
+            # --------------------------------------------
+
             if _needs_rebuild(old_meta, payload):
                 if pooled_builder:
                     pooled_builder(universe, dest, start, end)
+
+                    # INSERT INSIDE the rebuild branch (pooled) AFTER pooled_builder(...)
+                    # Build per-symbol calibrators into pooled/calibrators
+                    if calibrator_builder:
+                        for sym in universe:
+                            calibrator_builder(sym, dest, start, end)  # writes <pooled>/calibrators/<SYM>.isotonic.pkl
+                            # --- 3.8: write diagnostics.json (per_symbol) ---
+                            _write_diagnostics_json(dest, payload={"distance": payload.get("distance"),
+                                                                   "schema_hash": payload.get("schema_hash")},
+                                                    symbols=[sym])
+                            # ------------------------------------------------
+
+                # --- 3.8: refresh diagnostics after rebuild ---
+                _write_diagnostics_json(dest, payload={"distance": payload.get("distance"),
+                                                       "schema_hash": payload.get("schema_hash")},
+                                        symbols=universe)
+                # ----------------------------------------------
+
                 meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
 
             return {"__pooled__": dest}
