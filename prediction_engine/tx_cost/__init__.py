@@ -182,6 +182,32 @@ class BasicCostModel(BaseCostModel):
 
         return float(hs + c + impact)
 
+    # Convenience: order-level total cost (per-share × |qty|)
+    def total_cost(
+        self,
+        qty: float,
+        *,
+        half_spread: float | None = None,
+        adv_pct: float | None = None,
+        volatility: float | None = None,
+        **kwargs,
+    ) -> float:
+        """
+        Returns USD cost for an order of `qty` shares.
+        Notes:
+          - `half_spread` is in USD PER SHARE (fallback ≈ $0.015 if omitted).
+          - `adv_pct` is fraction of ADV (e.g., 0.05 for 5% ADV), not 5.0.
+        """
+        per_share = self.cost(
+            qty=qty,
+            half_spread=half_spread,
+            adv_pct=adv_pct,
+            volatility=volatility,
+            **kwargs,
+        )
+        return float(abs(qty) * per_share)
+
+
 # --- NEW: Explicit zero-cost model for debug / unit tests --------------
 class NoCostModel(BaseCostModel):
     """Always returns zero per-share cost (useful for debug runs)."""

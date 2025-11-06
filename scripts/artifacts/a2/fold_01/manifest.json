@@ -41,16 +41,16 @@
   },
   "artifact_sources": {
     "strategy": "pooled",
-    "core_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled",
-    "scaler": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\scaler.pkl",
-    "pca": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\pca.pkl",
-    "clusters": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\clusters.pkl",
-    "feature_schema": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\feature_schema.json",
+    "core_dir": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled",
+    "scaler": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/scaler.pkl",
+    "pca": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/pca.pkl",
+    "clusters": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/clusters.pkl",
+    "feature_schema": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/feature_schema.json",
     "ann": {
-      "trend": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\ann\\TREND.index",
-      "range": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\ann\\RANGE.index",
-      "vol": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\ann\\VOL.index",
-      "global": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights\\pooled\\ann\\GLOBAL.index"
+      "trend": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/TREND.index",
+      "range": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/RANGE.index",
+      "vol": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/VOL.index",
+      "global": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/GLOBAL.index"
     },
     "calibrator": {
       "path": "",

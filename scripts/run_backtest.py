@@ -24,10 +24,88 @@ import pandas as pd
 import json
 from scripts.a2_report import generate_report  # NEW
 from sklearn.isotonic import IsotonicRegression
+from prediction_engine.portfolio.sizer import size_from_p, RiskCaps
+# NEW (Phase 4.5): portfolio ledger + risk
+from prediction_engine.portfolio.ledger import PortfolioLedger, TradeFill
+from prediction_engine.portfolio.risk import RiskLimits, RiskEngine
+
+# NEW (Phase 4.5): portfolio ledger + risk
+from prediction_engine.portfolio.ledger import PortfolioLedger, TradeFill
+from prediction_engine.portfolio.risk import RiskLimits, RiskEngine
+
 
 import logging
 import sys
 from pathlib import Path
+
+
+
+# at top of scripts/run_backtest.py
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.types as pat
+
+def _arrow_ts_between_filter(dataset: ds.Dataset, col: str, start: str, end: str):
+    """
+    Build an Arrow filter `(col >= start) & (col <= end)` where the Python datetime
+    scalars are cast to the SAME timestamp(unit, tz) as the dataset column.
+    Works for tz-aware (UTC) and tz-naive columns, any unit (s/ms/us/ns).
+    """
+    tfield = dataset.schema.field(col).type
+    if not pat.is_timestamp(tfield):
+        raise TypeError(f"Column {col!r} is not a timestamp: {tfield}")
+
+    unit = tfield.unit  # 's'|'ms'|'us'|'ns'
+    tz = tfield.tz      # None or 'UTC' (or other tz)
+
+    # Build Python datetimes with matching tz-awareness
+    if tz is None:
+        s_py = pd.to_datetime(start).to_pydatetime()
+        e_py = pd.to_datetime(end).to_pydatetime()
+    else:
+        s_py = pd.to_datetime(start, utc=True).to_pydatetime()
+        e_py = pd.to_datetime(end,   utc=True).to_pydatetime()
+
+    s_scalar = pa.scalar(s_py, type=pa.timestamp(unit, tz))
+    e_scalar = pa.scalar(e_py, type=pa.timestamp(unit, tz))
+
+    col_expr = ds.field(col)
+    return (col_expr >= s_scalar) & (col_expr <= e_scalar)
+
+
+
+
+# --- Phase 4.1: unified minute clock over the universe (fast, no joins) ---
+def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols: list[str]) -> pd.DatetimeIndex:
+    root = Path(parquet_root)
+    parts: list[pd.Series] = []
+
+    for sym in symbols:
+        sym_dir = root / f"symbol={sym}"
+        if not sym_dir.exists():
+            continue
+
+        dataset = ds.dataset(str(sym_dir), format="parquet", partitioning="hive", exclude_invalid_files=True)
+        filt = _arrow_ts_between_filter(dataset, "timestamp", start, end)
+        tbl = dataset.to_table(columns=["timestamp"], filter=filt)
+        if tbl.num_rows == 0:
+            continue
+
+        # Whatever the on-disk type is, normalize to tz-aware UTC in pandas
+        ts = pd.to_datetime(tbl.column("timestamp").to_pandas(), utc=True, errors="coerce")
+        if not ts.empty:
+            parts.append(ts.dropna())
+
+    if not parts:
+        return pd.DatetimeIndex([], tz="UTC")
+
+    uni = pd.Index(pd.concat(parts, ignore_index=True).unique())
+    uni = pd.to_datetime(uni, utc=True).floor("T").sort_values().unique()
+    return pd.DatetimeIndex(uni, tz="UTC")
+
+
+
+
 from typing import Any, Dict, List
 from prediction_engine.testing_validation.walkforward import WalkForwardRunner
 
@@ -151,6 +229,10 @@ def _pca_cols(df: pd.DataFrame) -> list[str]:
 
 
 from pathlib import Path
+
+# after: def _pca_cols(df: pd.DataFrame) -> list[str]:
+from prediction_engine.scoring.batch import vectorize_minute_batch  # NEW (Step 4.6)
+
 
 def discover_parquet_symbols(parquet_root: Path) -> list[str]:
     syms = []
@@ -375,27 +457,52 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
     )
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
-    filt = (
-            (ds.field("timestamp") >= start_ts) &
-            (ds.field("timestamp") <= end_ts)
-    )
-    table = dataset.to_table(filter=filt)
-    if table.num_rows == 0:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
+    #filt = (
+    #        (ds.field("timestamp") >= start_ts) &
+    #        (ds.field("timestamp") <= end_ts)
+    #)
+    #table = dataset.to_table(filter=filt)
+    #if table.num_rows == 0:
+    #    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
     '''df = table.to_pandas()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df["symbol"] = str(symbol)'''
 
+    #df = table.to_pandas()
+    #df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    # ▼ NEW: enforce unique timestamps after IO and any tz fiddling
+    #df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+
+    #df["symbol"] = str(symbol)
+    #return df.reset_index(drop=True)
+    filt = _arrow_ts_between_filter(dataset, "timestamp", cfg["start"], cfg["end"])
+    table = dataset.to_table(filter=filt)
+    if table.num_rows == 0:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
+
     df = table.to_pandas()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    # ▼ NEW: enforce unique timestamps after IO and any tz fiddling
+    # ensure unique, ordered minutes (helps later searchsorted calls)
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-
     df["symbol"] = str(symbol)
     return df.reset_index(drop=True)
-
     #return df.sort_values("timestamp").reset_index(drop=True)
+
+
+
+# --- Phase 4.1 helper: get the feature row for (symbol, t) without labels ---
+def _slice_features_at(df_features: pd.DataFrame, t: pd.Timestamp) -> pd.DataFrame:
+    """
+    Return a single-row DataFrame at minute t (UTC). Caller is responsible for
+    ensuring df_features['timestamp'] is tz-aware UTC. No label look-ahead here.
+    """
+    t = pd.to_datetime(t, utc=True)
+    # Exact match on minute; if your FE emits seconds, floor to minute first
+    view = df_features.loc[df_features["timestamp"].dt.floor("T") == t]
+    # We intentionally do not compute or touch any H-ahead targets here.
+    return view.head(1)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -427,11 +534,20 @@ CONFIG: Dict[str, Any] = {
     # "slippage_bp": 0.0,        # BrokerStub additional bp slippage
     "max_kelly": 0.5,
     "adv_cap_pct": 0.20,
-    "spread_bp": 0.0,  # half-spread in basis points
-    "commission": 0.0,  # $/share
-    "slippage_bp": 0.0,  # BrokerStub additional bp slippage
+    #"spread_bp": 0.0,  # half-spread in basis points
+    #"commission": 0.0,  # $/share
+    #"slippage_bp": 0.0,  # BrokerStub additional bp slippage
     # debug/test toggle
-    "debug_no_costs": True,  # ← set True for the tiny RRC slice
+    #"debug_no_costs": True,  # ← set True for the tiny RRC slice
+    "vectorized_scoring": True,  # Step 4.6: enable batch scoring by minute across symbols
+
+
+    # Costs ON by default — disable only for micro unit tests
+    "commission": 0.005,      # $/share (e.g., $0.005)
+    "debug_no_costs": False,  # True only for tiny synthetic tests
+    # optional: if you later record half-spread per trade, we'll use that directly
+
+
 # dev gating options
     "dev_scanner_loose": True,    # ← NEW
     "dev_detector_mode": "OR",    # ← NEW; force OR even without YAML
@@ -543,6 +659,369 @@ def _aggregate_universe_outputs(artifacts_root: Path, symbols: list[str]) -> tup
     return dec, trd
 
 
+# --- Phase 4.2: attach modeled costs to trades (commission + spread + impact)
+def _apply_modeled_costs_to_trades(trades: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Add round-trip modeled costs and net PnL:
+      modeled_cost_total = spread + commission + slippage + market_impact
+
+    Sane defaults so tests never get NaNs:
+      • if half_spread_usd missing ⇒ derive from cfg['spread_bp'] (default 1.0 bp)
+      • if adv_frac missing ⇒ 0.0
+      • commission/slippage default to 0.0
+      • market impact default: impact_bps_per_adv_frac (default 25 bps per 1.0 ADV fraction)
+
+    Returns a copy with columns:
+      'modeled_cost_total', 'realized_pnl_after_costs'
+    """
+    df = trades.copy()
+
+    # Short-circuit for costless mode
+    if bool(cfg.get("debug_no_costs", False)):
+        df["modeled_cost_total"] = 0.0
+        df["realized_pnl_after_costs"] = df["realized_pnl"].astype(float)
+        return df
+
+    # Pull knobs with safe defaults
+    spread_bp = float(cfg.get("spread_bp", 1.0))          # half-spread *in bps of price*
+    commission_per_share = float(cfg.get("commission", 0.0))
+    slippage_bp = float(cfg.get("slippage_bp", 0.0))
+    impact_bps_per_frac = float(cfg.get("impact_bps_per_adv_frac", 25.0))
+
+    # Required numeric columns with safe types
+    qty = df.get("qty", 0).astype(float).abs()
+    entry = df.get("entry_price", 0).astype(float)
+    exit_ = df.get("exit_price", 0).astype(float)
+    mid = (entry.add(exit_)).div(2.0)
+
+    # half_spread_usd: use provided, else derive from bps*price
+    half_spread_usd = df.get("half_spread_usd")
+    if half_spread_usd is None:
+        half_spread_usd = pd.Series(index=df.index, dtype=float)
+    half_spread_usd = half_spread_usd.astype(float)
+    fallback_half_spread = (spread_bp / 1e4) * mid  # USD/share
+    half_spread_usd = half_spread_usd.where(~half_spread_usd.isna(), fallback_half_spread)
+
+    # adv_frac (for market impact) — default 0
+    adv_frac = df.get("adv_frac")
+    if adv_frac is None:
+        adv_frac = pd.Series(0.0, index=df.index)
+    adv_frac = adv_frac.astype(float).fillna(0.0)
+
+    # Components (all positive)
+    spread_cost = 2.0 * half_spread_usd * qty
+    commission_cost = 2.0 * commission_per_share * qty
+    slippage_cost = (slippage_bp / 1e4) * mid * 2.0 * qty
+    impact_bp = impact_bps_per_frac * adv_frac           # bps
+    impact_cost = (impact_bp / 1e4) * mid * qty
+
+    total = (spread_cost + commission_cost + slippage_cost + impact_cost).fillna(0.0)
+
+    df["modeled_cost_total"] = total
+    df["realized_pnl_after_costs"] = df["realized_pnl"].astype(float) - total
+    return df
+
+# Phase 4.3 – simulator & quotes
+from prediction_engine.portfolio.order_sim import simulate_entry, simulate_exit, QuoteStats
+from prediction_engine.portfolio.quotes import estimate_quote_stats_from_rolling
+
+# --- Phase 4.3: decisions → simulated trades (deterministic MOO/MOC, partial fills)
+def _simulate_trades_from_decisions(
+    decisions: pd.DataFrame,
+    bars: pd.DataFrame,
+    *,
+    rules: dict,
+    horizon_col: str = "horizon_bars",
+    target_qty_col: str = "target_qty",
+) -> pd.DataFrame:
+    """
+    Turn per-bar 'decisions' into trades with entry/exit at next opens.
+    Requirements:
+      decisions: ['timestamp','symbol', target_qty_col, horizon_col, ...]
+      bars:      ['timestamp','symbol','open','volume', ('adv_shares' optional)]
+    Returns DataFrame with: ['symbol','entry_ts','entry_price','exit_ts','exit_price',
+                             'bars_held','qty','realized_pnl','half_spread_usd','adv_frac']
+    """
+    if decisions.empty:
+        return pd.DataFrame()
+
+    import pandas as _pd
+    dec = decisions.copy()
+    dec["timestamp"] = _pd.to_datetime(dec["timestamp"], utc=True)
+    bars = bars.copy()
+    bars["timestamp"] = _pd.to_datetime(bars["timestamp"], utc=True)
+
+    # Build next-open lookup per symbol
+    bars_by_sym = {s: g.sort_values("timestamp").reset_index(drop=True) for s, g in bars.groupby("symbol")}
+    def _next_open(sym: str, t):
+        g = bars_by_sym.get(sym)
+        if g is None: return None, None, None
+        idx = g["timestamp"].searchsorted(t, side="right")  # next bar
+        if idx >= len(g): return None, None, None
+        return float(g.loc[idx, "open"]), _pd.Timestamp(g.loc[idx, "timestamp"]), float(g.loc[idx, "volume"])
+
+    rows = []
+    for i, r in dec.iterrows():
+        sym = str(r["symbol"])
+        tgt = float(r.get(target_qty_col, 0.0))
+        H   = int(r.get(horizon_col, 1))
+        if tgt == 0:
+            continue
+
+        # entry at next open
+        px_e, ts_e, vol_e = _next_open(sym, r["timestamp"])
+        if ts_e is None:
+            continue
+
+        # crude quote stats from bars (spread & ADV)
+        q = estimate_quote_stats_from_rolling(
+            {"open": px_e, "adv_shares": bars_by_sym[sym]["volume"].rolling(20, min_periods=1).mean().iloc[max(0, bars_by_sym[sym]["timestamp"].searchsorted(ts_e)-1)]}
+        )
+
+        ent = simulate_entry(
+            decision_row=_pd.Series({"target_qty": tgt, "bar_volume": vol_e}),
+            next_open_price=px_e,
+            next_open_ts=ts_e,
+            quote=q,
+            rules=rules,
+        )
+
+        # exit H bars later at open
+        # index of entry bar in symbol series:
+        g = bars_by_sym[sym]
+        idx_e = int(g["timestamp"].searchsorted(ts_e))
+        idx_x = idx_e + H
+        if idx_x >= len(g):
+            continue
+        px_x = float(g.loc[idx_x, "open"]); ts_x = _pd.Timestamp(g.loc[idx_x, "timestamp"])
+        ex = simulate_exit(
+            position_row=_pd.Series({"filled_qty": ent.filled_qty, "entry_price": ent.entry_price}),
+            exit_open_price=px_x,
+            exit_open_ts=ts_x,
+            bars_held=H,
+            quote=q,
+            rules=rules,
+        )
+
+        rows.append({
+            "symbol": sym,
+            "entry_ts": ent.entry_ts,
+            "entry_price": ent.entry_price,
+            "exit_ts": ex.exit_ts,
+            "exit_price": ex.exit_price,
+            "bars_held": ex.bars_held,
+            "qty": ent.filled_qty,
+            "realized_pnl": ex.realized_pnl,
+            "half_spread_usd": ent.half_spread_usd,
+            "adv_frac": ent.adv_frac,
+        })
+
+    return _pd.DataFrame(rows)
+
+
+
+# --- Phase 4.4: compute target_qty from calibrated p with a dose–response ramp + cost hurdle
+# --- Phase 4.4: compute target_qty from calibrated p with a dose–response ramp + cost hurdle
+def _apply_sizer_to_decisions(
+    decisions: pd.DataFrame,
+    bars: pd.DataFrame,
+    cfg: dict,
+    *,
+    target_qty_col: str = "target_qty",   # <- define it here
+) -> pd.DataFrame:
+    """
+    Fills `target_qty_col` in decisions using size_from_p on the next-open price and simple vol proxy.
+    Requirements:
+      decisions: ['timestamp','symbol','p_cal','horizon_bars', ...]
+      bars:      ['timestamp','symbol','open','volume'] (for next-open price and ADV/vol proxies)
+    """
+    import pandas as _pd
+    import numpy as np
+
+    if decisions.empty:
+        return decisions
+
+    dec = decisions.copy()
+    dec["timestamp"] = _pd.to_datetime(dec["timestamp"], utc=True)
+    bars = bars.copy()
+    bars["timestamp"] = _pd.to_datetime(bars["timestamp"], utc=True)
+
+    # Build per-symbol series
+    bars_by_sym = {s: g.sort_values("timestamp").reset_index(drop=True) for s, g in bars.groupby("symbol")}
+    # Rolling 20-bar sigma of log returns (per-symbol) as vol proxy
+    for s, g in bars_by_sym.items():
+        rets = _pd.Series(_pd.Series(g["open"]).astype(float)).pct_change().fillna(0.0)
+        g["sigma20"] = rets.rolling(20, min_periods=5).std().fillna(rets.std() or 0.005)
+        g["adv_shares"] = g["volume"].rolling(20, min_periods=1).mean().fillna(g["volume"])
+        bars_by_sym[s] = g
+
+    caps = RiskCaps(
+        max_gross_frac=float(cfg.get("max_gross_frac", 0.10)),
+        adv_cap_pct=float(cfg.get("adv_cap_pct", 0.20)),
+        max_shares=float(cfg.get("max_shares", 1e9)),
+    )
+    p_gate = float(cfg.get("p_gate_quantile", 0.55))
+    p_full = float(cfg.get("full_p_quantile", 0.65))
+    capital = float(cfg.get("equity", 100_000.0))
+    commission = float(cfg.get("commission", 0.0))
+    slippage_bp = float(cfg.get("slippage_bp", 0.0))
+    impact_bps_per_frac = float(cfg.get("impact_bps_per_adv_frac", 25.0))
+    cost_lambda = float(cfg.get("sizer_cost_lambda", 1.2))
+    strategy = cfg.get("sizer_strategy", "score")
+
+    target_qty = []
+    for _, r in dec.iterrows():
+        sym = str(r["symbol"])
+        g = bars_by_sym.get(sym)
+        if g is None or "p_cal" not in r or _pd.isna(r["p_cal"]):
+            target_qty.append(0.0)
+            continue
+
+        # look up next-open for price + contemporaneous vol/ADV
+        idx = g["timestamp"].searchsorted(r["timestamp"], side="right")
+        if idx >= len(g):
+            target_qty.append(0.0)
+            continue
+
+        price = float(g.loc[idx, "open"])
+        vol = float(g.loc[max(0, idx - 1), "sigma20"])
+        adv = float(g.loc[max(0, idx - 1), "adv_shares"])
+        half_spread_usd = float(cfg.get("half_spread_usd", (cfg.get("spread_bp", 2.0) / 1e4) * price))
+
+        costs = {
+            "price": price,
+            "half_spread_usd": half_spread_usd,
+            "commission": commission,
+            "slippage_bp": slippage_bp,
+            "impact_bps_per_adv_frac": impact_bps_per_frac,
+            "adv_shares": adv,
+            "adv_frac": 0.0,
+        }
+
+        qty = size_from_p(
+            float(r["p_cal"]),
+            vol=vol if vol > 0 else float(cfg.get("fallback_vol", 0.005)),
+            capital=capital,
+            risk_caps=caps,
+            costs=costs,
+            p_gate=p_gate,
+            p_full=p_full,
+            strategy=strategy,
+            cost_lambda=cost_lambda,
+        )
+
+        # Fallback ramp if sized 0 but above gate
+        if (qty is None) or (qty == 0.0 and float(r["p_cal"]) > p_gate):
+            ramp = 0.0
+            if p_full > p_gate:
+                ramp = (float(r["p_cal"]) - p_gate) / (p_full - p_gate)
+            ramp = float(np.clip(ramp, 0.0, 1.0))
+            max_dollars = caps.max_gross_frac * capital
+            max_shares_gross = max_dollars / max(price, 1e-8)
+            soft_cap_shares = min(max_shares_gross, caps.max_shares)
+            qty = float(max(0.0, ramp * soft_cap_shares))
+            if 0.0 < qty < 1.0:
+                qty = 1.0
+
+        target_qty.append(qty)
+
+    dec[target_qty_col] = target_qty
+    return dec
+
+
+
+# --- Phase 4.5: risk gating before turning decisions into trades -------------
+def _enforce_risk_on_decisions(decisions: pd.DataFrame,
+                               bars: pd.DataFrame,
+                               risk: RiskEngine,
+                               ledger: PortfolioLedger,
+                               *, symbol_sector: dict[str, str] | None = None,
+                               log=None) -> pd.DataFrame:
+    """
+    Drop/clip decisions that would violate risk limits at the moment of entry.
+    Approximates entry price with next-open (same lookup as the simulator).
+    """
+    import pandas as _pd
+    if decisions.empty:
+        return decisions
+
+    dec = decisions.copy()
+    dec["timestamp"] = _pd.to_datetime(dec["timestamp"], utc=True)
+    bars = bars.copy()
+    bars["timestamp"] = _pd.to_datetime(bars["timestamp"], utc=True)
+
+    # Build per symbol next-open lookup
+    bars_by_sym = {s: g.sort_values("timestamp").reset_index(drop=True) for s, g in bars.groupby("symbol")}
+
+    # Base snapshot from ledger (will be cloned and updated locally per timestamp)
+    def _base_snapshot():
+        return {
+            **ledger.snapshot_row(),
+            "positions": [s for s, p in ledger.positions.items() if p.qty != 0],
+            "symbol_notional": {s: abs(p.qty * p.avg_price) for s, p in ledger.positions.items()},
+            "sector_gross": {},  # local working view
+            "open_positions": sum(1 for p in ledger.positions.values() if p.qty != 0),
+        }
+
+    # Seed sector view from existing positions (approx using avg_price)
+    if hasattr(risk, "sector_gross") and isinstance(risk.sector_gross, dict):
+        sector_seed = dict(risk.sector_gross)
+    else:
+        sector_seed = {}
+
+    kept_rows = []
+
+    # Process decisions grouped by timestamp so we can enforce max_concurrent "within the bar"
+    for tstamp, group in dec.sort_values(["timestamp"]).groupby("timestamp"):
+        snap = _base_snapshot()
+        # start local view with risk engine's sector gross
+        snap["sector_gross"] = dict(sector_seed)
+
+        # loop deterministic by symbol to keep behavior stable
+        for _, r in group.sort_values(["symbol"]).iterrows():
+            sym = str(r["symbol"])
+            g = bars_by_sym.get(sym)
+            if g is None:
+                continue
+            idx = g["timestamp"].searchsorted(tstamp, side="right")
+            if idx >= len(g):
+                continue
+            price = float(g.loc[idx, "open"])
+            qty = float(r.get("target_qty", 0.0))
+            if qty == 0.0:
+                continue
+
+            sector = (symbol_sector or {}).get(sym, None)
+            ok, reason = risk.can_open(
+                symbol=sym, sector=sector, qty=qty, price=price, now=g.loc[idx, "timestamp"],
+                ledger_snapshot={
+                    "gross": snap["gross"],
+                    "net": snap["net"],
+                    "day_pnl": snap["day_pnl"],
+                    "positions": snap["positions"],
+                    "symbol_notional": snap["symbol_notional"],
+                },
+                open_positions=snap["open_positions"],
+            )
+
+            if ok:
+                # Accept and update LOCAL snapshot so later decisions at this same timestamp
+                # see the increased exposure/concurrency.
+                kept_rows.append(r)
+                add_notional = abs(qty * price)
+                side = 1 if qty > 0 else -1
+                snap["gross"] = snap["gross"] + add_notional
+                snap["net"] = snap["net"] + side * add_notional
+                snap["open_positions"] = snap["open_positions"] + (0 if sym in snap["positions"] else 1)
+                snap["positions"] = list(set(snap["positions"]) | {sym})
+                snap["symbol_notional"][sym] = snap["symbol_notional"].get(sym, 0.0) + add_notional
+                if sector:
+                    snap["sector_gross"][sector] = snap["sector_gross"].get(sector, 0.0) + add_notional
+            elif log:
+                log.info(f"[Risk] skip {sym} qty={qty:.0f} @ {price:.2f} — {reason}")
+
+    return _pd.DataFrame(kept_rows, columns=dec.columns) if kept_rows else dec.iloc[:0]
+
 
 async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
@@ -573,6 +1052,44 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     df_raw["adv_shares"] = df_raw["volume"].rolling(20, min_periods=1).mean()
     df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
+
+    # --- Test-only override: force constant p to exercise the full Phase-4 pipeline on bare OHLCV hives ---
+    unit_p = float(cfg.get("unit_test_force_constant_p", float("nan")))
+    if unit_p == unit_p:  # not-NaN → enabled
+        # Build minimal per-bar decisions (skip the very last bar; we need t+1 to exist)
+        dec = df_raw.loc[df_raw["timestamp"] < df_raw["timestamp"].max()].copy()
+        dec = dec[["timestamp"]].copy()
+        dec["symbol"] = str(sym)
+        dec["p_raw"] = unit_p
+        dec["p_cal"] = unit_p
+        dec["horizon_bars"] = int(cfg.get("horizon_bars", 3))
+
+        # Sizer → target_qty on next-open
+        bars_min = df_full[["timestamp","symbol","open","volume"]].copy()
+        sized = _apply_sizer_to_decisions(decisions=dec, bars=bars_min, cfg=cfg)
+        sized = sized.loc[sized["target_qty"].abs() > 0].copy()
+
+        # Simulate fills (MOO/MOC with gap bands + partial fills)
+        rules = {
+            "max_participation": float(cfg.get("max_participation", 0.25)),
+            "moo_gap_band": True, "moc_gap_band": True,
+        }
+        trades = _simulate_trades_from_decisions(
+            decisions=sized, bars=bars_min, rules=rules,
+            horizon_col="horizon_bars", target_qty_col="target_qty",
+        )
+
+        # Persist per-symbol artifacts so the Phase-4.7 aggregator can pick them up
+        sym_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
+        sym_dir.mkdir(parents=True, exist_ok=True)
+        if len(sized):
+            sized.to_parquet(sym_dir / "decisions.parquet", index=False)
+        if len(trades):
+            trades.to_parquet(sym_dir / "trades.parquet", index=False)
+
+        # Short-circuit the per-symbol runner in this test mode; aggregation runs later in `run()`
+        return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
+
 
     # 2) Walk-forward runner (unchanged, but pass symbol)
     resolved_parquet_root = _resolve_path(cfg["parquet_root"])
@@ -715,6 +1232,146 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(cfg.get("artifacts_root", "artifacts/a2"))}])
 
 
+def _score_minute_batch_shim(ev_engine, minute_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transitional shim for Step 4.6: if df has PCA feature columns, call a single
+    vectorized predict. Otherwise, return empty and let the legacy path run.
+    This keeps the wiring safe while you progressively feed feature rows here.
+    """
+    if minute_df.empty:
+        return minute_df
+    pca_cols = [c for c in minute_df.columns if c.startswith("pca_")]
+    if not pca_cols:
+        return pd.DataFrame(columns=["timestamp","symbol","p_raw","p_cal"])
+    res = vectorize_minute_batch(ev_engine, minute_df, pca_cols)
+    return res.frame
+
+
+# ─── Step 4.8 helpers (module scope) ───────────────────────────────────
+
+def _share_multisymbol(decisions: pd.DataFrame) -> float:
+    if decisions.empty or not {'timestamp', 'symbol'}.issubset(decisions.columns):
+        return 0.0
+    g = decisions.groupby('timestamp')['symbol'].nunique()
+    return float((g >= 2).mean())
+
+def _median_slippage_error_bps(trades: pd.DataFrame) -> float:
+    """
+    Approx 'replay' check: when MOO/MOC simulator wrote half_spread_usd, the ideal
+    execution is open ± half_spread. Compare what we actually recorded vs ideal.
+    """
+    if trades.empty:
+        return 0.0
+    df = trades.copy()
+    for col in ("entry_price", "exit_price", "half_spread_usd"):
+        if col not in df.columns:
+            return 0.0
+
+    # +1 for long, -1 for short if qty present; default +1
+    side = pd.Series(1.0, index=df.index)
+    if "qty" in df.columns:
+        side = (df["qty"] > 0).astype(float).where(df["qty"].notna(), 1.0) * 2.0 - 1.0
+
+    ideal_entry = df["entry_price"] - (side * df["half_spread_usd"] * -1.0)
+    ideal_exit  = df["exit_price"]  + (side * df["half_spread_usd"] * -1.0)
+
+    def _bps(err, base):
+        base = base.where(base.abs() > 1e-12, 1.0)
+        return (err.abs() / base) * 1e4
+
+    entry_bps = _bps((df["entry_price"] - ideal_entry), df["entry_price"])
+    exit_bps  = _bps((df["exit_price"]  - ideal_exit),  df["exit_price"])
+    both = pd.concat([entry_bps, exit_bps], ignore_index=True)
+    return float(both.median(skipna=True))
+
+def _sizing_sanity(decisions: pd.DataFrame, *, p_threshold: float = 0.60, p_gate: float | None = None) -> dict:
+    """
+    (a) median target size for p>=threshold > 0
+    (b) count 'cost-hurdle violations' where p >= gate but target_qty==0
+    """
+    out = {"median_pos_gt_zero": False, "cost_hurdle_violations": 0}
+    if decisions.empty:
+        return out
+    if "p_cal" not in decisions.columns or "target_qty" not in decisions.columns:
+        return out
+
+    hi = decisions.loc[decisions["p_cal"] >= p_threshold]
+    if len(hi):
+        out["median_pos_gt_zero"] = float(hi["target_qty"].fillna(0).abs().median()) > 0.0
+
+    gate = float(p_gate) if p_gate is not None else p_threshold
+    #v = decisions.loc[(decisions["p_cal"] >= gate) & (decisions["target_qty"].fillna(0) == 0)]
+    # Strictly above the gate is a violation if size is still zero.
+    eps = 1e-12
+    v = decisions.loc[(decisions["p_cal"] > gate + eps) & (decisions["target_qty"].fillna(0) == 0)]
+
+    out["cost_hurdle_violations"] = int(len(v))
+    return out
+
+def _promotion_checks_step4_8(*, port_dir: Path, cfg: dict | None = None) -> dict:
+    """
+    Reads portfolio/decisions.parquet & trades.parquet, evaluates readiness bar.
+    Returns dict with booleans + key metrics; prints human-readable summary.
+    """
+    dec_p = port_dir / "decisions.parquet"
+    trd_p = port_dir / "trades.parquet"
+    results = {
+        "exists_decisions": dec_p.exists(),
+        "exists_trades": trd_p.exists(),
+        "exists_equity": (port_dir / "equity_curve.csv").exists(),
+        "exists_metrics_json": (port_dir / "portfolio_metrics.json").exists(),
+        "share_multisymbol": 0.0,
+        "slippage_median_bps": 0.0,
+        "commission_nonzero": False,
+        "sizing_median_pos_gt0": False,
+        "sizing_cost_hurdle_violations": None,
+        "passed": False,
+    }
+    if not (results["exists_decisions"] and results["exists_trades"]):
+        print("[4.8] Missing portfolio decisions/trades; cannot evaluate promotion.")
+        return results
+
+    decisions = pd.read_parquet(dec_p)
+    trades = pd.read_parquet(trd_p)
+
+    # Multi-symbol presence
+    results["share_multisymbol"] = _share_multisymbol(decisions)
+
+    # PnL realism
+    results["slippage_median_bps"] = _median_slippage_error_bps(trades)
+    if "modeled_cost_total" in trades.columns:
+        if cfg and float(cfg.get("commission", 0.0)) > 0.0:
+            results["commission_nonzero"] = True
+        else:
+            results["commission_nonzero"] = bool((trades["modeled_cost_total"] > 0).any())
+
+    # Sizing sanity
+    p_gate = float(cfg.get("p_gate_quantile", 0.55)) if cfg else None
+    sz = _sizing_sanity(decisions, p_threshold=0.60, p_gate=p_gate)
+    results["sizing_median_pos_gt0"] = bool(sz["median_pos_gt_zero"])
+    results["sizing_cost_hurdle_violations"] = int(sz["cost_hurdle_violations"])
+
+    # Pass/fail
+    checks = [
+        (results["share_multisymbol"] >= 0.10, "multi-symbol share ≥ 0.10"),
+        (results["slippage_median_bps"] < 10.0, "slippage median < 10 bps"),
+        (results["commission_nonzero"], "commission line non-zero"),
+        (results["sizing_median_pos_gt0"], "median size > 0 for p≥0.60"),
+        (results["sizing_cost_hurdle_violations"] == 0, "0% cost-hurdle violations"),
+        (results["exists_equity"] and results["exists_metrics_json"], "equity+metrics emitted"),
+    ]
+    results["passed"] = all(ok for ok, _ in checks)
+
+    print("[4.8] Promotion checklist:")
+    for ok, label in checks:
+        print(f"    [{'OK' if ok else 'FAIL'}] {label}")
+    print(f"    share_multisymbol={results['share_multisymbol']:.3f}  "
+          f"slip_median_bps={results['slippage_median_bps']:.2f}  "
+          f"sizing_cost_hurdle_violations={results['sizing_cost_hurdle_violations']}")
+    return results
+
+
+
 
 # ────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -791,6 +1448,23 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(f"[Parquet] Partitions (symbol:count) {sample}{' ...' if len(part_counts) > 12 else ''}")
     print("=" * 72)
 
+
+    # Phase 4.1: build the unified clock (audit only; scoring loop refactor comes later)
+    uni_clock = build_unified_clock(parquet_root, cfg["start"], cfg["end"], symbols)
+    print(f"[Clock] unified minutes = {len(uni_clock)} from {uni_clock.min() if len(uni_clock) else '∅'} "
+          f"to {uni_clock.max() if len(uni_clock) else '∅'}")
+
+    # Optional: persist for debugging/inspection alongside portfolio outputs
+    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    (arte_root / "portfolio").mkdir(parents=True, exist_ok=True)
+    clock_out = arte_root / "portfolio" / "unified_clock.csv"
+    if len(uni_clock):
+        pd.Series(uni_clock, name="timestamp").to_csv(clock_out, index=False)
+        print(f"[Clock] wrote unified clock → {clock_out}")
+    else:
+        print("[Clock] WARNING: unified clock is empty for the requested window/universe.")
+
+
     if not symbols:
         raise RuntimeError("No requested symbols were found under parquet/. Abort.")
 
@@ -835,6 +1509,67 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         if colmap:
             trd_df = trd_df.rename(columns=colmap)
 
+
+
+        # Phase 4.2: attach modeled costs (commission + half-spread + impact)
+        # If your per-trade schema already contains 'half_spread_usd' or 'adv_frac',
+        # pass them via half_spread_col / adv_pct_col below.
+        trd_df = _apply_modeled_costs_to_trades(
+            trd_df,
+            cfg=cfg,
+            price_col="entry_price",
+            qty_col="qty" if "qty" in trd_df.columns else ("shares" if "shares" in trd_df.columns else "quantity"),
+            half_spread_col="half_spread_usd" if "half_spread_usd" in trd_df.columns else None,
+            adv_pct_col="adv_frac" if "adv_frac" in trd_df.columns else None,
+        )
+
+        # --- Phase 4.5: apply ledger & record portfolio columns on fills ------------
+        # Initialize ledger using cfg equity; set gross/net limits relative to equity
+        equity0 = float(cfg.get("equity", 100_000.0))
+        ledger = PortfolioLedger(cash=equity0)
+
+
+
+        limits = RiskLimits(
+            max_gross=equity0 * float(cfg.get("max_gross_frac", 0.5)),
+            max_net=equity0 * float(cfg.get("max_net_frac", 0.2)),
+            per_symbol_cap=equity0 * float(cfg.get("per_symbol_cap_frac", 0.15)),
+            sector_cap=equity0 * float(cfg.get("sector_cap_frac", 0.25)),
+            max_concurrent=int(cfg.get("max_concurrent", 5)),
+            daily_stop=-equity0 * float(cfg.get("daily_stop_frac", 0.02)),
+            streak_stop=int(cfg.get("streak_stop", 0)),
+        )
+        risk = RiskEngine(limits)
+
+        port_rows = []
+        for i, row in trd_df.sort_values("entry_ts").iterrows():
+            # entry leg
+            entry = TradeFill(
+                symbol=str(row["symbol"]),
+                ts=pd.to_datetime(row["entry_ts"], utc=True),
+                side=+1 if row.get("qty", 0.0) > 0 else -1,
+                qty=abs(float(row.get("qty", 0.0))),
+                price=float(row["entry_price"]),
+                fees=float(row.get("modeled_cost_total", 0.0)) * 0.5,  # half on entry
+            )
+            ledger.on_fill(entry)
+            # exit leg
+            exitf = TradeFill(
+                symbol=str(row["symbol"]),
+                ts=pd.to_datetime(row["exit_ts"], utc=True),
+                side=-entry.side,
+                qty=entry.qty,
+                price=float(row["exit_price"]),
+                fees=float(row.get("modeled_cost_total", 0.0)) * 0.5,  # half on exit
+            )
+            ledger.on_fill(exitf)
+
+            snap = ledger.snapshot_row()
+            port_rows.append({**row.to_dict(), **snap})
+
+        # augment trades with portfolio columns
+        trd_df = pd.DataFrame(port_rows) if port_rows else trd_df
+
         # Save unified trades
         trades_out = port_dir / "trades.parquet"
         trd_df.to_parquet(trades_out, index=False)
@@ -846,11 +1581,86 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             curve_out = port_dir / "equity_curve.csv"
             curve.to_csv(curve_out, header=["equity"])
             print(f"[Portfolio] equity curve → {curve_out}")
+
+            # --- Phase 4.7: portfolio-level metrics (turnover, exposure, DD) -------
+            def _compute_portfolio_metrics(trades_df: pd.DataFrame,
+                                           equity_curve: pd.Series | None,
+                                           equity0: float) -> dict:
+                import numpy as _np
+                import pandas as _pd
+
+                if trades_df.empty:
+                    return {
+                        "n_trades": 0, "win_rate": 0.0, "turnover": 0.0,
+                        "avg_concurrent_positions": 0.0, "max_drawdown": 0.0,
+                    }
+
+                df = trades_df.copy()
+                # Coerce types
+                for c in ("entry_ts", "exit_ts"):
+                    if c in df.columns:
+                        df[c] = _pd.to_datetime(df[c], utc=True, errors="coerce")
+                for c in ("entry_price", "exit_price", "qty", "realized_pnl_after_costs", "realized_pnl"):
+                    if c in df.columns:
+                        df[c] = _pd.to_numeric(df[c], errors="coerce")
+
+                # Round-trip dollars (simple turnover proxy)
+                notional_in = (df["qty"].abs() * df["entry_price"]).fillna(0.0)
+                notional_out = (df["qty"].abs() * df["exit_price"]).fillna(0.0)
+                turnover_dollars = float((notional_in + notional_out).sum())
+                turnover = (turnover_dollars / max(equity0, 1e-9))
+
+                # Outcomes (prefer after-costs if present)
+                pnl_col = "realized_pnl_after_costs" if "realized_pnl_after_costs" in df.columns else "realized_pnl"
+                wins = (df[pnl_col] > 0).mean() if len(df) else 0.0
+
+                # Concurrent exposure: average open positions across the run window
+                # Build minute grid from entries/exits, count overlaps
+                if df[["entry_ts", "exit_ts"]].notna().all().all():
+                    # 1-minute grid between min(entry) and max(exit)
+                    t0, t1 = df["entry_ts"].min(), df["exit_ts"].max()
+                    grid = _pd.date_range(t0.floor("T"), t1.ceil("T"), freq="T", tz="UTC")
+                    # fast interval counting
+                    starts = _pd.Series(0, index=grid, dtype="int64")
+                    ends = _pd.Series(0, index=grid, dtype="int64")
+                    for _, r in df.iterrows():
+                        es = r["entry_ts"].floor("T")
+                        xs = r["exit_ts"].floor("T")
+                        if es in starts.index: starts[es] += 1
+                        if xs in ends.index:   ends[xs] += 1
+                    open_ct = starts.cumsum() - ends.cumsum().shift(fill_value=0)
+                    avg_conc = float(open_ct.mean())
+                else:
+                    avg_conc = 0.0
+
+                # Max drawdown from equity curve (after realized PnL only)
+                if equity_curve is not None and len(equity_curve) > 0:
+                    eq = equity_curve.astype(float).copy()
+                    roll_max = eq.cummax()
+                    dd = (eq - roll_max)
+                    max_dd = float(dd.min())  # negative number (depth)
+                else:
+                    max_dd = 0.0
+
+                return {
+                    "n_trades": int(len(df)),
+                    "win_rate": float(wins),
+                    "turnover": float(turnover),
+                    "avg_concurrent_positions": float(avg_conc),
+                    "max_drawdown": float(max_dd),
+                }
+
+            # Compute & write portfolio_metrics.json alongside equity curve
+            metrics = _compute_portfolio_metrics(trd_df, curve if 'curve' in locals() else None, equity0)
+            metrics_path = port_dir / "portfolio_metrics.json"
+            metrics_path.write_text(json.dumps(metrics, indent=2))
+            print(f"[Portfolio] metrics → {metrics_path} :: "
+                  f"trades={metrics['n_trades']} win_rate={metrics['win_rate']:.2%} "
+                  f"turnover={metrics['turnover']:.2f} avg_open={metrics['avg_concurrent_positions']:.2f} "
+                  f"maxDD={metrics['max_drawdown']:.2f}")
+
         else:
             print("[Portfolio] skipped equity curve (missing exit_ts or realized_pnl)")
-
-    # ─── end Phase 4 ────────────────────────────────────────────────────
-
 
     # --- Phase-4: consolidate per-fold/per-symbol outputs into single files ---
     artifacts_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
@@ -874,10 +1684,28 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         if {'decision_ts','entry_ts'}.issubset(dec.columns):
             lag_ok = (pd.to_datetime(dec['entry_ts']) > pd.to_datetime(dec['decision_ts'])).mean()
             print("entry strictly after decision:", round(float(lag_ok), 3))
+            # Phase 4.7 extra soft checks
+            port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
+            metrics_json = port_dir / "portfolio_metrics.json"
+            print("has portfolio_metrics.json:", metrics_json.exists())
+            if (port_dir / "equity_curve.csv").exists():
+                ec = pd.read_csv(port_dir / "equity_curve.csv", parse_dates=["exit_ts"])
+                print("equity curve rows:", len(ec))
+
     else:
         print("[Phase-4] Note: could not find per-fold outputs to consolidate into decisions/trades. "
               "Backtest completed, but portfolio acceptance checks were skipped.")
 
+
+    # ─── Step 4.8: evaluate readiness (requires portfolio/ files & costs ON) ───
+    try:
+        port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
+        promo = _promotion_checks_step4_8(port_dir=port_dir, cfg=cfg)
+        print(f"[4.8] passed={promo['passed']}  "
+              f"multi={promo['share_multisymbol']:.3f}  "
+              f"slip_bps={promo['slippage_median_bps']:.2f}")
+    except Exception as e:
+        print(f"[4.8] Promotion checks skipped due to error: {e!r}")
 
 
     # decisions must exist and contain both symbols on a shared timeline
