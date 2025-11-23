@@ -630,3 +630,134 @@ class ArtifactManager:
 
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+
+    # --- INSERT INSIDE ArtifactManager (AFTER fit_or_load) -------------------
+    def build_fold_artifacts(
+        self,
+        *,
+        universe: List[str],
+        train_start: str,
+        train_end: str,
+        fold_dir: Path | str,
+        strategy: Strategy = "pooled",
+        fold_id: int | str | None = None,
+        config_hash_parts: Dict[str, object] | None = None,
+        schema_hash_parts: Dict[str, object] | None = None,
+        # optional builders (same signatures you already use)
+        per_symbol_builder=None,   # (symbol, out_dir: Path, start, end) -> None
+        pooled_builder=None,       # (symbols: List[str], out_dir: Path, start, end) -> None
+        calibrator_builder=None,   # (symbol: str, pooled_dir: Path, start, end) -> (pkl_path, metrics_dict)
+    ) -> Dict[str, Path]:
+        """
+        Build (or refresh) artifacts scoped to a *single fold* namespace.
+
+        Layout:
+          <artifacts_root>/folds/fold_i/
+            pooled/...   or   <SYM>/...
+
+        Writes meta.json in the chosen directory with:
+          train_window, universe_hash, schema_hash, config_hash, row_count|digest, tmax (if available), fold_id
+        """
+        self.parquet_root = Path(self.parquet_root).expanduser().resolve()
+        fold_dir = Path(fold_dir).expanduser().resolve()
+        fold_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg_hash = _hash_obj(config_hash_parts or {})
+        sch_hash = _hash_schema(schema_hash_parts)
+        u_hash = _hash_universe(universe)
+        fp = _fingerprint_slice(self.parquet_root, universe, train_start, train_end)
+
+        if strategy == "per_symbol":
+            out_dirs: Dict[str, Path] = {}
+            for sym in universe:
+                dest = fold_dir / sym
+                dest.mkdir(parents=True, exist_ok=True)
+
+                meta_path = dest / "meta.json"
+                old_meta = _load_meta(meta_path)
+
+                # If fp is dict-like (per symbol), use per-symbol portion; else wrap digest
+                if isinstance(fp, dict):
+                    sym_fp = fp.get(sym, {"rows": 0, "tmax": None})
+                else:
+                    sym_fp = {"digest": fp}
+
+                payload = {
+                    "fold_id": fold_id,
+                    "strategy": "per_symbol",
+                    "symbol": sym,
+                    "train_window": {"start": train_start, "end": train_end},
+                    "fingerprint": sym_fp,
+                    "config_hash": cfg_hash,
+                    "schema_hash": sch_hash,
+                    "universe_hash": u_hash,
+                }
+
+                # distance contract mirror (optional but keeps parity with fit_or_load)
+                family = (config_hash_parts or {}).get("metric", "euclidean")
+                k_max = int((config_hash_parts or {}).get("k_max", 32))
+                distance_params: dict[str, object] = {"k_max": k_max}
+                schema_file = dest / "feature_schema.json"
+                if schema_file.exists():
+                    distance_params["feature_schema_path"] = str(schema_file)
+                payload["distance"] = {"family": str(family), "params": distance_params}
+
+                if _needs_rebuild(old_meta, payload):
+                    if per_symbol_builder:
+                        per_symbol_builder(sym, dest, train_start, train_end)
+                    meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
+
+                out_dirs[sym] = dest
+            return out_dirs
+
+        elif strategy == "pooled":
+            dest = fold_dir / "pooled"
+            dest.mkdir(parents=True, exist_ok=True)
+            _ensure_ann_contract(dest)  # ann/{TREND,RANGE,VOL,GLOBAL}.index
+
+            meta_path = dest / "meta.json"
+            old_meta = _load_meta(meta_path)
+
+            payload = {
+                "fold_id": fold_id,
+                "strategy": "pooled",
+                "symbols": list(universe),
+                "train_window": {"start": train_start, "end": train_end},
+                "fingerprint": fp,                # full-slice fingerprint (rows/min/max or digest)
+                "config_hash": cfg_hash,
+                "schema_hash": sch_hash,
+                "universe_hash": u_hash,
+                "paths": {
+                    "scaler": str(dest / "scaler.pkl"),
+                    "pca": str(dest / "pca.pkl"),
+                    "clusters": str(dest / "clusters.pkl"),
+                    "feature_schema": str(dest / "feature_schema.json"),
+                    "calibrators_dir": str(dest / "calibrators"),
+                },
+            }
+            (dest / "calibrators").mkdir(parents=True, exist_ok=True)
+
+            # distance contract
+            family = (config_hash_parts or {}).get("metric", "euclidean")
+            k_max = int((config_hash_parts or {}).get("k_max", 32))
+            payload["distance"] = {"family": str(family), "params": {"k_max": k_max}}
+
+            # write diagnostics skeleton once (safe to overwrite)
+            _write_diagnostics_json(dest, payload={"distance": payload.get("distance"),
+                                                   "schema_hash": payload.get("schema_hash")}, symbols=universe)
+
+            if _needs_rebuild(old_meta, payload):
+                if pooled_builder:
+                    pooled_builder(universe, dest, train_start, train_end)
+                if calibrator_builder:
+                    for sym in universe:
+                        calibrator_builder(sym, dest, train_start, train_end)
+                _write_diagnostics_json(dest, payload={"distance": payload.get("distance"),
+                                                       "schema_hash": payload.get("schema_hash")}, symbols=universe)
+                meta_path.write_text(json.dumps({"payload": payload}, indent=2), encoding="utf-8")
+
+            return {"__pooled__": dest}
+
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+    # --- END INSERT -----------------------------------------------------------

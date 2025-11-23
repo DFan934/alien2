@@ -35,6 +35,124 @@ class Fold:
     purge_bars: int
 
 
+
+# --- INSERT AFTER: the Fold dataclass definition ---
+
+def make_time_folds(
+    *,
+    window_start: "pd.Timestamp | str",
+    window_end: "pd.Timestamp | str",
+    mode: str,
+    n_folds: int,
+    test_span_days: int,
+    train_min_days: int,
+    embargo_days: int,
+) -> list[Fold]:
+    """
+    Build time-only folds with an explicit embargo gap between TRAIN and TEST.
+      • Expanding: TRAIN starts at window_start; TRAIN end is (test_start - embargo)
+      • Rolling:   TRAIN has fixed length; TRAIN end is (test_start - embargo)
+      • TEST:      [test_start, test_start + test_span_days)  (left-closed, right-open)
+    Returns a list of Fold(idx, train_start, train_end, test_start, test_end, purge_bars=embargo_days).
+    NOTE: We store embargo_days in the Fold.purge_bars field to avoid changing the dataclass shape.
+    """
+    import pandas as _pd
+
+    ws = _pd.to_datetime(window_start)
+    we = _pd.to_datetime(window_end)
+    if not (ws < we):
+        raise ValueError("window_start must be < window_end")
+
+    mode = str(mode).lower()
+    if mode not in {"expanding", "rolling"}:
+        raise ValueError("mode must be 'expanding' or 'rolling'")
+
+    if n_folds <= 0:
+        raise ValueError("n_folds must be >= 1")
+    if test_span_days <= 0 or train_min_days <= 0 or embargo_days < 0:
+        raise ValueError("test_span_days > 0, train_min_days > 0, embargo_days >= 0 required")
+
+    # Compute test starts uniformly over the window
+    total_days = (we.normalize() - ws.normalize()).days
+    if total_days < (train_min_days + embargo_days + test_span_days):
+        raise ValueError("Window too short for requested train/embargo/test lengths.")
+
+    # Even spacing of test blocks (not overlapping), clipped to fit inside the window
+    # We’ll choose test_start candidates and take the first n_folds that fit.
+    # TEST is left-closed/right-open to avoid boundary double-count.
+    test_starts = []
+    cursor = ws.normalize() + _pd.Timedelta(days=train_min_days + embargo_days)
+    while cursor + _pd.Timedelta(days=test_span_days) <= we:
+        test_starts.append(cursor)
+        # Next test block starts right after the previous test block
+        cursor = cursor + _pd.Timedelta(days=test_span_days)
+
+    if len(test_starts) == 0:
+        raise ValueError("Could not place any test folds with given constraints.")
+    if len(test_starts) > n_folds:
+        test_starts = test_starts[:n_folds]
+
+    folds: list[Fold] = []
+    for i, ts in enumerate(test_starts, start=1):
+        te = ts + _pd.Timedelta(days=test_span_days)  # right-open
+        if te > we:
+            break  # don’t create ragged partial fold beyond the window
+
+        # Train end is test_start - embargo
+        train_end = ts - _pd.Timedelta(days=embargo_days)
+        if mode == "expanding":
+            train_start = ws
+        else:  # rolling
+            train_start = train_end - _pd.Timedelta(days=train_min_days)
+            if train_start < ws:
+                # not enough space for a full rolling window; skip
+                continue
+
+        if not (train_start < train_end and ts < te):
+            # Skip degenerate folds
+            continue
+
+        folds.append(
+            Fold(
+                idx=i,
+                train_start=train_start.tz_localize(None) if hasattr(train_start, "tz") else train_start,
+                train_end=(train_end - _pd.Timedelta(nanoseconds=1)),  # make TRAIN right-closed
+                test_start=ts,
+                test_end=(te - _pd.Timedelta(nanoseconds=1)),         # make TEST right-closed for persistence
+                purge_bars=int(embargo_days),  # store embargo_days here for compatibility
+            )
+        )
+
+    if not folds:
+        raise ValueError("No valid folds produced. Check your time bounds and parameters.")
+    return folds
+
+
+def save_folds_json(artifacts_root: "Path | str", folds: list[Fold]) -> "Path":
+    """
+    Write folds.json under artifacts_root/folds/
+    """
+    root = Path(artifacts_root)
+    outdir = root / "folds"
+    outdir.mkdir(parents=True, exist_ok=True)
+    payload = [
+        {
+            "idx": f.idx,
+            "train_start": str(f.train_start),
+            "train_end": str(f.train_end),
+            "test_start": str(f.test_start),
+            "test_end": str(f.test_end),
+            "embargo_days": int(f.purge_bars),  # stored here
+        }
+        for f in folds
+    ]
+    out = outdir / "folds.json"
+    out.write_text(json.dumps(payload, indent=2))
+    return out
+
+
+
+
 class WalkForwardRunner:
     """
     A2 (revised): Purged walk-forward built off the FULL bar stream.
@@ -160,7 +278,20 @@ class WalkForwardRunner:
         # Align helper: quick index by timestamp
         y_by_ts = pd.Series(y_full.values, index=full["timestamp"].values)
 
-        folds = self._build_folds(start, end, full)
+        #folds = self._build_folds(start, end, full)
+
+        # --- INSERT near the top of WalkForwardRunner.run(...) after you resolve start/end ---
+
+        folds = make_time_folds(
+            window_start=start,
+            window_end=end,
+            mode="expanding",  # or "rolling" or param
+            n_folds=6,  # example
+            test_span_days=20,  # example
+            train_min_days=60,  # example
+            embargo_days=3,  # example
+        )
+        save_folds_json(self.artifacts_root, folds)
 
         all_fold_metrics = []
         total_entries = 0
@@ -323,6 +454,33 @@ class WalkForwardRunner:
                 if p.is_file():
                     shutil.copy2(p, ev_dst / p.name)
 
+            # ---- 5.3: run fold TEST via backtest callable ------------------------------
+            from scripts.run_backtest import run_batch as run_bt
+
+            test_cfg = {
+                "parquet_root": str(self.parquet_root),
+                "universe": [self.symbol],  # or a list of symbols in your universe
+                "start": str(pd.to_datetime(f.test_start).date()),
+                "end": str(pd.to_datetime(f.test_end).date()),
+                "equity": float(self.__dict__.get("equity", 100_000.0)),
+                "commission": 0.005,
+                "debug_no_costs": bool(self.debug_no_costs),
+                "vectorized_scoring": True,
+                # carry over fold FE prepro dir if you saved it above
+                "prepro_dir": str(prepro_dir),
+                # optional: if you have a ready test features frame:
+                # "test_features_df": feats_scan_te,
+                "horizon_bars": int(self.horizon_bars),
+            }
+
+            bt_metrics = run_bt(test_cfg, artifacts_dir=fold_dir, ev_artifacts_dir=ev_dst)
+
+            # Sanity gate for entries (helps acceptance)
+            min_entries = int(self.__dict__.get("min_entries_per_fold", 50))
+            n_tr = int(bt_metrics.get("n_trades", 0))
+            if n_tr < min_entries:
+                print(f"[Fold {f.idx}] WARNING: only {n_tr} trades (< {min_entries}).")
+
             # Try to load EV meta for manifest
             ev_meta = {}
             try:
@@ -340,6 +498,37 @@ class WalkForwardRunner:
                 # --- FIX: Access the .mu attribute by name ---
                 return np.array([ev.evaluate(x).mu for x in X], dtype=float)
             '''
+
+            # ---- 5.4: per-fold metrics (calibration, analog fidelity, residual QC) ----
+            from prediction_engine.testing_validation.fold_metrics import (
+                compute_and_save_fold_metrics, FoldMetricsConfig
+            )
+
+            metrics_dir = fold_dir / "metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+
+            compute_and_save_fold_metrics(
+                decisions_parquet=fold_dir / "decisions.parquet",
+                trades_parquet=fold_dir / "trades.parquet",
+                out_dir=metrics_dir,
+                cfg=FoldMetricsConfig(
+                    p_col="p_cal",
+                    regime_col="regime",
+                    side_col="side",
+                    decision_ts_col="timestamp",
+                    symbol_col="symbol",
+                    trade_id_col="decision_id",  # leave as-is; function will fallback if missing
+                    entry_ts_col="entry_ts",
+                    realized_pnl_col="realized_pnl_after_costs",
+                    nn_mu_col_candidates=("nn_mu", "nn_expected_outcome", "mu_hist"),
+                    fallback_col_candidates=("fallback", "used_global", "used_default"),
+                    dpi=110,
+                ),
+                # Optional PSI inputs (provide if you captured samples earlier in 5.2/5.3)
+                train_feature_samples=None,
+                test_feature_samples=None,
+                psi_features=None,
+            )
 
             def _mu_on_feats(ev: EVEngine, feats_df: pd.DataFrame, regimes: Optional[pd.Series] = None) -> np.ndarray:
                 """

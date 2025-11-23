@@ -409,3 +409,282 @@ def print_reliability(name: str, p: np.ndarray, y: np.ndarray):
         print(f"{pm_s:>8} {yr_s:>8} {n:4d}")
 
 
+# ------------------------------
+# 5.5: Fold aggregator & promotion gates
+# ------------------------------
+from dataclasses import dataclass, asdict
+from scipy.stats import spearmanr  # if available; otherwise small fallback
+
+@dataclass(frozen=True)
+class GateThresholds:
+    # Bucket-level gates (per regime x side)
+    analog_spearman_min: float = 0.30
+    ece_max: float = 0.03                  # 3%
+    # For the Brier “≤ dev + 0.01” gate, we accept a dev_brier input; if None, gate is marked UNKNOWN.
+    brier_additive_worst: float = 0.01
+    # Portfolio gates
+    sharpe_min: float = 1.2
+    mdd_max_abs: float = 0.12              # 12%
+    # Fallback
+    fallback_rate_max: float = 0.15
+    # Costs sanity (bps)
+    slippage_med_abs_bps_max: float = 10.0
+    slippage_p99_abs_bps_max: float = 25.0
+    # Rolling “not contradict” allowance
+    delta_pf_ok: float = 0.20
+    delta_sharpe_ok: float = 0.20
+
+def _find_fold_dirs(artifacts_root: Path) -> list[Path]:
+    return sorted([p for p in Path(artifacts_root).glob("fold_*") if p.is_dir()])
+
+def _load_fold_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _load_fold_metrics(artifacts_root: Path) -> list[dict]:
+    rows = []
+    for fd in _find_fold_dirs(artifacts_root):
+        fm = fd / "metrics" / "fold_metrics.json"
+        if fm.exists():
+            payload = _load_fold_json(fm)
+            if payload is not None:
+                rows.append({"fold": fd.name, **payload})
+    return rows
+
+def _concat_trades(artifacts_root: Path) -> pd.DataFrame:
+    out = []
+    for fd in _find_fold_dirs(artifacts_root):
+        tp = fd / "trades.parquet"
+        if tp.exists() and tp.stat().st_size > 0:
+            try:
+                df = pd.read_parquet(tp)
+                df["fold"] = fd.name
+                out.append(df)
+            except Exception:
+                pass
+    if not out:
+        return pd.DataFrame(columns=["entry_ts","exit_ts","qty","realized_pnl_after_costs","fold"])
+    df = pd.concat(out, ignore_index=True)
+    # normalize timestamps
+    for col in ("entry_ts","exit_ts"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+def _portfolio_metrics_from_trades(trades: pd.DataFrame) -> dict:
+    """
+    Compute portfolio PF/Sharpe/MDD from realized PnL series (naive but consistent).
+    Assumes trades already net of costs if 'realized_pnl_after_costs' exists.
+    """
+    if trades.empty:
+        return {
+            "n_trades": 0, "net_pnl": 0.0, "sharpe": float("nan"),
+            "max_drawdown": float("nan"), "turnover": 0.0, "exposure_proxy": 0.0
+        }
+
+    pnl = trades.get("realized_pnl_after_costs", trades.get("realized_pnl", pd.Series(dtype=float))).astype(float)
+    # naive “per-trade return” proxy for Sharpe
+    mu = pnl.mean()
+    sd = pnl.std(ddof=1)
+    sharpe = float(mu / sd) if sd > 0 else float("nan")
+    # equity curve (per trade)
+    eq = (1.0 + pnl.fillna(0.0)).cumprod()
+    mdd = _max_drawdown(eq)
+
+    # crude turnover/exposure proxies (don’t block promotion if missing)
+    turnover = float(len(trades))
+    # exposure proxy: average concurrent open positions from overlapping intervals (approx)
+    exposure_proxy = float(turnover)  # cheap placeholder; replace with real overlap calc when available
+
+    # slippage sanity if columns present
+    med_abs_bps = p99_abs_bps = None
+    if "slippage_model_bps" in trades.columns and "slippage_realized_bps" in trades.columns:
+        err = (trades["slippage_model_bps"] - trades["slippage_realized_bps"]).abs()
+        med_abs_bps = float(err.median())
+        p99_abs_bps = float(err.quantile(0.99))
+
+    return {
+        "n_trades": int(len(trades)),
+        "net_pnl": float(pnl.sum()),
+        "sharpe": float(sharpe),
+        "max_drawdown": float(mdd),
+        "turnover": turnover,
+        "exposure_proxy": exposure_proxy,
+        "slippage_med_abs_bps": med_abs_bps,
+        "slippage_p99_abs_bps": p99_abs_bps,
+    }
+
+def _bucket_gate_results(fold_metrics: list[dict], thresholds: GateThresholds, dev_brier: float | None) -> dict:
+    """
+    Aggregate bucket-level gates from per-fold metrics payloads.
+    We combine folds by simple mean where applicable.
+    """
+    # Gather by regime x side
+    bucket = {}
+    # Collect analog fidelity across folds
+    for row in fold_metrics:
+        af = row.get("analog_fidelity_by_bucket", {}) or {}
+        for regime, side_map in af.items():
+            for side, rho in side_map.items():
+                bucket.setdefault((regime, side), {"spearman": []})
+                if rho is not None:
+                    bucket[(regime, side)]["spearman"].append(float(rho))
+
+    # Global stats (ECE/Brier/fallback) — average across folds
+    eces = [float(r["ece"]) for r in fold_metrics if r.get("ece") is not None and np.isfinite(r["ece"])]
+    briers = [float(r["brier"]) for r in fold_metrics if r.get("brier") is not None and np.isfinite(r["brier"])]
+    fallback_rates = [float(r["fallback_rate"]) for r in fold_metrics if r.get("fallback_rate") is not None and np.isfinite(r["fallback_rate"])]
+
+    mean_ece = float(np.mean(eces)) if eces else float("nan")
+    mean_brier = float(np.mean(briers)) if briers else float("nan")
+    mean_fallback = float(np.mean(fallback_rates)) if fallback_rates else float("nan")
+
+    # Evaluate gates
+    gates = {
+        "ece_pass": bool(np.isfinite(mean_ece) and (mean_ece <= thresholds.ece_max)),
+        "brier_pass": "UNKNOWN" if dev_brier is None else bool(np.isfinite(mean_brier) and (mean_brier <= (dev_brier + thresholds.brier_additive_worst))),
+        "fallback_pass": bool(np.isfinite(mean_fallback) and (mean_fallback <= thresholds.fallback_rate_max)),
+        "per_bucket": {}
+    }
+
+    for (regime, side), d in bucket.items():
+        # If no data, mark UNKNOWN; else check mean Spearman
+        if not d["spearman"]:
+            gates["per_bucket"][f"{regime}::{side}"] = {"analog_spearman": None, "pass": "UNKNOWN"}
+            continue
+        s_mean = float(np.mean(d["spearman"]))
+        gates["per_bucket"][f"{regime}::{side}"] = {
+            "analog_spearman": s_mean,
+            "pass": bool(s_mean >= thresholds.analog_spearman_min),
+        }
+
+    return {
+        "mean_ece": mean_ece,
+        "mean_brier": mean_brier,
+        "mean_fallback_rate": mean_fallback,
+        "gates": gates,
+    }
+
+def _portfolio_gate_results(trades: pd.DataFrame, thresholds: GateThresholds) -> dict:
+    pm = _portfolio_metrics_from_trades(trades)
+    sharpe_ok = np.isfinite(pm["sharpe"]) and (pm["sharpe"] >= thresholds.sharpe_min)
+    mdd_ok = np.isfinite(pm["max_drawdown"]) and (abs(pm["max_drawdown"]) <= thresholds.mdd_max_abs)
+
+    slip_med_ok = "UNKNOWN"
+    slip_p99_ok = "UNKNOWN"
+    if pm.get("slippage_med_abs_bps") is not None:
+        slip_med_ok = pm["slippage_med_abs_bps"] <= thresholds.slippage_med_abs_bps_max
+    if pm.get("slippage_p99_abs_bps") is not None:
+        slip_p99_ok = pm["slippage_p99_abs_bps"] <= thresholds.slippage_p99_abs_bps_max
+
+    return {
+        "metrics": pm,
+        "gates": {
+            "sharpe_pass": bool(sharpe_ok),
+            "mdd_pass": bool(mdd_ok),
+            "slippage_med_abs_bps_pass": slip_med_ok,
+            "slippage_p99_abs_bps_pass": slip_p99_ok,
+        }
+    }
+
+def _overall_pass(panel: dict) -> bool:
+    """All bucket-level gates (where known) + portfolio gates must pass."""
+    b = panel["bucket"]["gates"]
+    per_bucket = [v["pass"] for v in b["per_bucket"].values()]
+    # Treat "UNKNOWN" as neutral (do not fail), only False fails.
+    per_bucket_ok = all((x is True or x == "UNKNOWN") for x in per_bucket)
+    global_ok = (
+        (b["ece_pass"] is True) and
+        (b["brier_pass"] is True or b["brier_pass"] == "UNKNOWN") and
+        (b["fallback_pass"] is True)
+    )
+    port = panel["portfolio"]["gates"]
+    port_ok = (
+        (port["sharpe_pass"] is True) and
+        (port["mdd_pass"] is True) and
+        (port["slippage_med_abs_bps_pass"] in (True, "UNKNOWN")) and
+        (port["slippage_p99_abs_bps_pass"] in (True, "UNKNOWN"))
+    )
+    return bool(per_bucket_ok and global_ok and port_ok)
+
+def generate_final_report(
+    *,
+    expanding_root: str | Path,
+    rolling_root: str | Path,
+    out_dir: str | Path | None = None,
+    thresholds: GateThresholds = GateThresholds(),
+    dev_brier_reference: float | None = None,
+) -> dict:
+    """
+    Aggregate Expanding vs Rolling panels and evaluate promotion gates.
+    Writes: final_report.json and final_report.html
+    """
+    exp_root = _resolve_path(expanding_root)
+    rol_root = _resolve_path(rolling_root)
+    out = Path(out_dir) if out_dir else exp_root
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Load per-fold metrics & trades
+    exp_fm = _load_fold_metrics(exp_root)
+    rol_fm = _load_fold_metrics(rol_root)
+    exp_tr = _concat_trades(exp_root)
+    rol_tr = _concat_trades(rol_root)
+
+    # Build panels
+    exp_panel = {
+        "bucket": _bucket_gate_results(exp_fm, thresholds, dev_brier_reference),
+        "portfolio": _portfolio_gate_results(exp_tr, thresholds),
+    }
+    rol_panel = {
+        "bucket": _bucket_gate_results(rol_fm, thresholds, dev_brier_reference),
+        "portfolio": _portfolio_gate_results(rol_tr, thresholds),
+    }
+
+    # Overall decisions
+    exp_pass = _overall_pass(exp_panel)
+    # Rolling must not catastrophically contradict Expanding:
+    # If Rolling is weaker but within deltas, still pass.
+    rol_pass = _overall_pass(rol_panel)
+    # Allow "weaker but within deltas" override:
+    if not rol_pass and exp_pass:
+        # compute rough PF & Sharpe deltas if available
+        e_sh = exp_panel["portfolio"]["metrics"].get("sharpe", float("nan"))
+        r_sh = rol_panel["portfolio"]["metrics"].get("sharpe", float("nan"))
+        # “PF” proxy: net_pnl vs n_trades (naive)
+        e_pf = exp_panel["portfolio"]["metrics"].get("net_pnl", 0.0)
+        r_pf = rol_panel["portfolio"]["metrics"].get("net_pnl", 0.0)
+        sh_ok = (np.isfinite(e_sh) and np.isfinite(r_sh) and (e_sh - r_sh) <= thresholds.delta_sharpe_ok)
+        pf_ok = ((e_pf - r_pf) <= thresholds.delta_pf_ok)
+        if sh_ok and pf_ok:
+            rol_pass = True
+
+    final = {
+        "thresholds": asdict(thresholds),
+        "expanding": exp_panel,
+        "rolling": rol_panel,
+        "pass_flags": {
+            "expanding": exp_pass,
+            "rolling": rol_pass
+        },
+        "promotion_decision": bool(exp_pass and rol_pass)
+    }
+
+    # JSON
+    (out / "final_report.json").write_text(json.dumps(final, indent=2), encoding="utf-8")
+
+    # Minimal HTML summary
+    html = f"""
+    <html><head><title>A2 Promotion Report</title></head>
+    <body>
+      <h2>A2 Promotion Report</h2>
+      <h3>Decision: {"PASS" if final["promotion_decision"] else "FAIL"}</h3>
+      <h4>Expanding: {"PASS" if exp_pass else "FAIL"}</h4>
+      <pre>{json.dumps(exp_panel, indent=2)}</pre>
+      <h4>Rolling: {"PASS" if rol_pass else "FAIL"}</h4>
+      <pre>{json.dumps(rol_panel, indent=2)}</pre>
+    </body></html>
+    """
+    (out / "final_report.html").write_text(html, encoding="utf-8")
+    return final

@@ -1,0 +1,9 @@
+{
+  "dim": 6,
+  "feature_sha1": "e0e5eb6d4dc8",
+  "files": [],
+  "index_type": "none",
+  "metric": "rf_weighted",
+  "n_items": 64,
+  "trained_on_date": "2025-11-08T16:15:44.215348"
+}

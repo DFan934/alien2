@@ -2,20 +2,20 @@
   "fold_idx": 2,
   "windows": {
     "train_start": "1998-08-26 00:00:00",
-    "train_end": "1998-10-31 23:57:00",
-    "purge_bars": 60,
-    "test_start": "1998-11-01 00:00:00",
-    "test_end": "1998-11-30 23:57:00"
+    "train_end": "1998-11-13 23:59:59.999999999",
+    "purge_bars": 3,
+    "test_start": "1998-11-17 00:00:00",
+    "test_end": "1998-12-06 23:59:59.999999999"
   },
   "gates": {
-    "p_gate": 0.030821917808219176,
-    "full_p": 0.03208556149732621,
-    "mode": "widened"
+    "p_gate": 0.6,
+    "full_p": 0.72,
+    "mode": "normal"
   },
   "prepro_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\fold_02\\prepro",
   "ev_artifacts": {
     "start": "1998-08-26 00:00:00",
-    "end": "1998-10-31 20:57:00",
+    "end": "1998-11-13 23:50:59.999999999",
     "symbols": [
       "BBY"
     ],
