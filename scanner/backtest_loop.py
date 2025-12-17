@@ -41,7 +41,17 @@ class BacktestScannerLoop:
                 continue
             for _, row in slice_df[mask].iterrows():
                 # Enforce canonical feature order for downstream pipelines
-                row = row.loc[list(FEATURE_ORDER)]
+                #row = row.loc[list(FEATURE_ORDER)]
+
+                missing = [c for c in FEATURE_ORDER if c not in row.index]
+                if missing:
+                    raise KeyError(
+                        "Scanner snapshot schema mismatch: row is missing required columns: "
+                        + ", ".join(missing[:25])
+                        + (f" ... (+{len(missing) - 25} more)" if len(missing) > 25 else "")
+                    )
+                row = row.reindex(list(FEATURE_ORDER))
+
                 sym = row["symbol"]
                 self.builder.log_sync(ts, sym, row)  # <-- sync write
                 yield ts, sym, row
