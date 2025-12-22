@@ -51,15 +51,9 @@ _PREDICT_COLS = [
     "atr_14", "adx_14",
     # trigger-context features:
     #"time_since_trigger_min",
-    "time_since_trigger_min",
-
     "latency_sec",
     "volume_spike_pct",
 ]
-
-# After _PREDICT_COLS = [...]
-FEATURE_ORDER = ["timestamp", "symbol"] + list(_PREDICT_COLS)
-
 
 
 # feature_engineering/pipelines/core.py  (near the top, after imports)
@@ -155,7 +149,6 @@ class CoreFeaturePipeline:
         if not self.parquet_root.exists():
             raise FileNotFoundError(self.parquet_root)
     '''
-    FEATURE_ORDER = FEATURE_ORDER
 
     def __init__(self, parquet_root: str | Path):
         self.parquet_root = Path(parquet_root)

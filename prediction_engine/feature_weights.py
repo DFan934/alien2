@@ -41,55 +41,6 @@ The script falls back to a synthetic self‑test if neither default path nor CLI
 args are supplied, ensuring the ▶️ run always exits gracefully.
 """
 
-# ---------------------------------------------------------------------------
-# RF Feature Importance
-# ---------------------------------------------------------------------------
-from sklearn.ensemble import RandomForestClassifier
-import numpy as np
-
-
-class RFFeatureWeighter:
-    """
-    Trains a RandomForest and exposes normalized feature importances
-    for distance weighting.
-    """
-
-    def __init__(
-        self,
-        n_estimators: int = 300,
-        max_depth: int | None = None,
-        min_samples_leaf: int = 20,
-        random_state: int = 42,
-    ):
-        self.model = RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_leaf=min_samples_leaf,
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        self.importances_: np.ndarray | None = None
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
-        self.model.fit(X, y)
-
-        imp = self.model.feature_importances_
-        if not np.isfinite(imp).all():
-            raise ValueError("RF feature importances contain NaNs or infs")
-
-        # normalize to sum to 1
-        imp = np.maximum(imp, 0.0)
-        s = imp.sum()
-        self.importances_ = imp / s if s > 0 else np.ones_like(imp) / len(imp)
-
-        return self.importances_
-
-    def get_weights(self) -> np.ndarray:
-        if self.importances_ is None:
-            raise RuntimeError("RF weights requested before fit()")
-        return self.importances_
-
-
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path

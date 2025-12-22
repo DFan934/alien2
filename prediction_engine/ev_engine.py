@@ -42,9 +42,6 @@ from prediction_engine.position_sizer import KellySizer        # NEW
 from .drift_monitor import get_monitor, DriftStatus        # NEW
 from typing import Iterable, Literal, Tuple, Dict, Any
 from functools import lru_cache
-from typing import Mapping, Any
-import dataclasses
-
 import json
 import numpy as np
 from numpy.typing import NDArray
@@ -79,95 +76,40 @@ _ADJACENT = {
 
 
 
-def _coerce_curve_params_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+def _coerce_curve_params_dict(data: dict) -> dict:
     """
-    Normalise a raw JSON payload into kwargs suitable for CurveParams.
-
-    Handles both:
-      * {"params": {...}} payloads (newer style)
-      * flat {"family": "...", "tail_len_days": 20, "alpha": 1.5, ...}
-    and a few legacy field names.
+    Coerce flexible JSON into CurveParams kwargs.
+    Accepts flat dicts or {"params": {...}}.
+    Maps aliases onto the actual CurveParams fields.
     """
-    # Don't ever early-return an empty dict; CurveParams needs required fields.
-    if raw is None:
-        raw = {}
+    if "params" in data and isinstance(data["params"], dict):
+        data = dict(data["params"])  # unwrap
 
-    # Unwrap {"params": {...}} if present
-    if "params" in raw and isinstance(raw["params"], dict):
-        inner = raw["params"]
-    else:
-        inner = raw
-
-    # Lower-case keys for robustness
-    norm: dict[str, Any] = {str(k).lower(): v for k, v in inner.items()}
-
-    # Determine which field in CurveParams represents "tail length"
-    tail_field = None
-    for f in dataclasses.fields(CurveParams):
-        if f.name in ("tail_len", "tail", "tail_len_days"):
-            tail_field = f.name
-            break
-    if tail_field is None:
-        tail_field = "tail_len"
-
-    aliases: dict[str, str] = {
-        # Tail length variants
-        "tail_len_days": tail_field,
-        "tail_len": tail_field,
-        "tail": tail_field,
-
-        # Main fields we expect to keep as-is
-        "family": "family",
-        "shape": "shape",
-        "shape_param": "shape",   # legacy
-        "shape_params": "shape",  # legacy
-
-        # Legacy "alpha" knobs → blend_alpha
-        "alpha": "blend_alpha",
-        "a": "blend_alpha",
-        "blend_alpha": "blend_alpha",
-
-        # Lambda regularisation
-        "lambda": "lambda_reg",
-        "lambda_reg": "lambda_reg",
+    # map incoming aliases to our dataclass field names
+    aliases = {
+        "tail_len_days": _TAIL_FIELD,   # <— the important one
+        "tail_len": _TAIL_FIELD,
+        "tail": _TAIL_FIELD,
+        "a": "alpha",
+        "shape": "shape_params",
     }
 
-    wanted = {f.name for f in dataclasses.fields(CurveParams)}
-    out: dict[str, Any] = {}
+    norm = {}
+    for k, v in data.items():
+        kk = aliases.get(k, k)
+        if kk is None:
+            continue
+        norm[kk] = v
 
-    # Map raw keys → canonical CurveParams field names
-    for k, v in norm.items():
-        key = aliases.get(k, k)
-        if key in wanted and v is not None:
-            out[key] = v
+    wanted = {f.name for f in _dc_fields(CurveParams)}
+    out = {k: norm[k] for k in list(norm.keys()) if k in wanted}
 
-    # ---------- REQUIRED FIELDS: provide safe defaults ----------
-
-    # Tail length default if none was supplied
-    if tail_field in wanted and tail_field not in out:
-        # Reasonable default tail length in days
-        out[tail_field] = 20
-
-    # Family default
-    if "family" not in out and "family" in wanted:
-        out["family"] = "exp"
-
-    # ---------- OPTIONAL FIELDS: safe defaults ----------
-
-    if "shape" in wanted and "shape" not in out:
-        # Neutral-ish shape – will behave close to flat / linear
-        out["shape"] = 1.0
-
-    if "blend_alpha" in wanted and "blend_alpha" not in out:
-        # You can change this to 0.25 if you want to match Phase 2 exactly
-        out["blend_alpha"] = 0.5
-
-    if "lambda_reg" in wanted and "lambda_reg" not in out:
-        out["lambda_reg"] = 1.0
-
+    out.setdefault("family", "uniform")
+    if _TAIL_FIELD and _TAIL_FIELD in wanted:
+        out.setdefault(_TAIL_FIELD, 20)
+    if "alpha" in wanted:
+        out.setdefault("alpha", 1.0)
     return out
-
-
 
 
 # --- ADD: lightweight ANN index artifact helpers ---

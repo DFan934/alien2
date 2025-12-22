@@ -21,8 +21,4 @@ FEATURE_ORDER: list[str] = list(_PREDICT_COLS) + ["symbol", "timestamp"]
 __all__ = ["FEATURE_ORDER"]
 
 # Guard against accidental mutation
-#FEATURE_ORDER = tuple(FEATURE_ORDER)  # type: ignore[assignment]
-
-from feature_engineering.pipelines.core import FEATURE_ORDER as FE_FEATURE_ORDER
-
-FEATURE_ORDER = tuple(FE_FEATURE_ORDER)
+FEATURE_ORDER = tuple(FEATURE_ORDER)  # type: ignore[assignment]
