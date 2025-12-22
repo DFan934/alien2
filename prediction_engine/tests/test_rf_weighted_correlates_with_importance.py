@@ -37,22 +37,3 @@ def test_rf_weighted_distances_track_importance():
 
     rho = _spearman_ranks(d2, proxy)
     assert rho > 0.4, f"Spearman too low: {rho:.3f}"
-
-
-'''def test_weighted_distance_prefers_informative_feature():
-    import numpy as np
-    from prediction_engine.distance_calculator import DistanceCalculator
-
-    # Feature 0 is informative
-    X = np.random.randn(200, 2)
-    y = (X[:, 0] > 0).astype(int)
-
-    w = np.array([0.9, 0.1])
-
-    d_unw = DistanceCalculator()
-    d_w = DistanceCalculator(feature_weights=w)
-
-    d0 = d_unw.pairwise(X[:10], X[10:20]).mean()
-    d1 = d_w.pairwise(X[:10], X[10:20]).mean()
-
-    assert d1 != d0'''
