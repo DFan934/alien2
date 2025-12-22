@@ -93,3 +93,18 @@ def test_ev_engine_factory_with_rf_weights(tmp_path: Path, monkeypatch):
     x = np.array([1.0, 0.0], dtype=np.float32)
     res = engine.evaluate(x, regime=None)
     assert res.cluster_id == 1
+
+
+
+def test_rf_importances_sum_to_one():
+    from prediction_engine.feature_weights import RFFeatureWeighter
+    import numpy as np
+
+    X = np.random.randn(500, 10)
+    y = (X[:, 0] > 0).astype(int)
+
+    rf = RFFeatureWeighter()
+    w = rf.fit(X, y)
+
+    assert w.shape == (10,)
+    assert abs(w.sum() - 1.0) < 1e-6

@@ -258,13 +258,42 @@ def load_regime_curves(artefact_root: Path | str) -> dict[str, CurveParams]:
     Load all CurveParams from
     artefact_root/regime=<name>/curve_params.json
     and return a mapping { name: CurveParams(...) }.
+
+    Supports BOTH:
+      * legacy: {"params": {...}}
+      * flat:   {"family": "...", "tail_len_days": 20, "alpha": 0.25, ...}
     """
     root = Path(artefact_root)
     curves: dict[str, CurveParams] = {}
-    for d in root.glob("regime=*"):
-        f = d / "curve_params.json"
-        if not f.exists():
+
+    for regime_dir in root.glob("regime=*"):
+        params_file = regime_dir / "curve_params.json"
+        if not params_file.is_file():
             continue
-        payload = json.loads(f.read_text())
-        curves[d.name.split("=", 1)[1]] = CurveParams(**payload["params"])
+
+        raw = json.loads(params_file.read_text(encoding="utf-8"))
+
+        # 1) unwrap legacy {"params": {...}} layout
+        if isinstance(raw, dict) and "params" in raw and isinstance(raw["params"], dict):
+            params = dict(raw["params"])
+        else:
+            params = dict(raw)
+
+        # 2) normalise tail length field
+        if "tail_len" not in params:
+            if "tail_len_days" in params:
+                params["tail_len"] = params.pop("tail_len_days")
+            elif "tail" in params:
+                params["tail_len"] = params.pop("tail")
+
+        # 3) normalise shape field
+        #    Your JSON currently uses "alpha"; treat that as the shape parameter.
+        if "shape" not in params and "alpha" in params:
+            params["shape"] = params["alpha"]
+
+        # CurveParams has defaults for blend_alpha / lambda_reg, so missing fields are fine.
+        regime_name = regime_dir.name.split("=", 1)[1].lower()
+        curves[regime_name] = CurveParams(**params)
+
     return curves
+

@@ -79,6 +79,8 @@ class DistanceCalculator:  # pylint: disable=too-few-public-methods
             raise ValueError("ref must be a 2‑D array [n_reference, n_features]")
         self._ref = np.ascontiguousarray(ref.astype(np.float32))
         self._metric: Metric = metric  # type: ignore[assignment]
+
+
         self._ann_backend = ann_backend.lower()
         backend_kwargs = backend_kwargs or {}
 
