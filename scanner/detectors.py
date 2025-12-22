@@ -113,30 +113,42 @@ class CompositeDetector:
 
     # FILE: scanner/detectors.py
 
-    async def __call__(self, df: pd.DataFrame) -> pd.Series:
-        import inspect, asyncio
+    def __call__(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Synchronous call contract.
 
-        if self.mode == "AND":
-            mask = pd.Series(True, index=df.index)
+        BacktestScannerLoop is synchronous, so CompositeDetector must be sync.
+        If any sub-detector returns a coroutine, we raise with a clear message.
+        """
+        import inspect
+        import pandas as pd
+
+        if self.mode.upper() not in ("AND", "OR"):
+            raise ValueError(f"CompositeDetector.mode must be AND or OR, got {self.mode}")
+
+        if self.mode.upper() == "AND":
+            out = pd.Series(True, index=df.index)
             for det in self.sub:
                 res = det(df)
                 if inspect.iscoroutine(res):
-                    res = await res
-                mask &= res
-                if not mask.any():
-                    break
-            return mask
-        else:  # "OR"
-            mask = pd.Series(False, index=df.index)
-            for det in self.sub:
-                res = det(df)
-                if inspect.iscoroutine(res):
-                    res = await res
-                # Apply the result to the mask regardless of detector type
-                mask |= res
-                if mask.all():
-                    break
-            return mask
+                    raise RuntimeError(
+                        "Async detector returned coroutine under a sync scanner loop. "
+                        "Either make the detector sync or make the scanner loop async."
+                    )
+                out &= res.astype(bool)
+            return out
+
+        # OR
+        out = pd.Series(False, index=df.index)
+        for det in self.sub:
+            res = det(df)
+            if inspect.iscoroutine(res):
+                raise RuntimeError(
+                    "Async detector returned coroutine under a sync scanner loop. "
+                    "Either make the detector sync or make the scanner loop async."
+                )
+            out |= res.astype(bool)
+        return out
 
 
 # ---------------------------------------------------------------------------

@@ -1547,7 +1547,11 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     if cfg.get("dev_detector_mode", "").upper() in {"OR", "AND"}:
         detector.mode = cfg["dev_detector_mode"].upper()
 
-    mask = await detector(df_raw)
+    #mask = await detector(df_raw)
+
+    mask = detector(df_raw)
+    mask = pd.Series(mask, index=df_raw.index).astype(bool)
+
     pass_rate = mask.mean() * 100
     print(f"[Scanner KPI] {sym}: Bars passing filters: {mask.sum()} / {len(mask)} = {pass_rate:.2f}%")
 
@@ -2324,7 +2328,25 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             dec = decisions.copy()
             dec["timestamp"] = pd.to_datetime(dec["timestamp"], utc=True)
 
+            #b = bars.copy()
+
             b = bars.copy()
+
+            # --- Phase 3 contract guard: ensure symbol exists for merges ---
+            if "symbol" not in b.columns:
+                # If decisions has exactly one symbol, we can safely fill it.
+                if "symbol" in decisions.columns:
+                    uniq = decisions["symbol"].dropna().unique()
+                    if len(uniq) == 1:
+                        b["symbol"] = uniq[0]
+                    else:
+                        raise KeyError(
+                            "bars is missing 'symbol' and decisions has multiple symbols; "
+                            "cannot safely attach labels."
+                        )
+                else:
+                    raise KeyError("bars is missing 'symbol' and decisions has no symbol column.")
+
             if b.empty:
                 return dec
             b["timestamp"] = pd.to_datetime(b["timestamp"], utc=True)
