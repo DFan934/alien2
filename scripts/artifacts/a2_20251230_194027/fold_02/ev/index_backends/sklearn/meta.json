@@ -1,0 +1,9 @@
+{
+  "dim": 6,
+  "feature_sha1": "e0e5eb6d4dc8",
+  "files": [],
+  "index_type": "sklearn",
+  "metric": "euclidean",
+  "n_items": 64,
+  "trained_on_date": "2025-12-30T19:43:16.048239"
+}

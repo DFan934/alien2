@@ -513,8 +513,8 @@ class EVEngine:
         cls,
         artefact_dir: Path | str,
         *,
-        #metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
-        metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "rf_weighted",
+        metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "euclidean",
+        #metric: Literal["euclidean", "mahalanobis", "rf_weighted"] = "rf_weighted",
         k: int | None = None,
         cost_model: object | None = None,
         calibrator: Any | None=None,
@@ -586,6 +586,12 @@ class EVEngine:
         for regime_dir in artefact_dir.glob("regime=*"):
             regime_name = regime_dir.name.split("=")[-1]
             params_file = regime_dir / "curve_params.json"
+            text = params_file.read_text(encoding="utf-8", errors="replace")
+            print("[EV-ARTIFACT] params_file =", params_file)
+            print("[EV-ARTIFACT] size_bytes =", params_file.stat().st_size)
+            print("[EV-ARTIFACT] head =", repr(text[:200]))
+            raw = json.loads(text)
+
             if not params_file.exists():
                 continue
             raw = json.loads(params_file.read_text())
@@ -623,6 +629,38 @@ class EVEngine:
         if meta["sha"] != _sha1_list(features_live):            raise RuntimeError(
                 "Feature schema drift detected – retrain PathClusterEngine before loading EVEngine."
             )'''
+
+
+        #import json
+
+        '''p = Path(params_file)
+        if (not p.exists()) or p.stat().st_size == 0:
+            raise FileNotFoundError(
+                f"EV artifacts missing/empty: {p} (exists={p.exists()}, size={p.stat().st_size if p.exists() else 'NA'}). "
+                "Regenerate curve_params.json or point to the correct weights directory."
+            )
+
+        text = p.read_text(encoding="utf-8").strip()
+        if not text:
+            raise ValueError(f"EV artifacts empty after strip: {p}")
+
+        p = Path(params_file)
+        if (not p.exists()) or p.stat().st_size == 0:
+            raise FileNotFoundError(
+                f"EV artifacts missing/empty: {p} (exists={p.exists()}, size={p.stat().st_size if p.exists() else 'NA'}). "
+                "Regenerate curve_params.json or point to the correct weights directory."
+            )
+
+        text = p.read_text(encoding="utf-8").strip()
+        if not text:
+            raise ValueError(f"EV artifacts empty after strip: {p}")
+
+        raw = json.loads(text)
+        '''
+
+
+
+#        raw = json.loads(text)
 
         meta = json.loads((artefact_dir / "meta.json").read_text())
         features_live = stats["feature_list"].tolist()
@@ -694,7 +732,33 @@ class EVEngine:
             if not rf_path.exists():
                 raise FileNotFoundError("rf_weighted selected but rf_feature_weights.npy missing")
             import numpy as _np, hashlib
-            w = _np.load(rf_path, allow_pickle=False).astype(_np.float32, copy=False)
+
+            print("[EV-ARTIFACT] rf_path =", rf_path)
+            p = Path(rf_path)
+            print("[EV-ARTIFACT] exists =", p.exists(), "is_file =", p.is_file())
+            if p.exists():
+                print("[EV-ARTIFACT] size_bytes =", p.stat().st_size)
+                with open(p, "rb") as f:
+                    head = f.read(16)
+                print("[EV-ARTIFACT] head16 =", head)
+
+            # just before np.load
+            import os
+
+            print(f"[EV-RF] rf_path={rf_path}")
+            print(
+                f"[EV-RF] exists={os.path.exists(rf_path)} isfile={os.path.isfile(rf_path)} size={os.path.getsize(rf_path) if os.path.exists(rf_path) else 'NA'}")
+
+            if (not os.path.exists(rf_path)) or (os.path.getsize(rf_path) == 0):
+                print("[EV-RF] RF weights missing/empty -> SKIP RF weighting")
+                w = None
+            else:
+                w = _np.load(rf_path, allow_pickle=False).astype(_np.float32, copy=False)
+
+            #w = _np.load(rf_path, allow_pickle=False).astype(_np.float32, copy=False)
+
+
+
             if w.ndim != 1 or w.shape[0] != n_feat_schema:
                 raise RuntimeError(
                     f"RF weights length {w.shape} does not match feature schema ({n_feat_schema})"

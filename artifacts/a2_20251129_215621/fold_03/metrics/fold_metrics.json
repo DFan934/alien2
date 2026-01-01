@@ -1,0 +1,78 @@
+{
+  "n_decisions": 1435,
+  "n_trades_matched": 522,
+  "ece": 0.36355871130998174,
+  "brier": 0.23894160393254837,
+  "deciles": 10,
+  "decile_table": [
+    {
+      "decile": 0,
+      "p_mean": 0.33877654489239495,
+      "y_rate": 0.125,
+      "count": 144
+    },
+    {
+      "decile": 1,
+      "p_mean": 0.3576538956424259,
+      "y_rate": 0.04895104895104895,
+      "count": 143
+    },
+    {
+      "decile": 2,
+      "p_mean": 0.37547126315038093,
+      "y_rate": 0.0763888888888889,
+      "count": 144
+    },
+    {
+      "decile": 3,
+      "p_mean": 0.4117640533386034,
+      "y_rate": 0.0979020979020979,
+      "count": 143
+    },
+    {
+      "decile": 4,
+      "p_mean": 0.43470549286719523,
+      "y_rate": 0.09027777777777778,
+      "count": 144
+    },
+    {
+      "decile": 5,
+      "p_mean": 0.49224994789488347,
+      "y_rate": 0.055944055944055944,
+      "count": 143
+    },
+    {
+      "decile": 6,
+      "p_mean": 0.5579005489998866,
+      "y_rate": 0.09090909090909091,
+      "count": 143
+    },
+    {
+      "decile": 7,
+      "p_mean": 0.5849307043592735,
+      "y_rate": 0.14583333333333334,
+      "count": 144
+    },
+    {
+      "decile": 8,
+      "p_mean": 0.6166616684991264,
+      "y_rate": 0.23776223776223776,
+      "count": 143
+    },
+    {
+      "decile": 9,
+      "p_mean": 0.6503232473294321,
+      "y_rate": 0.2152777777777778,
+      "count": 144
+    }
+  ],
+  "fallback_rate": null,
+  "analog_fidelity_by_bucket": {},
+  "residual_cusum_3sigma_breaches": 1433,
+  "psi": null,
+  "notes": {
+    "ece_bins": "deciles",
+    "win_label": "realized_pnl_after_costs > 0",
+    "join_strategy": "decision_id OR (symbol,timestamp)~(symbol,entry_ts)"
+  }
+}

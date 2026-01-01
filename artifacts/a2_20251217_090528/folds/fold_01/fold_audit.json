@@ -1,0 +1,21 @@
+{
+  "cadence_seconds": 180,
+  "fold": 1,
+  "knn": {
+    "k_used": -1,
+    "metric": "euclidean"
+  },
+  "n_test_bars": 861,
+  "n_train_bars": 2425,
+  "pca": {
+    "cum_explained_var": -1.0,
+    "n_components": -1
+  },
+  "weights": {
+    "curve_loaded": false,
+    "fell_back_uniform": false,
+    "weights_loaded": false
+  },
+  "y_test_pos_rate": 0.026845637583892617,
+  "y_train_pos_rate": 0.03597601598934044
+}

@@ -1,0 +1,15 @@
+{
+  "run_id": "964022b4",
+  "git_sha": "n/a",
+  "started": "2025-12-31T16:07:10Z",
+  "label_horizon": "open\u2192open log-return, H=20 bars",
+  "label_function": "feature_engineering.labels.labeler.one_bar_ahead",
+  "label_side": "long_positive",
+  "label_threshold": 0.0,
+  "sign_check": true,
+  "min_entries_per_fold": 100,
+  "scanner_dev_loose": true,
+  "detector_mode": "OR",
+  "use_isotonic": true,
+  "symbol": "RRC"
+}

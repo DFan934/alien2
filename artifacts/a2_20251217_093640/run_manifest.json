@@ -1,0 +1,29 @@
+{
+  "cadence_target_seconds": 60,
+  "config_hash": "2fc9d4cb4335",
+  "config_path": null,
+  "feature_schema_version": "v1",
+  "git_sha": "n/a",
+  "metric": "mahalanobis",
+  "phase": "phase0",
+  "resolved_universe": [
+    "RRC",
+    "BBY"
+  ],
+  "run_id": "3d6afda9",
+  "seed_default": 1337,
+  "started": "2025-12-17T09:36:40Z",
+  "universe_hash": "c8e18b91bfb6",
+  "universe_requested": {
+    "symbols": [
+      "RRC",
+      "BBY"
+    ],
+    "type": "static"
+  },
+  "universe_source": "static:list",
+  "window": {
+    "end": "1999-01-01",
+    "start": "1998-08-26"
+  }
+}

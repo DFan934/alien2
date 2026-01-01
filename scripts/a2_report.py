@@ -1,7 +1,14 @@
 # scripts/a2_report.py
+
+
 from __future__ import annotations
+
 import json
 from pathlib import Path
+
+from feature_engineering.utils.artifacts_root import resolve_artifacts_root
+
+
 from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
@@ -157,7 +164,15 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
 
 
 
-    artifacts_root = Path(artifacts_root)
+    #artifacts_root = Path(artifacts_root)
+
+    if isinstance(artifacts_root, dict):
+        artifacts_root = resolve_artifacts_root(artifacts_root, create=False)
+    else:
+        artifacts_root = Path(artifacts_root)
+
+    print(f"[RunContext] artifacts_root={artifacts_root}")
+
     csv_path = Path(csv_path)
     if out_dir is None:
         out_dir = artifacts_root
@@ -621,8 +636,23 @@ def generate_final_report(
     Aggregate Expanding vs Rolling panels and evaluate promotion gates.
     Writes: final_report.json and final_report.html
     """
-    exp_root = _resolve_path(expanding_root)
-    rol_root = _resolve_path(rolling_root)
+    #exp_root = _resolve_path(expanding_root)
+    #rol_root = _resolve_path(rolling_root)
+
+    # Accept either: a dict cfg, or a string/path; normalize through resolver when cfg-like
+    if isinstance(expanding_root, dict):
+        exp_root = resolve_artifacts_root(expanding_root, create=False)
+    else:
+        exp_root = Path(expanding_root)
+
+    if isinstance(rolling_root, dict):
+        rol_root = resolve_artifacts_root(rolling_root, create=False)
+    else:
+        rol_root = Path(rolling_root)
+
+    print(f"[RunContext] expanding_artifacts_root={exp_root}")
+    print(f"[RunContext] rolling_artifacts_root={rol_root}")
+
     out = Path(out_dir) if out_dir else exp_root
     out.mkdir(parents=True, exist_ok=True)
 

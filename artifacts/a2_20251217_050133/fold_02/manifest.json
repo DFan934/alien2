@@ -1,0 +1,67 @@
+{
+  "fold_idx": 2,
+  "windows": {
+    "train_start": "1998-08-26 00:00:00",
+    "train_end": "1998-11-13 23:59:59.999999999",
+    "purge_bars": 3,
+    "test_start": "1998-11-17 00:00:00",
+    "test_end": "1998-12-06 23:59:59.999999999"
+  },
+  "gates": {
+    "p_gate": 0.6,
+    "full_p": 0.72,
+    "mode": "normal"
+  },
+  "prepro_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\artifacts\\a2_20251217_050133\\fold_02\\prepro",
+  "ev_artifacts": {
+    "start": "1998-08-26 00:00:00",
+    "end": "1998-11-13 23:50:59.999999999",
+    "symbols": [
+      "RRC"
+    ],
+    "n_clusters": 64,
+    "features": [
+      "pca_1",
+      "pca_2",
+      "pca_3",
+      "pca_4",
+      "pca_5",
+      "pca_6"
+    ],
+    "sha": "e0e5eb6d4dc8",
+    "label_horizon": "O->C",
+    "source_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights"
+  },
+  "env": {
+    "python": "3.11.9",
+    "numpy": "2.0.2",
+    "pandas": "2.2.3",
+    "sklearn": "1.7.0",
+    "platform": "Windows-10-10.0.26100-SP0"
+  },
+  "artifact_sources": {
+    "strategy": "pooled",
+    "core_dir": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled",
+    "scaler": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/scaler.pkl",
+    "pca": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/pca.pkl",
+    "clusters": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/clusters.pkl",
+    "feature_schema": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/feature_schema.json",
+    "ann": {
+      "trend": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/TREND.index",
+      "range": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/RANGE.index",
+      "vol": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/VOL.index",
+      "global": "C:/Users/donav/Downloads/TheFinalProject5/weights/pooled/ann/GLOBAL.index"
+    },
+    "calibrator": {
+      "path": "",
+      "scope": "missing",
+      "used_in_fold": true
+    },
+    "distance_contract": {
+      "family": "euclidean",
+      "params": {}
+    }
+  },
+  "calibrator_path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\artifacts\\a2_20251217_050133\\fold_02\\calibration\\iso_calibrator.pkl",
+  "feature_cols_path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\artifacts\\a2_20251217_050133\\fold_02\\prepro\\feature_cols.json"
+}

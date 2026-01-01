@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
+from feature_engineering.utils.time import to_utc
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,117 @@ class Fold:
 
 
 
+def _ts_diag(name: str, x) -> str:
+    """Return a compact diagnostic string for timestamp-like things."""
+    import pandas as pd
+
+    if x is None:
+        return f"[{name}] <None>"
+
+    # Accept Series / Index / list-like
+    s = pd.Series(x) if not isinstance(x, (pd.Series, pd.Index)) else x
+    if isinstance(s, pd.Index):
+        s = pd.Series(s)
+
+    out = [f"[{name}]"]
+    out.append(f"  dtype: {getattr(s, 'dtype', type(s))}")
+    # tz info (works if datetime64[ns, tz])
+    try:
+        tz = getattr(getattr(s.dt, "tz", None), "zone", None) or getattr(s.dt, "tz", None)
+    except Exception:
+        tz = None
+    out.append(f"  tz: {tz}")
+
+    # head/tail samples
+    try:
+        head = s.head(3).tolist()
+        tail = s.tail(3).tolist()
+        out.append(f"  head: {head}")
+        out.append(f"  tail: {tail}")
+    except Exception:
+        pass
+
+    # min/max
+    try:
+        s_dt = pd.to_datetime(s, utc=True, errors="coerce")
+        s_dt = s_dt.dropna()
+        if len(s_dt):
+            out.append(f"  min/max: {s_dt.min()} → {s_dt.max()}")
+        else:
+            out.append("  min/max: <empty>")
+    except Exception:
+        out.append("  min/max: <unavailable>")
+
+    return "\n".join(out)
+
+
+def _audit_scan_fold_intersection(
+    *,
+    full_df,
+    scan_df,
+    full_tr,
+    full_te,
+    scan_tr,
+    scan_te,
+    allow_fallback: bool,
+    fold_idx: int,
+) -> tuple[list, list]:
+    """
+    Audit BEFORE/AFTER scan↔fold timestamp intersection.
+    Hard-fail if scan has rows but both intersections are empty (unless allow_fallback).
+    Returns: (scan_tr_ts_in_fold, scan_te_ts_in_fold) as python lists of timestamps.
+    """
+    import pandas as pd
+
+    # ---- BEFORE ----
+    print(f"[Fold {fold_idx}] [SCAN-AUDIT] BEFORE intersection")
+    print(_ts_diag("FULL.timestamp", full_df["timestamp"]))
+    print(_ts_diag("SCAN.timestamp", scan_df["timestamp"]))
+    print(_ts_diag("FULL_TR.timestamp", full_tr["timestamp"]))
+    print(_ts_diag("FULL_TE.timestamp", full_te["timestamp"]))
+    print(_ts_diag("SCAN_TR.timestamp", scan_tr["timestamp"]))
+    print(_ts_diag("SCAN_TE.timestamp", scan_te["timestamp"]))
+    print(f"[Fold {fold_idx}] [SCAN-AUDIT] counts: scan_tr={len(scan_tr)} scan_te={len(scan_te)}")
+
+    # Normalize to UTC for safe intersection (handles tz-aware vs naive mismatches)
+    def _utc_series(df):
+        return pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+    tr_full_ts = pd.Index(_utc_series(full_tr).dropna())
+    te_full_ts = pd.Index(_utc_series(full_te).dropna())
+    tr_scan_ts = pd.Index(_utc_series(scan_tr).dropna())
+    te_scan_ts = pd.Index(_utc_series(scan_te).dropna())
+
+    tr_in = tr_scan_ts.intersection(tr_full_ts)
+    te_in = te_scan_ts.intersection(te_full_ts)
+
+    # ---- AFTER ----
+    print(f"[Fold {fold_idx}] [SCAN-AUDIT] AFTER intersection")
+    print(f"[Fold {fold_idx}] [SCAN-AUDIT] len(scan_tr_in_fold)={len(tr_in)} len(scan_te_in_fold)={len(te_in)}")
+    if len(tr_in):
+        print(f"[Fold {fold_idx}] [SCAN-AUDIT] scan_tr_in_fold min/max: {tr_in.min()} → {tr_in.max()}")
+    if len(te_in):
+        print(f"[Fold {fold_idx}] [SCAN-AUDIT] scan_te_in_fold min/max: {te_in.min()} → {te_in.max()}")
+
+    # ---- HARD FAIL on contradiction ----
+    if (len(scan_tr) > 0 or len(scan_te) > 0) and (len(tr_in) == 0 and len(te_in) == 0) and (not allow_fallback):
+        msg = (
+            f"[Fold {fold_idx}] SCAN↔FOLD CONTRADICTION: scan_tr/scan_te are nonzero "
+            f"(scan_tr={len(scan_tr)}, scan_te={len(scan_te)}) but both intersections are 0.\n"
+            f"{_ts_diag('FULL.timestamp', full_df['timestamp'])}\n"
+            f"{_ts_diag('SCAN.timestamp', scan_df['timestamp'])}\n"
+            f"{_ts_diag('FULL_TR.timestamp', full_tr['timestamp'])}\n"
+            f"{_ts_diag('FULL_TE.timestamp', full_te['timestamp'])}\n"
+            f"{_ts_diag('SCAN_TR.timestamp', scan_tr['timestamp'])}\n"
+            f"{_ts_diag('SCAN_TE.timestamp', scan_te['timestamp'])}\n"
+            "This would previously have caused silent fallback. Refusing to continue."
+        )
+        raise RuntimeError(msg)
+
+    # Return python lists (useful for isin)
+    return list(tr_in), list(te_in)
+
+
 # --- INSERT AFTER: the Fold dataclass definition ---
 
 def make_time_folds(
@@ -58,8 +170,15 @@ def make_time_folds(
     """
     import pandas as _pd
 
-    ws = _pd.to_datetime(window_start)
-    we = _pd.to_datetime(window_end)
+    #ws = _pd.to_datetime(window_start)
+    #we = _pd.to_datetime(window_end)
+
+    #ws = _pd.to_datetime(window_start, utc=True)
+    #we = _pd.to_datetime(window_end, utc=True)
+
+    ws = to_utc(window_start)
+    we = to_utc(window_end)
+
     if not (ws < we):
         raise ValueError("window_start must be < window_end")
 
@@ -112,7 +231,7 @@ def make_time_folds(
             # Skip degenerate folds
             continue
 
-        folds.append(
+        '''folds.append(
             Fold(
                 idx=i,
                 train_start=train_start.tz_localize(None) if hasattr(train_start, "tz") else train_start,
@@ -120,6 +239,29 @@ def make_time_folds(
                 test_start=ts,
                 test_end=(te - _pd.Timedelta(nanoseconds=1)),         # make TEST right-closed for persistence
                 purge_bars=int(embargo_days),  # store embargo_days here for compatibility
+            )
+        )'''
+
+        '''folds.append(
+            Fold(
+                idx=i,
+                train_start=_pd.Timestamp(train_start, tz="UTC") if getattr(train_start, "tz",
+                                                                            None) is None else train_start,
+                train_end=(train_end - _pd.Timedelta(nanoseconds=1)),
+                test_start=_pd.Timestamp(ts, tz="UTC") if getattr(ts, "tz", None) is None else ts,
+                test_end=(te - _pd.Timedelta(nanoseconds=1)),
+                purge_bars=int(embargo_days),
+            )
+        )'''
+
+        folds.append(
+            Fold(
+                idx=i,
+                train_start=to_utc(train_start),
+                train_end=to_utc(train_end - _pd.Timedelta(nanoseconds=1)),
+                test_start=to_utc(ts),
+                test_end=to_utc(te - _pd.Timedelta(nanoseconds=1)),
+                purge_bars=int(embargo_days),
             )
         )
 
@@ -213,6 +355,72 @@ class WalkForwardRunner:
         # If scanning made bars sparse (e.g., multi-hour gaps), fall back to 1 minute
         return dt if pd.Timedelta(minutes=1) <= dt <= pd.Timedelta(hours=1) else pd.Timedelta(minutes=1)
 
+    # ============================
+    # DEBUG / DIAGNOSTICS HELPERS
+    # ============================
+
+    @staticmethod
+    def _force_utc_ts(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+        """
+        Hard-normalize a timestamp column to datetime64[ns, UTC].
+        Drops NaT and sorts by timestamp.
+        """
+        df = df.copy()
+        if col not in df.columns:
+            raise KeyError(f"Missing '{col}' column")
+        df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+        df = df[df[col].notna()].sort_values(col).reset_index(drop=True)
+        return df
+
+    @staticmethod
+    def _ts_diag(name: str, df: pd.DataFrame) -> None:
+        print(f"\n[TS-DIAG] {name}")
+        print("  shape:", df.shape)
+        if "timestamp" not in df.columns:
+            print("  MISSING timestamp COLUMN")
+            return
+        s = df["timestamp"]
+        print("  dtype:", s.dtype)
+        try:
+            print("  head:", s.head(3).tolist())
+            print("  tail:", s.tail(3).tolist())
+        except Exception as e:
+            print("  head/tail failed:", e)
+
+        s2 = pd.to_datetime(s, errors="coerce", utc=True)
+        print("  to_datetime(utc=True) dtype:", s2.dtype)
+        print("  coerced NaT:", int(s2.isna().sum()))
+        if s2.notna().any():
+            print("  min/max:", str(s2.min()), "→", str(s2.max()))
+
+    def _fold_diag(self, f: Fold, full: pd.DataFrame, scan: pd.DataFrame) -> None:
+        print(f"\n[FOLD-DIAG] fold={f.idx}")
+        print("  train:", f.train_start, "→", f.train_end, " purge_bars:", f.purge_bars)
+        print("  test: ", f.test_start,  "→", f.test_end)
+
+        for k, t in [("train_start", f.train_start), ("train_end", f.train_end),
+                     ("test_start", f.test_start), ("test_end", f.test_end)]:
+            try:
+                print(f"  {k}: tz={getattr(t, 'tz', None)}  type={type(t)}")
+            except Exception:
+                print(f"  {k}: type={type(t)}")
+
+        self._ts_diag("FULL", full)
+        self._ts_diag("SCAN", scan)
+
+        # Mask counts preview (these should NOT be zero in your case)
+        bar_dt = self._median_bar_delta(full)
+        purge_cut = f.purge_bars * bar_dt
+
+        tr_mask_full = (full["timestamp"] >= f.train_start) & (full["timestamp"] <= f.train_end - purge_cut)
+        te_mask_full = (full["timestamp"] >= f.test_start)  & (full["timestamp"] <= f.test_end)
+        tr_mask_scan = (scan["timestamp"] >= f.train_start) & (scan["timestamp"] <= f.train_end - purge_cut)
+        te_mask_scan = (scan["timestamp"] >= f.test_start)  & (scan["timestamp"] <= f.test_end)
+
+        print("  mask counts | full_tr:", int(tr_mask_full.sum()), "full_te:", int(te_mask_full.sum()),
+              "| scan_tr:", int(tr_mask_scan.sum()), "scan_te:", int(te_mask_scan.sum()))
+
+
     def _build_folds(
         self, start: pd.Timestamp, end: pd.Timestamp, df_full: pd.DataFrame
     ) -> List[Fold]:
@@ -231,13 +439,24 @@ class WalkForwardRunner:
                 break
             train_end = test_start - bar_dt
             train_start = start
-            folds.append(
+            '''folds.append(
                 Fold(
                     idx=len(folds) + 1,
                     train_start=train_start,
                     train_end=train_end,
                     test_start=test_start,
                     test_end=test_end,
+                    purge_bars=purge_bars,
+                )
+            )'''
+
+            folds.append(
+                Fold(
+                    idx=len(folds) + 1,
+                    train_start=to_utc(train_start),
+                    train_end=to_utc(train_end),
+                    test_start=to_utc(test_start),
+                    test_end=to_utc(test_end),
                     purge_bars=purge_bars,
                 )
             )
@@ -261,12 +480,38 @@ class WalkForwardRunner:
             persist_prob_columns: Tuple[str, str] | None = None,  # e.g., ("p_raw", "p_cal")
     ) -> Dict:
 
-        start = pd.to_datetime(start)
+        '''start = pd.to_datetime(start)
         end = pd.to_datetime(end)
 
         # filter both frames to window (defensive)
         full = df_full[(df_full["timestamp"] >= start) & (df_full["timestamp"] <= end)].reset_index(drop=True)
-        scan = df_scanned[(df_scanned["timestamp"] >= start) & (df_scanned["timestamp"] <= end)].reset_index(drop=True)
+        scan = df_scanned[(df_scanned["timestamp"] >= start) & (df_scanned["timestamp"] <= end)].reset_index(drop=True)'''
+
+        # ============================
+        # FORCE UTC TIMESTAMPS (CRITICAL)
+        # ============================
+        start = pd.to_datetime(start, utc=True)
+        end = pd.to_datetime(end, utc=True)
+
+        # normalize timestamp columns
+        full_all = self._force_utc_ts(df_full, "timestamp")
+        scan_all = self._force_utc_ts(df_scanned, "timestamp")
+
+        # filter both frames to window (defensive)
+        full = full_all[(full_all["timestamp"] >= start) & (full_all["timestamp"] <= end)].reset_index(drop=True)
+        scan = scan_all[(scan_all["timestamp"] >= start) & (scan_all["timestamp"] <= end)].reset_index(drop=True)
+
+        if full.empty:
+            raise ValueError("No rows in df_full after date filter")
+
+        # Quick window sanity
+        print(f"[WINDOW] start={start} end={end}")
+        print(f"[WINDOW] full rows={len(full)} | scan rows={len(scan)}")
+        print(f"[WINDOW] full min/max={full['timestamp'].min()} → {full['timestamp'].max()}")
+        if not scan.empty:
+            print(f"[WINDOW] scan min/max={scan['timestamp'].min()} → {scan['timestamp'].max()}")
+
+
         if full.empty:
             raise ValueError("No rows in df_full after date filter")
         # Note: scan MAY be empty in a given month; we’ll still compute folds/metrics.
@@ -307,6 +552,13 @@ class WalkForwardRunner:
             bar_dt = self._median_bar_delta(full)
             purge_cut = f.purge_bars * bar_dt
 
+            # ============================
+            # DEBUG: PRINT FOLD 1 ONLY
+            # ============================
+            if int(f.idx) == 1:
+                self._fold_diag(f, full, scan)
+
+
             # TRAIN on FULL (with purge)
             tr_mask_full = (full["timestamp"] >= f.train_start) & (full["timestamp"] <= f.train_end - purge_cut)
             te_mask_full = (full["timestamp"] >= f.test_start) & (full["timestamp"] <= f.test_end)
@@ -318,6 +570,16 @@ class WalkForwardRunner:
                 (fold_dir / "calibration").mkdir(parents=True, exist_ok=True)
                 (fold_dir / "plots").mkdir(parents=True, exist_ok=True)
                 scan_rows = int(((scan["timestamp"] >= f.test_start) & (scan["timestamp"] <= f.test_end)).sum())
+
+                print(
+                    f"[Fold {f.idx}] EMPTY slice. "
+                    f"full_tr={len(full_tr)} full_te={len(full_te)} "
+                    f"| scan_rows(test)={scan_rows} "
+                    f"| full_ts_dtype={full['timestamp'].dtype} scan_ts_dtype={scan['timestamp'].dtype} "
+                    f"| fold_test={f.test_start}→{f.test_end}"
+                )
+
+
                 m = {
                     "fold": f.idx,
                     "train_window": [str(f.train_start), str(f.train_end)],
@@ -340,6 +602,20 @@ class WalkForwardRunner:
             te_mask_scan = (scan["timestamp"] >= f.test_start) & (scan["timestamp"] <= f.test_end)
             scan_tr = scan.loc[tr_mask_scan].reset_index(drop=True)
             scan_te = scan.loc[te_mask_scan].reset_index(drop=True)
+
+            # ---- Phase 2: scan→fold intersection audit + hard-fail on contradiction ----
+            allow_scan_fallback = bool(getattr(self, "allow_scan_fallback", False))  # dev-only escape hatch
+
+            scan_tr_in_fold_ts, scan_te_in_fold_ts = _audit_scan_fold_intersection(
+                full_df=full,
+                scan_df=scan,
+                full_tr=full_tr,
+                full_te=full_te,
+                scan_tr=scan_tr,
+                scan_te=scan_te,
+                allow_fallback=allow_scan_fallback,
+                fold_idx=f.idx,
+            )
 
             # ---- FE: fit on full TRAIN, transform SCANNED train/test (no eval fit)
             '''pipe = CoreFeaturePipeline(parquet_root=Path(""))
@@ -379,10 +655,18 @@ class WalkForwardRunner:
 
             # 3. Instead of re-calculating, just SELECT the rows we need from the results above.
             #    This is efficient and guarantees the columns exist.
-            feats_scan_tr = feats_full_tr.loc[feats_full_tr['timestamp'].isin(scan_tr['timestamp'])].reset_index(
+            '''feats_scan_tr = feats_full_tr.loc[feats_full_tr['timestamp'].isin(scan_tr['timestamp'])].reset_index(
                 drop=True)
             feats_scan_te = feats_full_te.loc[feats_full_te['timestamp'].isin(scan_te['timestamp'])].reset_index(
-                drop=True)
+                drop=True)'''
+
+            feats_scan_tr = feats_full_tr.loc[
+                pd.to_datetime(feats_full_tr["timestamp"], utc=True, errors="coerce").isin(scan_tr_in_fold_ts)
+            ].reset_index(drop=True)
+
+            feats_scan_te = feats_full_te.loc[
+                pd.to_datetime(feats_full_te["timestamp"], utc=True, errors="coerce").isin(scan_te_in_fold_ts)
+            ].reset_index(drop=True)
 
             print(
                 f"[Fold {f.idx}] Found {len(feats_scan_tr)} scanned train bars and {len(feats_scan_te)} scanned test bars.")

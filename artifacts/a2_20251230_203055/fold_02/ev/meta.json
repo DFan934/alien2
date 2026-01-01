@@ -1,0 +1,18 @@
+{
+  "start": "1998-08-26 00:00:00+00:00",
+  "end": "1998-11-13 23:50:59.999999999+00:00",
+  "symbols": [
+    "RRC"
+  ],
+  "n_clusters": 64,
+  "features": [
+    "pca_1",
+    "pca_2",
+    "pca_3",
+    "pca_4",
+    "pca_5",
+    "pca_6"
+  ],
+  "sha": "e0e5eb6d4dc8",
+  "label_horizon": "O->C"
+}

@@ -1,0 +1,9 @@
+{
+  "timestamp": "timestamp[us, tz=UTC]",
+  "open": "float",
+  "high": "float",
+  "low": "float",
+  "close": "float",
+  "volume": "int32",
+  "symbol": "string"
+}

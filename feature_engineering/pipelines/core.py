@@ -3,6 +3,7 @@
 ##############################################
 """Pure‑pandas feature pipeline – now with a concrete ``run`` method."""
 from __future__ import annotations
+from feature_engineering.utils.time import ensure_utc_timestamp_col, to_utc
 
 import datetime as _dt
 from pathlib import Path
@@ -70,8 +71,12 @@ def _assert_schema_tz_freq(df: pd.DataFrame) -> None:
         raise ValueError(f"[FE] Missing required columns: {sorted(missing)}")
 
     # Enforce tz-naive UTC internally: normalize here
-    if pd.api.types.is_datetime64tz_dtype(df["timestamp"]):
-        df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+    #if pd.api.types.is_datetime64tz_dtype(df["timestamp"]):
+    #    df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    # Enforce tz-aware UTC everywhere (never tz-naive)
+    ensure_utc_timestamp_col(df, "timestamp", who="[FE]")
+
 
     # Sort per symbol by timestamp; check monotonicity and duplicates
     df.sort_values(["symbol", "timestamp"], inplace=True)
@@ -459,8 +464,14 @@ class CoreFeaturePipeline:
         #df_pca["symbol"] = df["symbol"].values
         #df_pca["timestamp"] = df["timestamp"].values
 
-        df_pca["symbol"] = df_with_features["symbol"].values
-        df_pca["timestamp"] = df_with_features["timestamp"].values
+        #df_pca["symbol"] = df_with_features["symbol"].values
+        #df_pca["timestamp"] = df_with_features["timestamp"].values
+
+        # Keep tz-aware timestamps: DO NOT use .values on tz-aware series
+        df_pca["symbol"] = df_with_features["symbol"].astype(str).to_numpy()
+        df_pca["timestamp"] = df_with_features["timestamp"]  # preserve tz-aware series
+        ensure_utc_timestamp_col(df_pca, "timestamp", who="[FE:run_mem output]")
+
         log.info("[FE] normalization_mode=%s", normalization_mode)
 
         pca_meta = {
@@ -483,6 +494,7 @@ class CoreFeaturePipeline:
             log.warning("[FE] Could not persist pca_meta.json: %s", e)
 
         #out["close"] = df["close"].values  # keep close so cluster builder can create y
+
 
         return df_pca, pca_meta
 
@@ -526,6 +538,10 @@ class CoreFeaturePipeline:
 
         if "trigger_ts" not in df.columns:
             df["trigger_ts"] = df["timestamp"]
+
+        # Phase-1: enforce canonical tz-aware UTC on both timestamp + trigger_ts
+        ensure_utc_timestamp_col(df, "timestamp", who="[FE:_calculate_base_features]")
+        ensure_utc_timestamp_col(df, "trigger_ts", who="[FE:_calculate_base_features]")
 
         ts_utc = _as_utc(df["timestamp"])
         tr_utc = _as_utc(df["trigger_ts"])
@@ -709,8 +725,12 @@ class CoreFeaturePipeline:
         n_comp = self._pipe.named_steps["pca"].n_components_
         pca_cols = [f"pca_{i + 1}" for i in range(n_comp)]
         df_pca = pd.DataFrame(transformed, columns=pca_cols, index=df_with_features.index, dtype=np.float32)
-        df_pca["symbol"] = df_with_features["symbol"].values
-        df_pca["timestamp"] = df_with_features["timestamp"].values
+        #df_pca["symbol"] = df_with_features["symbol"].values
+        #df_pca["timestamp"] = df_with_features["timestamp"].values
+
+        df_pca["symbol"] = df_with_features["symbol"].astype(str).to_numpy()
+        df_pca["timestamp"] = df_with_features["timestamp"]
+        ensure_utc_timestamp_col(df_pca, "timestamp", who="[FE:transform_mem output]")
 
         return df_pca
 
@@ -924,8 +944,12 @@ class CoreFeaturePipeline:
         k = pipe.named_steps["pca"].n_components_
         pca_cols = [f"pca_{i + 1}" for i in range(k)]
         out = pd.DataFrame(transformed, columns=pca_cols, index=df.index, dtype=np.float32)
-        out["symbol"] = df["symbol"].values
-        out["timestamp"] = df["timestamp"].values
+        #out["symbol"] = df["symbol"].values
+        #out["timestamp"] = df["timestamp"].values
+
+        out["symbol"] = df["symbol"].astype(str).to_numpy()
+        out["timestamp"] = df["timestamp"]
+        ensure_utc_timestamp_col(out, "timestamp", who="[FE:run output]")
 
         pca_meta = {
             "n_components": int(k),

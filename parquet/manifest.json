@@ -1,0 +1,87 @@
+{
+  "created_at": "2025-10-27T08:10:23Z",
+  "partitions": [
+    {
+      "day": 2,
+      "month": 1,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=APA\\year=1998\\month=01\\day=02\\part-19980102-4bea3504acb4.parquet",
+      "rows": 140384,
+      "sha256": "655037284d91b618100cfb2a0d3d335c2d05b8ae1653ca9c5753d6beba0362da",
+      "symbol": "APA",
+      "year": 1998
+    },
+    {
+      "day": 2,
+      "month": 1,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=BBY\\year=1998\\month=01\\day=02\\part-19980102-74b32a0c784e.parquet",
+      "rows": 223302,
+      "sha256": "6b2f55dd30f4caa77138935978eb984d7be4159545f1e075b1c760c2d65c1250",
+      "symbol": "BBY",
+      "year": 1998
+    },
+    {
+      "day": 26,
+      "month": 8,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=RRC\\year=1998\\month=08\\day=26\\part-19980826-fa1aa0741d91.parquet",
+      "rows": 41285,
+      "sha256": "ba70a693d8b045ae8af0b0c1bbc01862df1f87e7d9be2098c0bbac572268940d",
+      "symbol": "RRC",
+      "year": 1998
+    },
+    {
+      "day": 2,
+      "month": 1,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=APA\\year=1998\\month=01\\day=02\\part-19980102-652685698aeb.parquet",
+      "rows": 140384,
+      "sha256": "655037284d91b618100cfb2a0d3d335c2d05b8ae1653ca9c5753d6beba0362da",
+      "symbol": "APA",
+      "year": 1998
+    },
+    {
+      "day": 2,
+      "month": 1,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=BBY\\year=1998\\month=01\\day=02\\part-19980102-5d7b53bf6fb5.parquet",
+      "rows": 223302,
+      "sha256": "6b2f55dd30f4caa77138935978eb984d7be4159545f1e075b1c760c2d65c1250",
+      "symbol": "BBY",
+      "year": 1998
+    },
+    {
+      "day": 26,
+      "month": 8,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=RRC\\year=1998\\month=08\\day=26\\part-19980826-2ad2f9ccc471.parquet",
+      "rows": 41285,
+      "sha256": "ba70a693d8b045ae8af0b0c1bbc01862df1f87e7d9be2098c0bbac572268940d",
+      "symbol": "RRC",
+      "year": 1998
+    },
+    {
+      "day": 2,
+      "month": 1,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=APA\\year=1998\\month=01\\day=02\\part-19980102-edec04bc528a.parquet",
+      "rows": 112570,
+      "sha256": "33c8ce7b6029b5e3dc4128f978d3d3a61be502eda1f44faeb01509bafee0fba2",
+      "symbol": "APA",
+      "year": 1998
+    },
+    {
+      "day": 2,
+      "month": 1,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=BBY\\year=1998\\month=01\\day=02\\part-19980102-19a44daf262e.parquet",
+      "rows": 171755,
+      "sha256": "048a7187cfa0fed119c06599bea79dcc5158d8744fa408e3abbe1d3f933d2a16",
+      "symbol": "BBY",
+      "year": 1998
+    },
+    {
+      "day": 26,
+      "month": 8,
+      "path": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\parquet\\symbol=RRC\\year=1998\\month=08\\day=26\\part-19980826-3ebd207da46d.parquet",
+      "rows": 24960,
+      "sha256": "55fe2b29e562201ab09f6e4f6dcbec660965655f16d6876ff9128d381b876421",
+      "symbol": "RRC",
+      "year": 1998
+    }
+  ],
+  "schema_version": 1
+}

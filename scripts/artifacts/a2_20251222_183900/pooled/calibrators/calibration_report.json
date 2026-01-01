@@ -1,0 +1,14 @@
+{
+  "BBY": {
+    "ece": 0.0,
+    "brier": 0.0,
+    "mono_adj_pairs": 0,
+    "pooled_brier": 0.2,
+    "status": "fail",
+    "gates": {
+      "ece_max": 0.03,
+      "brier_delta_max": 0.03,
+      "min_monotonic_adjacent_pairs": 8
+    }
+  }
+}

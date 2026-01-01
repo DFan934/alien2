@@ -1,0 +1,23 @@
+{
+  "distance_family": "mahalanobis",
+  "k_used": 64,
+  "feature_schema_version": "4008f5dce074951a2642d7ae0b3ded99b540d1b0",
+  "fallback_rate_by_regime": {
+    "TREND": 0.0,
+    "RANGE": 0.0,
+    "VOL": 0.0,
+    "GLOBAL": 0.0
+  },
+  "median_knn_distance_by_regime": {
+    "TREND": null,
+    "RANGE": null,
+    "VOL": null,
+    "GLOBAL": null
+  },
+  "calibration_ece_by_symbol": {
+    "RRC": 0.0
+  },
+  "brier_by_symbol": {
+    "RRC": 0.0
+  }
+}
