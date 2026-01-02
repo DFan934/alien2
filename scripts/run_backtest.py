@@ -18,6 +18,8 @@ import glob
 
 import pyarrow.dataset as ds
 from prediction_engine.prediction_engine.artifacts.manager import ArtifactManager
+import json
+from feature_engineering.utils.timegrid import grid_audit_to_json
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,8 @@ from prediction_engine.portfolio.risk import RiskLimits, RiskEngine
 # NEW (Phase 4.5): portfolio ledger + risk
 from prediction_engine.portfolio.ledger import PortfolioLedger, TradeFill
 from prediction_engine.portfolio.risk import RiskLimits, RiskEngine
+
+from feature_engineering.utils.parquet_utc import write_parquet_utc
 
 
 import logging
@@ -49,6 +53,7 @@ import pyarrow.types as pat
 
 
 
+from prediction_engine.run_context import RunContext
 
 
 
@@ -78,6 +83,25 @@ def _install_print_filter(enable_verbose: bool) -> None:
 
 
 
+# --- Task3: run_context.json is the canonical root contract -------------------
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+def _write_run_context_json(artifacts_root: Path, payload: dict) -> None:
+    artifacts_root = Path(artifacts_root)
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    out_path = artifacts_root / "run_context.json"
+    tmp_path = artifacts_root / "run_context.json.tmp"
+
+    # Make payload stable + explicit
+    payload = dict(payload)
+    payload.setdefault("written_at_utc", datetime.now(timezone.utc).isoformat())
+    payload["artifacts_root"] = str(artifacts_root)
+
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(out_path)  # atomic on Windows if same volume
 
 
 
@@ -178,6 +202,26 @@ def run_batch(cfg: dict,
     artifacts_root = resolve_artifacts_root(cfg, create=True)
     print(f"[RunContext] artifacts_root={artifacts_root}")
 
+    # --- Task3: reject any root drift (e.g., scripts/artifacts vs artifacts) ---
+    expected = Path(cfg["artifacts_root"])
+    got = Path(artifacts_root)
+
+    # Normalize (string compare is fine; Windows path casing can differ, so use resolve)
+    try:
+        expected_r = expected.resolve()
+        got_r = got.resolve()
+    except Exception:
+        expected_r = expected
+        got_r = got
+
+    if expected_r != got_r:
+        raise RuntimeError(
+            f"[Task3] Artifact root drift detected.\n"
+            f"  expected cfg['artifacts_root']={expected_r}\n"
+            f"  got resolve_artifacts_root(...)={got_r}\n"
+            f"Refusing to proceed (this causes split decisions/trades/reporting)."
+        )
+
     # EV artifacts live under the same root unless explicitly overridden.
     if ev_artifacts_dir is not None:
         ev_dir = Path(ev_artifacts_dir)
@@ -249,6 +293,16 @@ def run_batch(cfg: dict,
     bars = pd.concat(bars, ignore_index=True) if bars else pd.DataFrame(
         columns=["timestamp","open","high","low","close","volume","symbol"]
     )
+
+    # --- Task 2: persist grid audit artifact ---
+    if hasattr(bars, "attrs") and "grid_audit" in bars.attrs:
+        grid_audit = grid_audit_to_json(bars.attrs["grid_audit"])
+        out_path = Path(artifacts_root) / "grid_audit.json"
+        out_path.write_text(json.dumps(grid_audit, indent=2, default=str))
+        print(f"[Grid] wrote {out_path}")
+
+
+
     if bars.empty:
         # Write empty outputs so the fold still has artifacts
         (out_dir / "decisions.parquet").write_bytes(b"")
@@ -298,6 +352,45 @@ def run_batch(cfg: dict,
     if feats_df is None:
         pipe = CoreFeaturePipeline(parquet_root=Path(prepro_dir) if prepro_dir else Path(""))
         # Use the *fitted* fold pipeline: transform only, no re-fit
+
+        # --- CANONICALIZE BARS BEFORE FE ---
+        from feature_engineering.utils.time import ensure_utc_timestamp_col  # if you have it
+        from feature_engineering.utils.timegrid import standardize_bars_to_grid  # wherever it lives
+
+        # Ensure tz-aware UTC timestamp column
+        bars = bars.copy()
+        bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+
+        # Force symbol column exists (if it's coming from partition/index)
+        if "symbol" not in bars.columns:
+            raise RuntimeError("[run_bt] bars missing symbol column before standardization")
+
+        import inspect
+        print("[DBG] standardize_bars_to_grid =", standardize_bars_to_grid)
+        print("[DBG] signature:", inspect.signature(standardize_bars_to_grid))
+
+        print("[DBG] BEFORE standardize symbol counts:\n", bars["symbol"].value_counts().head(10))
+
+        bars, grid_audit = standardize_bars_to_grid(
+            bars,
+            symbol_col="symbol",
+            ts_col="timestamp",
+            freq="60s",
+            expected_freq_s=60,
+            fill_volume_zero=True,
+            keep_ohlc_nan=True,
+        )
+
+        print("[DBG] AFTER  standardize symbol counts:\n", bars["symbol"].value_counts().head(10))
+
+        print("[DBG] after standardize:", bars["symbol"].nunique(), "symbols",
+              "rows=", len(bars),
+              "ts_tz=", getattr(bars["timestamp"].dtype, "tz", None))
+
+        # Optional: hard assert right here (so you see it before FE)
+        _dbg(bars, "run_bt: bars after standardize_bars_to_grid")
+        # --- END CANONICALIZE ---
+
         feats_df = pipe.transform_mem(bars)
 
     # If the fold saved the exact PCA columns, enforce them here
@@ -437,7 +530,7 @@ def run_batch(cfg: dict,
     decisions.to_csv(out_dir / "signals_out.csv", index=False)
 
     # Simple portfolio metrics + equity
-    eq = (trades[["exit_ts", "realized_pnl_after_costs"]]
+    '''eq = (trades[["exit_ts", "realized_pnl_after_costs"]]
           .rename(columns={"exit_ts": "timestamp", "realized_pnl_after_costs": "equity"})
           .copy())
     eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True)
@@ -453,9 +546,82 @@ def run_batch(cfg: dict,
         "gross_pnl": float(trades.get("realized_pnl", pd.Series(dtype=float)).sum()),
         "net_pnl": float(trades.get("realized_pnl_after_costs", pd.Series(dtype=float)).sum()),
     }
+    (out_dir / "portfolio_metrics.json").write_text(json.dumps(metrics, indent=2))'''
+
+    # -------------------------------
+    # Simple portfolio metrics + equity (robust)
+    # -------------------------------
+    if trades is None:
+        trades = pd.DataFrame()
+
+    # If no trades, still write artifacts and return cleanly
+    if trades.empty:
+        eq = pd.DataFrame({
+            "timestamp": pd.Series([], dtype="datetime64[ns, UTC]"),
+            "equity": pd.Series([], dtype=float),
+        })
+        eq.to_csv(out_dir / "equity.csv", index=False)
+
+        metrics = {
+            "symbols": symbols,
+            "start": str(start),
+            "end": str(end),
+            "n_decisions": int(len(decisions)),
+            "n_trades": 0,
+            "gross_pnl": 0.0,
+            "net_pnl": 0.0,
+        }
+        (out_dir / "portfolio_metrics.json").write_text(json.dumps(metrics, indent=2))
+        return metrics
+
+    # Determine usable timestamp column for exits
+    ts_col = "exit_ts"
+    if ts_col not in trades.columns:
+        for alt in ("exit_time", "exit_timestamp", "exit_dt", "timestamp"):
+            if alt in trades.columns:
+                ts_col = alt
+                break
+
+    # Ensure pnl-after-costs exists
+    if "realized_pnl_after_costs" not in trades.columns:
+        if "realized_pnl" in trades.columns:
+            trades["realized_pnl_after_costs"] = pd.to_numeric(trades["realized_pnl"], errors="coerce").fillna(0.0)
+        else:
+            trades["realized_pnl_after_costs"] = 0.0
+
+    # Build equity safely
+    if ts_col not in trades.columns:
+        eq = pd.DataFrame({
+            "timestamp": pd.Series([], dtype="datetime64[ns, UTC]"),
+            "equity": pd.Series([], dtype=float),
+        })
+    else:
+        eq = trades[[ts_col, "realized_pnl_after_costs"]].rename(
+            columns={ts_col: "timestamp", "realized_pnl_after_costs": "equity"}
+        ).copy()
+        eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True, errors="coerce")
+        eq["equity"] = pd.to_numeric(eq["equity"], errors="coerce").fillna(0.0).cumsum()
+        eq = eq.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    eq.to_csv(out_dir / "equity.csv", index=False)
+
+    # Metrics (robust sums)
+    gross = 0.0
+    if "realized_pnl" in trades.columns:
+        gross = float(pd.to_numeric(trades["realized_pnl"], errors="coerce").fillna(0.0).sum())
+
+    net = float(pd.to_numeric(trades["realized_pnl_after_costs"], errors="coerce").fillna(0.0).sum())
+
+    metrics = {
+        "symbols": symbols,
+        "start": str(start),
+        "end": str(end),
+        "n_decisions": int(len(decisions)),
+        "n_trades": int(len(trades)),
+        "gross_pnl": gross,
+        "net_pnl": net,
+    }
     (out_dir / "portfolio_metrics.json").write_text(json.dumps(metrics, indent=2))
-
-
 
     # --- BEGIN: ensure required outputs exist for smoke/tests ---
     # Your code above may have already written real outputs; if not, touch/create minimal ones.
@@ -522,7 +688,7 @@ from prediction_engine.ev_engine import EVEngine
 from prediction_engine.tx_cost import BasicCostModel  # NEW
 from execution.risk_manager import RiskManager
 from prediction_engine.testing_validation.async_backtester import BrokerStub  # NEW
-from scripts.rebuild_artefacts import rebuild_if_needed  # NEW
+from scripts.rebuild_artefacts import rebuild_if_needed, _dbg  # NEW
 from scanner.detectors import build_detectors        # ‹— add scanner import
 from backtester import Backtester
 from execution.manager import ExecutionManager
@@ -699,7 +865,7 @@ import glob
 
 
 # --- timestamp normalization helper (tz-naive in UTC on disk) ---
-def _coerce_ts_cols(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
+'''def _coerce_ts_cols(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
     """
     Parse any present timestamp columns as UTC, then DROP the timezone so that
     Parquet stores tz-naive datetime64[ns] interpreted as UTC.
@@ -709,6 +875,52 @@ def _coerce_ts_cols(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
         if c in df.columns:
             s = pd.to_datetime(df[c], errors="coerce", utc=True)
             df[c] = s.dt.tz_localize(None)   # tz-naive, still in UTC
+    return df
+'''
+
+# --- timestamp normalization helper (tz-aware UTC end-to-end) ---
+'''def _coerce_ts_cols(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
+    """
+    Parse any present timestamp columns as tz-aware UTC (datetime64[ns, UTC]).
+    DO NOT strip tz. Task 6 invariant: artifact boundaries must preserve UTC awareness.
+    """
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce", utc=True)
+    return df
+'''
+
+from feature_engineering.utils.time import ensure_utc_timestamp_col
+
+class TimestampDtypeError(RuntimeError):
+    pass
+
+def _enforce_utc_ts_cols(df: pd.DataFrame, cols: tuple[str, ...], who: str) -> pd.DataFrame:
+    """
+    Enforce tz-aware UTC timestamps for any present timestamp columns.
+    HARD FAIL if coercion creates NaT for any *required* timestamp column.
+    """
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            try:
+                ensure_utc_timestamp_col(out, c, who=who)
+            except Exception as e:
+                raise TimestampDtypeError(f"{who} failed UTC enforcement for col={c}: {e}") from e
+    return out
+
+def _drop_if_all_nat(df: pd.DataFrame, col: str, who: str) -> pd.DataFrame:
+    """
+    Some timestamp-like columns are optional (e.g., decision_ts). If present but
+    completely invalid (all NaT after parse), drop it (and log) rather than killing the run.
+    """
+    if col not in df.columns:
+        return df
+    s = pd.to_datetime(df[col], errors="coerce", utc=True)
+    if s.isna().all():
+        print(f"[UTC] {who}: dropping optional ts col '{col}' because all values are NaT after coercion")
+        return df.drop(columns=[col])
+    # otherwise keep it and let the strict enforcer validate it
     return df
 
 
@@ -768,13 +980,89 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
                 pass
 
     if dec_parts:
-        dec = pd.concat(dec_parts, ignore_index=True).drop_duplicates()
+        '''dec = pd.concat(dec_parts, ignore_index=True).drop_duplicates()
         # normalize timestamps to tz-naive UTC on disk (single pass, no re-adding tz!)
         dec = _coerce_ts_cols(dec, ("timestamp", "decision_ts", "entry_ts", "exit_ts"))
         # light schema hygiene
         if "symbol" in dec.columns:
             dec["symbol"] = dec["symbol"].astype("string")
-        dec.to_parquet(decisions_out, index=False)
+        #dec.to_parquet(decisions_out, index=False)
+
+        # --- Task6: decisions timestamp schema repair (decision_ts optional but must be valid if present) ---
+        # decision_ts is often missing/invalid in some paths. Define a deterministic policy:
+        #   - if decision_ts exists but is mostly null/unparseable, fill from timestamp
+        #   - if still invalid after fill, drop it (do not let optional cols break run)
+        if "decision_ts" in dec.columns:
+            # Try parsing; count how many become NaT
+            parsed = pd.to_datetime(dec["decision_ts"], errors="coerce", utc=True)
+            nat = int(parsed.isna().sum())
+
+            # If any NaT, fill from canonical timestamp where possible
+            if nat > 0 and "timestamp" in dec.columns:
+                ts_fallback = pd.to_datetime(dec["timestamp"], errors="coerce", utc=True)
+                parsed = parsed.fillna(ts_fallback)
+                nat2 = int(parsed.isna().sum())
+
+                if nat2 > 0:
+                    # Still invalid after fallback → drop (optional column)
+                    print(
+                        f"[UTC][WARN] decision_ts invalid after fallback (NaT={nat2}); dropping column from consolidated decisions")
+                    dec = dec.drop(columns=["decision_ts"])
+                else:
+                    dec["decision_ts"] = parsed
+            else:
+                dec["decision_ts"] = parsed
+        # --- end Task6 decisions repair ---
+
+        write_parquet_utc(
+            dec,
+            decisions_out,
+            timestamp_cols=("timestamp", "decision_ts", "entry_ts", "exit_ts"),
+        )'''
+
+        dec = pd.concat(dec_parts, ignore_index=True).drop_duplicates()
+
+        # Optional column cleanup BEFORE strict enforcement:
+        dec = _drop_if_all_nat(dec, "decision_ts", who="[Consolidate decisions]")
+
+        # Required columns must be valid tz-aware UTC:
+        # - timestamp is REQUIRED for decisions artifacts
+        if "timestamp" not in dec.columns:
+            raise RuntimeError("[UTC] decisions missing required 'timestamp' column at consolidation")
+
+        dec = _enforce_utc_ts_cols(dec, ("timestamp",), who="[Consolidate decisions REQUIRED]")
+        #dec = _enforce_utc_ts_cols(dec, ("decision_ts",), who="[Consolidate decisions OPTIONAL]")
+        print(f"[UTC][DEBUG] decisions columns={list(dec.columns)} rows={len(dec)}")
+        if "decision_ts" in dec.columns:
+            print(f"[UTC][DEBUG] decision_ts dtype before={dec['decision_ts'].dtype}")
+
+        # decision_ts is optional: keep only if it can be fully coerced; otherwise drop
+        if "decision_ts" in dec.columns:
+            coerced = pd.to_datetime(dec["decision_ts"], errors="coerce", utc=True)
+
+            # Optional fallback: if timestamp exists, fill missing decision_ts from timestamp
+            if "timestamp" in dec.columns:
+                coerced = coerced.fillna(pd.to_datetime(dec["timestamp"], errors="coerce", utc=True))
+
+            if coerced.isna().any():
+                nat = int(coerced.isna().sum())
+                print(
+                    f"[UTC] [Consolidate decisions OPTIONAL] dropping decision_ts (NaT={nat} after coercion/fallback)")
+                dec = dec.drop(columns=["decision_ts"])
+            else:
+                dec["decision_ts"] = coerced
+
+        # light schema hygiene
+        if "symbol" in dec.columns:
+            dec["symbol"] = dec["symbol"].astype("string")
+
+        write_parquet_utc(
+            dec,
+            decisions_out,
+            timestamp_cols=("timestamp", "decision_ts"),
+        )
+        #decisions_path = decisions_out
+
         decisions_path = decisions_out
     else:
         decisions_path = None
@@ -820,12 +1108,66 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
                 pass
 
     if trade_parts:
-        trades = pd.concat(trade_parts, ignore_index=True).drop_duplicates()
+        '''trades = pd.concat(trade_parts, ignore_index=True).drop_duplicates()
         trades = _coerce_ts_cols(trades, ("entry_ts", "exit_ts", "timestamp"))
         if "symbol" in trades.columns:
             trades["symbol"] = trades["symbol"].astype("string")
-        trades.to_parquet(trades_out, index=False)
+        #trades.to_parquet(trades_out, index=False)
+
+        # --- Task6: decisions timestamp schema repair (decision_ts optional but must be valid if present) ---
+        # decision_ts is often missing/invalid in some paths. Define a deterministic policy:
+        #   - if decision_ts exists but is mostly null/unparseable, fill from timestamp
+        #   - if still invalid after fill, drop it (do not let optional cols break run)
+        if "decision_ts" in dec.columns:
+            # Try parsing; count how many become NaT
+            parsed = pd.to_datetime(dec["decision_ts"], errors="coerce", utc=True)
+            nat = int(parsed.isna().sum())
+
+            # If any NaT, fill from canonical timestamp where possible
+            if nat > 0 and "timestamp" in dec.columns:
+                ts_fallback = pd.to_datetime(dec["timestamp"], errors="coerce", utc=True)
+                parsed = parsed.fillna(ts_fallback)
+                nat2 = int(parsed.isna().sum())
+
+                if nat2 > 0:
+                    # Still invalid after fallback → drop (optional column)
+                    print(
+                        f"[UTC][WARN] decision_ts invalid after fallback (NaT={nat2}); dropping column from consolidated decisions")
+                    dec = dec.drop(columns=["decision_ts"])
+                else:
+                    dec["decision_ts"] = parsed
+            else:
+                dec["decision_ts"] = parsed
+        # --- end Task6 decisions repair ---
+
+        write_parquet_utc(
+            trades,
+            trades_out,
+            timestamp_cols=("timestamp", "entry_ts", "exit_ts"),
+        )
+
+        trades_path = trades_out'''
+
+        trades = pd.concat(trade_parts, ignore_index=True).drop_duplicates()
+
+        # If you have any optional timestamp-like columns in trades, drop-if-all-NaT them here.
+        # (Most common case: none; entry_ts/exit_ts are required if present in your schema.)
+
+        # Enforce required timestamps if present/expected.
+        # Typical trades artifact expects entry_ts and exit_ts; timestamp may or may not exist depending on producer.
+        trades = _enforce_utc_ts_cols(trades, ("entry_ts", "exit_ts"), who="[Consolidate trades REQUIRED]")
+        trades = _enforce_utc_ts_cols(trades, ("timestamp",), who="[Consolidate trades OPTIONAL]")
+
+        if "symbol" in trades.columns:
+            trades["symbol"] = trades["symbol"].astype("string")
+
+        write_parquet_utc(
+            trades,
+            trades_out,
+            timestamp_cols=("entry_ts", "exit_ts", "timestamp"),
+        )
         trades_path = trades_out
+
     else:
         trades_path = None
 
@@ -1212,6 +1554,7 @@ def _aggregate_universe_outputs(artifacts_root: Path, symbols: list[str]) -> tup
 
 
 # --- Phase 4.2: attach modeled costs to trades (commission + spread + impact)
+# --- Phase 4.2: attach modeled costs to trades (commission + spread + impact)
 def _apply_modeled_costs_to_trades(
     trades: pd.DataFrame,
     cfg: dict,
@@ -1228,28 +1571,45 @@ def _apply_modeled_costs_to_trades(
       - 'modeled_cost_total'
       - 'realized_pnl_after_costs'
     """
+    # Defensive: allow None or empty
+    if trades is None:
+        return trades
+    if len(trades) == 0:
+        # ensure expected columns exist even when empty (nice for downstream)
+        df = trades.copy()
+        df["modeled_cost_total"] = 0.0
+        df["realized_pnl_after_costs"] = 0.0
+        return df
+
     df = trades.copy()
+
+    def _col_as_series(col: str, default: float = 0.0) -> pd.Series:
+        """Return df[col] coerced to numeric Series; if missing, a default Series."""
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            return s.fillna(default)
+        return pd.Series(default, index=df.index, dtype=float)
 
     # Costless short-circuit
     if bool(cfg.get("debug_no_costs", False)):
         df["modeled_cost_total"] = 0.0
-        base_pnl_col = "realized_pnl" if "realized_pnl" in df.columns else None
-        if base_pnl_col:
-            df["realized_pnl_after_costs"] = pd.to_numeric(df[base_pnl_col], errors="coerce").fillna(0.0)
+        if "realized_pnl" in df.columns:
+            df["realized_pnl_after_costs"] = pd.to_numeric(df["realized_pnl"], errors="coerce").fillna(0.0)
         else:
             df["realized_pnl_after_costs"] = 0.0
         return df
 
     # Knobs
-    spread_bp = float(cfg.get("spread_bp", 1.0))                 # half-spread (bps of price)
-    commission_per_share = float(cfg.get("commission", 0.0))     # $/share
-    slippage_bp = float(cfg.get("slippage_bp", 0.0))             # bps
+    spread_bp = float(cfg.get("spread_bp", 1.0))                      # half-spread (bps of price)
+    commission_per_share = float(cfg.get("commission", 0.0))          # $/share
+    slippage_bp = float(cfg.get("slippage_bp", 0.0))                  # bps
     impact_bps_per_frac = float(cfg.get("impact_bps_per_adv_frac", 25.0))  # bps per 1.0 ADV frac
 
-    # Core columns
-    qty = pd.to_numeric(df.get(qty_col, 0.0), errors="coerce").fillna(0.0).abs()
-    entry = pd.to_numeric(df.get(price_col, 0.0), errors="coerce").fillna(0.0)
-    exit_ = pd.to_numeric(df.get(exit_price_col, 0.0), errors="coerce").fillna(0.0)
+    # Core columns (always Series)
+    qty_raw = _col_as_series(qty_col, default=0.0)
+    qty = qty_raw.abs()
+    entry = _col_as_series(price_col, default=0.0)
+    exit_ = _col_as_series(exit_price_col, default=0.0)
     mid = (entry + exit_) / 2.0
 
     # Half-spread $/share
@@ -1257,8 +1617,9 @@ def _apply_modeled_costs_to_trades(
         half_spread_usd = pd.to_numeric(df[half_spread_col], errors="coerce")
     else:
         half_spread_usd = pd.Series(np.nan, index=df.index, dtype=float)
+
     fallback_half_spread = (spread_bp / 1e4) * mid
-    half_spread_usd = half_spread_usd.where(~half_spread_usd.isna(), fallback_half_spread)
+    half_spread_usd = half_spread_usd.where(~half_spread_usd.isna(), fallback_half_spread).fillna(0.0)
 
     # ADV fraction (for impact)
     if adv_pct_col and adv_pct_col in df.columns:
@@ -1279,9 +1640,10 @@ def _apply_modeled_costs_to_trades(
     if "realized_pnl" in df.columns:
         base = pd.to_numeric(df["realized_pnl"], errors="coerce").fillna(0.0)
     else:
-        # sign from qty (long positive / short negative if you store it that way)
-        side = np.sign(pd.to_numeric(df.get(qty_col, 0.0), errors="coerce").fillna(0.0))
-        base = (exit_ - entry) * (side * qty)  # crude
+        # side derived from qty sign (if your qty stores signed direction)
+        side = np.sign(qty_raw).replace(0.0, 1.0)  # treat 0 as +1 to avoid NaNs
+        base = (exit_ - entry) * (side * qty)      # crude
+
     df["realized_pnl_after_costs"] = base - total
     return df
 
@@ -1812,6 +2174,25 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     print(df_full[['timestamp', 'open', 'high', 'low', 'close']].head(3))
     print(df_full[['timestamp', 'open', 'high', 'low', 'close']].tail(3))
 
+    from feature_engineering.utils.timegrid import standardize_bars_to_grid
+
+    df_full, grid_audits = standardize_bars_to_grid(
+        df_full,
+        symbol_col="symbol",
+        ts_col="timestamp",
+        freq="60s",
+        expected_freq_s=60,
+        fill_volume_zero=True,
+        keep_ohlc_nan=True,
+        hard_fail_on_duplicates=False,
+    )
+
+    # optional: print audit summary (nice when debugging)
+    if grid_audits:
+        bad = [a for a in grid_audits if (a.median_delta_s_out not in (None, 60.0))]
+        if bad:
+            print("[GridAudit] non-60s after standardize:", bad)
+
     #df_raw = df_raw.loc[mask].reset_index(drop=True)
 
     df_raw = df_raw.loc[mask].copy()  # keep original index so fold merge can key on it
@@ -2242,6 +2623,25 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     usrc = _universe_source_label(cfg)
     win_s, win_e = str(cfg["start"]), str(cfg["end"])
     arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+
+
+    # --- Task3: lock canonical artifacts_root for the entire run ---
+    cfg["artifacts_root"] = str(arte_root)  # canonical absolute (repo-root based)
+
+    print(f"[RunContext] artifacts_root={arte_root}")
+
+    _write_run_context_json(
+        arte_root,
+        payload={
+            "run_id": RUN_ID,
+            "universe_hash": uhash,
+            "universe_source": usrc,
+            "window_start": str(cfg["start"]),
+            "window_end": str(cfg["end"]),
+            # optional extra provenance if you have it:
+            "parquet_root": str(_resolve_path(cfg.get("parquet_root", "parquet"))),
+        },
+    )
 
     print(f"[Run] universe_hash={uhash} | source={usrc} | window={win_s}→{win_e} | artifacts={arte_root}")
 
@@ -2783,8 +3183,36 @@ if __name__ == "__main__":
     from feature_engineering.utils.walkforward_report import generate_walkforward_report
     from feature_engineering.utils.consistency_gate import ConsistencyGateInputs, run_consistency_gate
 
+    #run_id = RUN_ID
+    #artifacts_root = Path(CONFIG["artifacts_root"])
+
     run_id = RUN_ID
-    artifacts_root = Path(CONFIG["artifacts_root"])
+
+    # Source of truth: the run directory chosen by RunContext, persisted at run start
+    # (never trust CONFIG["artifacts_root"] if it could be a base dir or scripts/artifacts)
+    artifacts_root = None
+    try:
+        import json
+        # CONFIG["artifacts_root"] should be the run dir AFTER Task 3, but we still read run_context.json
+        # as the definitive “this run wrote here” artifact.
+        candidate = Path(CONFIG["artifacts_root"]).resolve()
+        rc = candidate / "run_context.json"
+        if rc.exists():
+            artifacts_root = Path(json.loads(rc.read_text(encoding="utf-8"))["artifacts_root"]).resolve()
+    except Exception:
+        artifacts_root = None
+
+    if artifacts_root is None:
+        artifacts_root = Path(CONFIG["artifacts_root"]).resolve()
+
+
+    # Hard fail: consolidation/reporting must run against a single run directory, not a base folder.
+    if (artifacts_root / "run_context.json").exists() is False:
+        raise RuntimeError(
+            "[Task3] Refusing to consolidate/report without run_context.json in artifacts_root. "
+            f"Got artifacts_root={artifacts_root}"
+        )
+
 
     searched_dirs = [
         artifacts_root,

@@ -1,6 +1,6 @@
 import pandas as pd
 from pathlib import Path
-from pandas.api.types import is_datetime64_ns_dtype
+from pandas.api.types import is_datetime64tz_dtype
 
 from scripts.run_backtest import _consolidate_phase4_outputs
 
@@ -84,10 +84,20 @@ def test_consolidate_parquet_timestamps_mixed_tz(tmp_path: Path):
     trd_out = pd.read_parquet(trd_path)
 
     assert "timestamp" in dec_out.columns
-    assert is_datetime64_ns_dtype(dec_out["timestamp"])
+    '''assert is_datetime64_ns_dtype(dec_out["timestamp"])
 
     assert is_datetime64_ns_dtype(trd_out["entry_ts"])
     assert is_datetime64_ns_dtype(trd_out["exit_ts"])
+    '''
+    assert is_datetime64tz_dtype(dec_out["timestamp"]), f"decisions.timestamp dtype was {dec_out['timestamp'].dtype}"
+    assert str(dec_out["timestamp"].dtype) == "datetime64[ns, UTC]"
+
+    assert is_datetime64tz_dtype(trd_out["entry_ts"]), f"trades.entry_ts dtype was {trd_out['entry_ts'].dtype}"
+    assert str(trd_out["entry_ts"].dtype) == "datetime64[ns, UTC]"
+
+    assert is_datetime64tz_dtype(trd_out["exit_ts"]), f"trades.exit_ts dtype was {trd_out['exit_ts'].dtype}"
+    assert str(trd_out["exit_ts"].dtype) == "datetime64[ns, UTC]"
+
 
 
 

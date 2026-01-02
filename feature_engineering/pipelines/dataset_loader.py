@@ -3,6 +3,7 @@
 # ---------------------------------------------------------------------------
 """Robust Parquet dataset loader that works on any PyArrow version."""
 from __future__ import annotations
+from feature_engineering.utils.timegrid import standardize_bars_to_grid
 
 from pathlib import Path
 from typing import List
@@ -214,6 +215,24 @@ def load_parquet_dataset(
         df["volume"] = df["volume"].astype("int32", copy=False)
     if "symbol" in df.columns:
         df["symbol"] = df["symbol"].astype("string").astype("object")  # pandas string→object
+
+
+
+    # --- Task 2: canonical grid enforcement (upstream) ---
+    # Force all symbols onto 60s UTC grid BEFORE any scanning/FE
+    df, audits = standardize_bars_to_grid(
+        df,
+        symbol_col="symbol",
+        ts_col="timestamp",
+        freq="60s",
+        expected_freq_s=60,
+        fill_volume_zero=True,
+        keep_ohlc_nan=True,
+        hard_fail_on_duplicates=False,  # make True later when you trust upstream quality
+    )
+    # Store audits on attrs for callers (run_backtest can serialize to artifacts_root)
+    df.attrs["grid_audit"] = audits
+
 
     # Stable ordering for downstream grouping/joins
     if "symbol" in df.columns:

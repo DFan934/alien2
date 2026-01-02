@@ -1,82 +1,74 @@
 ############################
 # feature_engineering/calculators/rvol.py
 ############################
-"""Relative volume: current volume vs N‑day mean for same minute index."""
+"""Relative volume: current volume vs N-day mean for same minute-slot index."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
-from .base import Calculator, RollingCalculatorMixin, BaseCalculator
-from ..utils.calendar import session_id, minutes_since_open
+from .base import RollingCalculatorMixin, BaseCalculator
+from ..utils.calendar import session_id, slots_since_open
 
 
 class RVOLCalculator(RollingCalculatorMixin, BaseCalculator):
     def __init__(self, lookback_days: int = 20):
         self.name = f"rvol_{lookback_days}d"
-        # 390 min per session (US equities) → store days for window calc
-        self.lookback = lookback_days * 390
-        self._days = lookback_days
-
-    '''def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        if "volume" not in df.columns:
-            raise KeyError("RVOLCalculator requires volume column")
-
-        # Minute index within session (0‑389)
-        idx_in_day = (df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute) - 570  # 9:30 open
-        avg_vol = (
-            df["volume"].groupby(idx_in_day).transform(lambda x: x.rolling(self._days, min_periods=1).mean())
-        )
-        rvol = df["volume"] / avg_vol.replace(0, pd.NA)
-        return pd.DataFrame({self.name: rvol.astype("float32")})
-    '''
+        # 390 min per session (US equities) → store sessions for window calc
+        self._days = int(lookback_days)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         if not {"timestamp", "symbol", "volume"}.issubset(df.columns):
             raise KeyError("RVOLCalculator requires timestamp, symbol, volume")
 
-        # Get cadence from settings (preferred) or infer from this chunk
-        try:
-            from feature_engineering.config import settings
-            bar_seconds = int(getattr(settings, "bar_seconds", 60))
-        except Exception:
-            bar_seconds = 60
+        # Task 2: canonical grid is fixed at 60s UTC. FE calculators must not infer cadence.
+        bar_seconds = 60
 
-        # If not set, infer from data as a fallback
-        if not bar_seconds:
-            diffs = df.groupby("symbol")["timestamp"].diff().dropna().dt.total_seconds()
-            bar_seconds = int(round(float(diffs.median()))) if len(diffs) else 60
-
-        # Slot index within the RTH session (0..N-1), cadence-aware
-        from ..utils.calendar import session_id, slots_since_open
-        slot = slots_since_open(df["timestamp"], bar_seconds=bar_seconds)  # int32
+        # Slot index within RTH session (0..N-1), cadence-aware
+        slot = slots_since_open(df["timestamp"], bar_seconds=bar_seconds)  # int32, -1 outside RTH
         sess = session_id(df["timestamp"])
 
-        # Keep only RTH slots (slot >= 0)
-        base = df.loc[slot >= 0, ["symbol", "volume"]].copy()
-        base["slot"] = slot[slot >= 0].values
-        base["sess"] = sess[slot >= 0].values
-
-        # Sort to ensure rolling by session order is stable
-        base = base.sort_values(["symbol", "slot", "sess"])
-
-        # Rolling mean volume across the last N sessions per (symbol, slot)
-        baseline = (
-            base.groupby(["symbol", "slot"])["volume"]
-            .transform(lambda x: x.rolling(self._days, min_periods=1).mean())
-            .astype("float32")
-        )
-        base["baseline"] = baseline.replace(0.0, pd.NA)
-
-        # Join back and compute RVOL = vol / baseline
         out = pd.DataFrame(index=df.index)
-        out[self.name] = pd.NA
-        mask = (slot >= 0)
-        out.loc[mask, self.name] = (
-                df.loc[mask, "volume"].astype("float32") / base["baseline"].values
-        ).astype("float32")
+        out[self.name] = np.float32(0.0)
 
-        # Clamp and fill NA for first slots / missing baselines
-        s = out[self.name].astype("Float32")  # allow pd.NA
-        s = s.clip(upper=50).fillna(0.0)
-        out[self.name] = s.astype("float32")
+        mask = (slot >= 0)
+        if not bool(mask.any()):
+            return out
+
+        # Build a working frame for only RTH rows, preserving original row order.
+        base = df.loc[mask, ["symbol", "volume"]].copy()
+        base["_row"] = np.arange(len(base), dtype=np.int64)  # row id in masked frame
+        base["slot"] = slot.loc[mask].to_numpy()
+        base["sess"] = sess.loc[mask].to_numpy()
+
+        # Ensure numeric volume
+        base["volume"] = pd.to_numeric(base["volume"], errors="coerce").astype("float64")
+
+        # Sort for stable rolling by session order per (symbol, slot)
+        base = base.sort_values(["symbol", "slot", "sess"], kind="mergesort")
+
+        # Rolling mean across last N sessions per (symbol, slot)
+        baseline = (
+            base.groupby(["symbol", "slot"], sort=False)["volume"]
+                .transform(lambda x: x.rolling(self._days, min_periods=1).mean())
+                .astype("float64")
+        )
+
+        # Replace non-positive baseline with NaN to avoid inf blowups
+        baseline = baseline.mask(baseline <= 0.0, np.nan)
+
+        # Unsort back to the masked-row order so values align 1:1 with df.loc[mask]
+        base["baseline"] = baseline.to_numpy()
+        base = base.sort_values("_row", kind="mergesort")
+
+        vol = base["volume"].to_numpy(dtype="float64")
+        base_bl = base["baseline"].to_numpy(dtype="float64")
+
+        raw = vol / base_bl
+        raw[~np.isfinite(raw)] = np.nan
+        raw = np.clip(raw, a_min=0.0, a_max=50.0)
+        raw = np.nan_to_num(raw, nan=0.0).astype("float32")
+
+        out.loc[mask, self.name] = raw
+        out[self.name] = out[self.name].astype("float32")
         return out

@@ -29,8 +29,77 @@ def _load_meta(path: Path) -> dict | None:
     except FileNotFoundError:
         return None
 
+def _dbg(df: pd.DataFrame, tag: str, head: int = 3):
+    try:
+        idx = df.index
+        idx_type = type(idx).__name__
+        idx_names = getattr(idx, "names", None)
+        tz = getattr(idx, "tz", None) if isinstance(idx, pd.DatetimeIndex) else None
+
+        print("\n" + "=" * 90)
+        print(f"[DBG] {tag}")
+        print(f"shape={df.shape}")
+        print(f"columns({len(df.columns)}): {list(df.columns)[:15]}{' ...' if len(df.columns)>15 else ''}")
+        print(f"has_col timestamp={('timestamp' in df.columns)} symbol={('symbol' in df.columns)}")
+        print(f"index_type={idx_type} index_names={idx_names} index_tz={tz}")
+
+        if isinstance(idx, pd.MultiIndex):
+            print(f"multiindex nlevels={idx.nlevels} names={idx.names}")
+            # show first few tuples
+            print("multiindex head:", idx[:min(head, len(idx))].tolist())
+            # duplicates
+            try:
+                dup = idx.duplicated().sum()
+                print(f"multiindex duplicated count={dup}")
+            except Exception as e:
+                print("multiindex duplicated check failed:", e)
+
+        if isinstance(idx, pd.DatetimeIndex):
+            print("dtindex head:", list(idx[:min(head, len(idx))]))
+            print("dtindex min/max:", idx.min(), idx.max())
+            print("dtindex duplicated count:", idx.duplicated().sum())
+
+        # timestamp column sanity if present
+        if "timestamp" in df.columns:
+            ts = df["timestamp"]
+            print("timestamp col dtype:", ts.dtype)
+            try:
+                ts2 = pd.to_datetime(ts, errors="coerce", utc=True)
+                print("timestamp col coerced utc dtype:", ts2.dtype, "NaT:", ts2.isna().sum())
+                # show a few
+                print("timestamp col head:", ts.head(head).tolist())
+            except Exception as e:
+                print("timestamp col coercion failed:", e)
+
+        # symbol column sanity if present
+        if "symbol" in df.columns:
+            sym = df["symbol"]
+            print("symbol col dtype:", sym.dtype)
+            print("symbol unique head:", sym.astype(str).unique()[:10])
+
+    except Exception as e:
+        print(f"[DBG] {tag} FAILED:", e)
 
 # INSERT BEFORE: def rebuild_if_needed(...)
+
+def _safe_reset_index(df: pd.DataFrame, tag: str = "") -> pd.DataFrame:
+    """
+    Reset index without crashing if index level names already exist as columns.
+    If df has MultiIndex (timestamp,symbol) AND also has those columns, we drop
+    the index instead of inserting duplicates.
+    """
+    if not isinstance(df.index, pd.MultiIndex):
+        return df.reset_index(drop=False)
+
+    idx_names = [n for n in df.index.names if n is not None]
+    collision = [n for n in idx_names if n in df.columns]
+
+    if collision:
+        print(f"[DBG] safe_reset_index({tag}) collisions={collision} -> reset_index(drop=True)")
+        return df.reset_index(drop=True)
+    else:
+        return df.reset_index(drop=False)
+
 
 def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root: str | Path, n_clusters: int = 64):
     """
@@ -54,14 +123,92 @@ def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root
         df = df[(df["timestamp"] >= pd.to_datetime(start)) & (df["timestamp"] <= pd.to_datetime(end))]
         if not df.empty:
             dfs.append(df)
+
+        '''from feature_engineering.utils.time import ensure_utc_timestamp_col
+        from feature_engineering.utils.timegrid import standardize_bars_to_grid
+
+        # --- canonicalize ts (tz-aware) + slice window in UTC -----------------
+        ensure_utc_timestamp_col(df, "timestamp", who=f"[pooled:{sym}]")
+
+        start_ts = pd.to_datetime(start, utc=True)
+        end_ts = pd.to_datetime(end, utc=True)
+        df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
+        if df.empty:
+            continue
+
+        # --- enforce 60s UTC grid BEFORE any FE --------------------------------
+        df_std, audit = standardize_bars_to_grid(df, symbol=sym, freq="60s")
+        LOG.info(f"[GridAudit pooled] {audit}")
+
+        dfs.append(df_std)'''
+
     if not dfs:
         raise RuntimeError("No data found for pooled build")
 
     raw = pd.concat(dfs, ignore_index=True)
 
+    from feature_engineering.utils.timegrid import standardize_bars_to_grid
+
+    raw, audits = standardize_bars_to_grid(
+        raw,
+        symbol_col="symbol",
+        ts_col="timestamp",
+        freq="60s",
+        expected_freq_s=60,
+        fill_volume_zero=True,
+        keep_ohlc_nan=True,
+        hard_fail_on_duplicates=False,
+    )
+
+    _dbg(raw, "after standardize_bars_to_grid (raw)")
+    # Force keys to live in columns (not index)
+    if isinstance(raw.index, pd.MultiIndex) and any(n in ("timestamp", "symbol") for n in raw.index.names):
+        raw = raw.reset_index(drop=True)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    raw["symbol"] = raw["symbol"].astype("string")
+
+    raw.attrs["grid_audit"] = audits
+
     # 2) Fit features (get scaler/pca inside pipeline) and build clusters on pooled PCA space
     pipe = CoreFeaturePipeline(parquet_root=out_dir)   # fits in-memory
+
     feats, arte = pipe.run_mem(raw)  # arte (if returned) may include scaler_, pca_, etc.
+
+    # --- Ensure feats has timestamp + symbol info (pooled builder contract) ----
+    # 1) Timestamp
+    if "timestamp" not in feats.columns:
+        # if timestamp is the index, preserve it as a column
+        if isinstance(feats.index, pd.DatetimeIndex):
+            idx = feats.index
+            # drop tz if present
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_localize(None)
+            feats = feats.copy()
+            feats["timestamp"] = idx
+        else:
+            raise KeyError("[pooled] feats has no 'timestamp' col and index is not DatetimeIndex")
+
+    else:
+        # normalize to UTC-naive timestamps consistently
+        feats = feats.copy()
+        feats["timestamp"] = (
+            pd.to_datetime(feats["timestamp"], utc=True, errors="coerce")
+            .dt.tz_localize(None)
+        )
+
+    # 2) Symbol
+    if "symbol" not in feats.columns:
+        # Best case: one-to-one row alignment with raw
+        if len(feats) == len(raw) and "symbol" in raw.columns:
+            feats["symbol"] = raw["symbol"].astype("string").to_numpy()
+        else:
+            # If you truly built pooled features without per-row symbols, you must
+            # use a single symbol tag and also collapse labels the same way.
+            # But your label series uses real symbols, so prefer the aligned case.
+            raise KeyError("[pooled] feats missing 'symbol' and cannot align rows to raw")
+    else:
+        feats["symbol"] = feats["symbol"].astype("string")
+    # --------------------------------------------------------------------------
 
     # 3) Persist core components
     # Try to extract internals if the pipeline exposes them; otherwise persist placeholders so layout exists.
@@ -353,6 +500,20 @@ def rebuild_if_needed(
     if raw.empty:
         raise RuntimeError("Rebuild slice returned zero rows after filtering – check dates/symbols/timezone.")
 
+    from feature_engineering.utils.timegrid import standardize_bars_to_grid
+
+    raw, audits = standardize_bars_to_grid(
+        raw,
+        symbol_col="symbol",
+        ts_col="timestamp",
+        freq="60s",
+        expected_freq_s=60,
+        fill_volume_zero=True,
+        keep_ohlc_nan=True,
+        hard_fail_on_duplicates=False,
+    )
+    raw.attrs["grid_audit"] = audits
+
     # Add required columns for the feature pipeline if they're missing
     if "trigger_ts" not in raw.columns:
         raw["trigger_ts"] = raw["timestamp"]
@@ -365,9 +526,38 @@ def rebuild_if_needed(
     # --- REFINEMENT: Use the artefact_dir for the pipeline's root ---
 
     # 2) Get features in the SAME PCA space as walk-forward
-    if fitted_pipeline_dir is not None:
+    '''if fitted_pipeline_dir is not None:
         pipe = CoreFeaturePipeline(parquet_root=Path(fitted_pipeline_dir))
         feats = pipe.transform_mem(raw)  # ← NO FIT
+
+        # --- CONTRACT: feats must carry timestamp (+ symbol) aligned row-for-row ---
+        raw = raw.sort_values(["timestamp"]).reset_index(drop=True)
+
+        # If feats came back with a nontrivial index, drop it so we can align by position
+        feats = feats.reset_index(drop=True)
+
+        # 1) Ensure timestamp exists in feats
+        if "timestamp" not in feats.columns:
+            # Best assumption in your pipeline: transform_mem preserves row order
+            if len(feats) != len(raw):
+                raise RuntimeError(f"[rebuild] feats len {len(feats)} != raw len {len(raw)}; cannot attach timestamps")
+            feats["timestamp"] = raw["timestamp"].to_numpy()
+        else:
+            feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+
+        # 2) Ensure symbol exists in feats (your labels are per-symbol)
+        if "symbol" not in feats.columns:
+            if len(feats) != len(raw):
+                raise RuntimeError(f"[rebuild] feats len {len(feats)} != raw len {len(raw)}; cannot attach symbols")
+            feats["symbol"] = raw["symbol"].astype("string").to_numpy()
+        else:
+            feats["symbol"] = feats["symbol"].astype("string")
+
+        # 3) Canonicalize timestamp to UTC-naive (matches your y_numeric_series)
+        feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+        # -------------------------------------------------------------------------
+
+
     else:
         pipe = CoreFeaturePipeline(parquet_root=artefact_dir)
         feats, _ = pipe.run_mem(raw)  # ← legacy path (fits)
@@ -393,13 +583,13 @@ def rebuild_if_needed(
     ).ffill().bfill()
 
     # 4) Generate numeric labels (forward returns)
-    '''raw = raw.sort_values(["symbol", "timestamp"])
+    raw = raw.sort_values(["symbol", "timestamp"])
     raw["ret_fwd"] = raw.groupby("symbol")["open"].shift(-1) / raw["open"] - 1.0
     y_numeric_series = pd.Series(
         raw["ret_fwd"].values,
         index=pd.to_datetime(raw["timestamp"]).dt.tz_localize(None),
         name="ret_fwd"
-    )'''
+    )
 
     # 4) Generate numeric labels (forward returns)  **O->C on NEXT bar**
     raw = raw.sort_values(["symbol", "timestamp"])
@@ -421,7 +611,140 @@ def rebuild_if_needed(
     df_clean = df_combined[required_cols].dropna()
 
     if df_clean.empty:
-        raise RuntimeError("Data alignment resulted in an empty DataFrame. Check for NaNs or index mismatches.")
+        raise RuntimeError("Data alignment resulted in an empty DataFrame. Check for NaNs or index mismatches.")'''
+
+    # --- Canonical sort (IMPORTANT): raw order must be deterministic ----------
+    raw = raw.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+
+    # 2) Get features in the SAME PCA space as walk-forward
+    if fitted_pipeline_dir is not None:
+        pipe = CoreFeaturePipeline(parquet_root=Path(fitted_pipeline_dir))
+        _dbg(raw, "before transform_mem (raw)")
+
+        feats = pipe.transform_mem(raw)  # NO FIT (must preserve row order)
+        _dbg(feats, "after transform_mem (feats)")
+
+        feats = feats.reset_index(drop=True)
+
+
+
+        # --- CONTRACT: attach timestamp + symbol row-for-row ------------------
+        if "timestamp" not in feats.columns:
+            if len(feats) != len(raw):
+                raise RuntimeError(f"[rebuild] feats len {len(feats)} != raw len {len(raw)}; cannot attach timestamps")
+            feats["timestamp"] = raw["timestamp"].to_numpy()
+        feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+
+        if "symbol" not in feats.columns:
+            if len(feats) != len(raw):
+                raise RuntimeError(f"[rebuild] feats len {len(feats)} != raw len {len(raw)}; cannot attach symbols")
+            feats["symbol"] = raw["symbol"].astype("string").to_numpy()
+        feats["symbol"] = feats["symbol"].astype("string")
+
+    else:
+        pipe = CoreFeaturePipeline(parquet_root=artefact_dir)
+        feats, _ = pipe.run_mem(raw)  # legacy path (fits)
+        feats = feats.reset_index(drop=True)
+
+        # Attach keys if pipeline didn't keep them
+        if "timestamp" not in feats.columns:
+            if len(feats) != len(raw):
+                raise RuntimeError(f"[rebuild] run_mem feats len {len(feats)} != raw len {len(raw)}; cannot attach timestamps")
+            feats["timestamp"] = raw["timestamp"].to_numpy()
+        feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+
+        if "symbol" not in feats.columns:
+            if len(feats) != len(raw):
+                raise RuntimeError(f"[rebuild] run_mem feats len {len(feats)} != raw len {len(raw)}; cannot attach symbols")
+            feats["symbol"] = raw["symbol"].astype("string").to_numpy()
+        feats["symbol"] = feats["symbol"].astype("string")
+
+    # --- Build MultiIndex key for BOTH raw and feats --------------------------
+    raw_ts = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    raw_sym = raw["symbol"].astype("string")
+    raw_key = pd.MultiIndex.from_arrays([raw_ts, raw_sym], names=["timestamp", "symbol"])
+    raw = raw.assign(timestamp=raw_ts, symbol=raw_sym)
+    raw.index = raw_key
+
+    feats_ts = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    feats_sym = feats["symbol"].astype("string")
+    feats_key = pd.MultiIndex.from_arrays([feats_ts, feats_sym], names=["timestamp", "symbol"])
+    feats = feats.assign(timestamp=feats_ts, symbol=feats_sym)
+    feats.index = feats_key
+
+    # (Optional) sort_index so joins are predictable
+    raw = raw.sort_index()
+    feats = feats.sort_index()
+
+    tmp = raw
+
+    # If symbol is both in index and in columns, drop the index version before reset
+    if "symbol" in tmp.columns and "symbol" in getattr(tmp.index, "names", []):
+        tmp = tmp.reset_index(drop=True)
+    else:
+        tmp = tmp.reset_index()
+
+
+    # 3) Regime labels (by day) → broadcast to each (ts, sym)
+
+    _dbg(raw, "before daily resample (raw)")
+    # Force keys to live in columns (not index)
+    if isinstance(raw.index, pd.MultiIndex) and any(n in ("timestamp", "symbol") for n in raw.index.names):
+        raw = raw.reset_index(drop=True)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    raw["symbol"] = raw["symbol"].astype("string")
+
+    daily_df = tmp.reset_index(drop=True).set_index("timestamp").resample("D").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}
+    ).dropna()
+    daily_regimes = label_days(daily_df, RegimeParams())
+
+    y_regime = pd.Series(
+        feats.index.get_level_values("timestamp").normalize().map(daily_regimes),
+        index=feats.index,
+        name="regime",
+    ).ffill().bfill()
+
+    # 4) Numeric labels: NEXT bar O->C return, per symbol
+    #raw_sorted = raw.reset_index().sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+    _dbg(raw, "before raw_sorted build (raw)")
+    # Force keys to live in columns (not index)
+    if isinstance(raw.index, pd.MultiIndex) and any(n in ("timestamp", "symbol") for n in raw.index.names):
+        raw = raw.reset_index(drop=True)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    raw["symbol"] = raw["symbol"].astype("string")
+
+    raw_sorted = _safe_reset_index(raw, "raw_sorted").sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+    _dbg(raw_sorted, "after raw_sorted build (raw_sorted)")
+
+    next_open = raw_sorted.groupby("symbol")["open"].shift(-1)
+    next_close = raw_sorted.groupby("symbol")["close"].shift(-1)
+    raw_sorted["ret_fwd"] = (next_close / next_open - 1.0)
+
+    y_ts = pd.to_datetime(raw_sorted["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    y_sym = raw_sorted["symbol"].astype("string")
+    y_key = pd.MultiIndex.from_arrays([y_ts, y_sym], names=["timestamp", "symbol"])
+    y_ret = pd.Series(raw_sorted["ret_fwd"].to_numpy(dtype=float), index=y_key, name="ret_fwd")
+
+    # 5) Combine (inner) and clean
+    pca_cols = [c for c in feats.columns if c.startswith("pca_")]
+    df_combined = feats[pca_cols].join(y_ret, how="inner").join(y_regime, how="inner")
+    df_clean = df_combined.dropna()
+
+    if df_clean.empty:
+        # Debug payload: tells you exactly which join collapsed
+        LOG.error("[rebuild] EMPTY after alignment")
+        LOG.error("  feats rows=%d | y_ret rows=%d | y_regime rows=%d", len(feats), len(y_ret), len(y_regime))
+        LOG.error("  feats key head=%s", feats.index[:3])
+        LOG.error("  y_ret  key head=%s", y_ret.index[:3])
+        LOG.error("  overlap feats∩y_ret=%d", len(feats.index.intersection(y_ret.index)))
+        raise RuntimeError("Data alignment resulted in an empty DataFrame. See logs for key overlap diagnostics.")
+
+    # df_clean now has: pca_* + ret_fwd + regime and aligned MultiIndex
+
+
 
     # 6) Build centroids from the cleaned, aligned data
     LOG.info("Building clusters with data shape: %s", df_clean.shape)

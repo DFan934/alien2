@@ -1,0 +1,141 @@
+# prediction_engine/run_context.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Optional
+import json
+
+
+class ArtifactRootMismatchError(RuntimeError):
+    def __init__(self, *, expected_root: Path, got_path: Path, rel: str):
+        super().__init__(
+            f"[ArtifactRootMismatchError] resolved path is outside artifacts_root\n"
+            f"  expected_root: {expected_root}\n"
+            f"  got_path:      {got_path}\n"
+            f"  rel:           {rel}\n"
+        )
+        self.expected_root = expected_root
+        self.got_path = got_path
+        self.rel = rel
+
+
+def _find_repo_root(start: Path) -> Path:
+    """
+    Repo root = a parent containing scripts/run_backtest.py (preferred) or .git.
+    Matches the logic already used in tests like test_signal_density_sanity.py.
+    """
+    cur = start.resolve()
+    for p in [cur, *cur.parents]:
+        if (p / "scripts" / "run_backtest.py").exists():
+            return p
+        if (p / ".git").exists():
+            return p
+    return cur.parents[0]
+
+
+def _canonicalize_artifacts_root(root: Path) -> Path:
+    """
+    Canonical policy for this repo:
+
+    - artifacts_root is always under <repo_root>/artifacts (never <repo_root>/scripts/artifacts)
+    - if an input root points at scripts/artifacts, rewrite it to artifacts
+
+    This prevents the exact split observed in logs:
+      ...\\scripts\\artifacts\\a2_... vs ...\\artifacts\\a2_...
+    """
+    root = root.expanduser().resolve()
+    parts = list(root.parts)
+
+    # Detect ".../<repo>/scripts/artifacts/..." and rewrite to ".../<repo>/artifacts/..."
+    # This is intentionally strict: we do not allow scripts/artifacts as a “valid” root.
+    try:
+        i = parts.index("scripts")
+        if i + 1 < len(parts) and parts[i + 1] == "artifacts":
+            # Replace the "scripts/artifacts" segment with just "artifacts"
+            new_parts = parts[:i] + ["artifacts"] + parts[i + 2 :]
+            return Path(*new_parts).resolve()
+    except ValueError:
+        pass
+
+    return root
+
+
+@dataclass(frozen=True)
+class RunContext:
+    run_id: str
+    artifacts_root: Path
+    universe_hash: Optional[str] = None
+    window: Optional[str] = None  # (optional) human-readable window, not a source of truth
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        cfg: Mapping[str, Any],
+        universe_hash: Optional[str] = None,
+        window: Optional[str] = None,
+    ) -> "RunContext":
+        """
+        Single constructor for the run’s artifacts root.
+
+        Rules:
+        - If cfg['artifacts_root'] is an explicit run dir (a2_...), accept it (but canonicalize scripts/artifacts → artifacts).
+        - Else derive <repo_root>/artifacts/a2_<timestamp> (or run_id driven), but ONLY ONCE here.
+        - Immediately persist run_context.json so downstream phases can sanity-check.
+        """
+        # Prefer: caller already set cfg["artifacts_root"] to the run directory
+        raw = cfg.get("artifacts_root")
+
+        if raw:
+            root = Path(str(raw))
+            root = _canonicalize_artifacts_root(root)
+        else:
+            # Derive default root: <repo_root>/artifacts/<run_id or a2_*>
+            repo = _find_repo_root(Path(__file__))
+            base = repo / "artifacts"
+            # If run_id is already the folder name, use it; else keep a2_ naming external.
+            root = base / str(run_id)
+            root = _canonicalize_artifacts_root(root)
+
+        root.mkdir(parents=True, exist_ok=True)
+
+        ctx = cls(run_id=str(run_id), artifacts_root=root, universe_hash=universe_hash, window=window)
+
+        # Persist run context for later tooling + debugging + “is this the right run dir?”
+        (root / "run_context.json").write_text(
+            json.dumps(
+                {
+                    "run_id": ctx.run_id,
+                    "artifacts_root": str(ctx.artifacts_root),
+                    "universe_hash": ctx.universe_hash,
+                    "window": ctx.window,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        print("[RunContext] artifacts_root=" + str(ctx.artifacts_root))
+        return ctx
+
+    def resolve(self, rel: str) -> Path:
+        """
+        Resolve a relative path under artifacts_root with a HARD invariant:
+        resolved_path MUST be inside artifacts_root.
+
+        This is the guardrail that makes scripts\\artifacts divergence impossible.
+        """
+        rel = str(rel).lstrip("/\\")
+        p = (self.artifacts_root / rel).resolve()
+
+        # Invariant: p is a child of artifacts_root
+        root = self.artifacts_root.resolve()
+        try:
+            p.relative_to(root)
+        except Exception:
+            raise ArtifactRootMismatchError(expected_root=root, got_path=p, rel=rel)
+
+        return p
