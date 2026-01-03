@@ -35,6 +35,19 @@ class FoldMetricsConfig:
     dpi: int = 110
 
 
+def _resolve_p_col(joined: pd.DataFrame, p_col: str) -> str:
+    if p_col in joined.columns:
+        return p_col
+    # common fallbacks
+    for alt in ("p_cal", "p", "prob", "p_pred", "p_hat", "p_raw"):
+        if alt in joined.columns:
+            return alt
+    raise KeyError(
+        f"[FoldMetrics] cfg.p_col='{p_col}' not found. "
+        f"Available columns include: {list(joined.columns)[:40]} ..."
+    )
+
+
 def _load_decisions_and_trades(decisions_parquet, trades_parquet):
     """
     Robust loader that tolerates schema differences.
@@ -138,6 +151,18 @@ def compute_and_save_fold_metrics(
         trades = _safe_read_parquet(tr_path)
 
     decisions = _safe_read_parquet(dec_path)
+
+
+    # ---- Ensure probability column exists (prevents KeyError: 'p_cal')
+    decisions, _ = _resolve_prob_col(decisions, cfg.p_col)
+
+
+    if cfg.p_col in decisions.columns:
+        # cheap sanity breadcrumb in logs
+        print(f"[FoldMetrics] using prob column: {cfg.p_col}")
+        print(f"[FoldMetrics] decisions cols sample: {sorted(list(decisions.columns))[:40]}")
+
+
     if decisions.empty:
         # write empty outputs and return
         payload = {
@@ -174,7 +199,9 @@ def compute_and_save_fold_metrics(
 
     # Use the already-joined frame to avoid schema issues
     y = joined["realized"].astype(float).to_numpy()
-    p = joined[cfg.p_col].astype(float).clip(0.0, 1.0).to_numpy()
+    #p = joined[cfg.p_col].astype(float).clip(0.0, 1.0).to_numpy()
+    p_col = _resolve_p_col(joined, cfg.p_col)
+    p = joined[p_col].astype(float).clip(0.0, 1.0).to_numpy()
 
     resid = y - p
     resid_centered = resid - resid.mean()  # center for CUSUM stability
@@ -242,9 +269,49 @@ def _safe_read_parquet(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+# -------------------------------
+# Helpers (add this)
+# -------------------------------
+
+def _resolve_prob_col(df: pd.DataFrame, desired: str) -> tuple[pd.DataFrame, str]:
+    """
+    Ensure a usable probability column exists.
+
+    Returns (df, prob_col_name_in_df).
+
+    Strategy:
+      1) If desired exists -> use it.
+      2) Else try common aliases -> rename first hit to desired.
+      3) Else create desired as NaN (so downstream returns empty metrics instead of crashing).
+    """
+    if desired in df.columns:
+        return df, desired
+
+    # Common aliases seen across pipelines / refactors
+    candidates = [
+        "p_cal", "p", "prob", "proba", "p_hat", "p_pred", "p_model",
+        "p_iso", "p_post", "p_win", "win_prob",
+        "score_cal", "score_prob", "score",
+    ]
+
+    for c in candidates:
+        if c in df.columns:
+            # rename the alias to the configured name so the rest of the code stays consistent
+            df = df.rename(columns={c: desired})
+            return df, desired
+
+    # Nothing found: create a placeholder column to avoid KeyError.
+    # Downstream calibration will become empty and return NaNs gracefully.
+    df[desired] = np.nan
+    return df, desired
+
+
 def _join_decisions_trades(dec, tr, cfg: FoldMetricsConfig) -> pd.DataFrame:
     dec = dec.copy()
     tr = tr.copy()
+
+    # Ensure prob column exists on decisions before we ever merge
+    dec, _ = _resolve_prob_col(dec, cfg.p_col)
 
     # Ensure realized_pnl column name exists
     if cfg.realized_pnl_col not in tr.columns:
@@ -288,15 +355,53 @@ def _join_decisions_trades(dec, tr, cfg: FoldMetricsConfig) -> pd.DataFrame:
     return j
 
 
-def _calibration_metrics(joined: pd.DataFrame, cfg: FoldMetricsConfig) -> Dict[str, object]:
-    df = joined[[cfg.p_col, "realized"]].dropna().copy()
+'''def _calibration_metrics(joined: pd.DataFrame, cfg: FoldMetricsConfig) -> Dict[str, object]:
+    # ---- Robust column selection (prevents KeyError on missing cfg.p_col) ----
+    requested = getattr(cfg, "p_col", None) or "p_cal"
+
+    # Try requested first, then common fallbacks used in your pipeline
+    candidates = [
+        requested,
+        "p_cal",
+        "p",          # common generic prob
+        "p_raw",      # pre-calibration
+        "p_hat",
+        "p_pred",
+        "p_full",     # sometimes used in gating logs
+        "p_gate",
+        "prob",
+        "prob_cal",
+    ]
+
+    p_col = next((c for c in candidates if c in joined.columns), None)
+
+    # If we don't have the required columns, skip calibration instead of crashing
+    if p_col is None or "realized" not in joined.columns:
+        # Return the same shape as your empty-case return
+        return {
+            "ece": np.nan, "brier": np.nan, "n_deciles": 0,
+            "decile_table": pd.DataFrame(columns=["decile", "p_mean", "y_rate", "count"]),
+            # Optional: include debug fields; harmless for downstream if ignored
+            "p_col_used": p_col,
+            "p_col_requested": requested,
+        }
+
+    # Ensure prob col exists in joined too (belt + suspenders)
+    if cfg.p_col not in joined.columns:
+        joined, _ = _resolve_prob_col(joined, cfg.p_col)
+
+    # Build df using the actual available p column, but normalize name to requested
+    df = joined[[p_col, "realized"]].dropna().copy()
     if df.empty:
         return {
             "ece": np.nan, "brier": np.nan, "n_deciles": 0,
-            "decile_table": pd.DataFrame(columns=["decile", "p_mean", "y_rate", "count"])
+            "decile_table": pd.DataFrame(columns=["decile", "p_mean", "y_rate", "count"]),
+            "p_col_used": p_col,
+            "p_col_requested": requested,
         }
+
     # clip p to [0,1]
-    p = df[cfg.p_col].astype(float).clip(0.0, 1.0)
+    p = df[p_col].astype(float).clip(0.0, 1.0)
     y = df["realized"].astype(float)
 
     # Brier
@@ -320,7 +425,47 @@ def _calibration_metrics(joined: pd.DataFrame, cfg: FoldMetricsConfig) -> Dict[s
     # ECE (expected calibration error) with decile weights
     ece = float(np.sum(np.abs(tab["p_mean"] - tab["y_rate"]) * (tab["count"] / n)))
 
+    return {
+        "ece": ece,
+        "brier": brier,
+        "n_deciles": int(tab.shape[0]),
+        "decile_table": tab,
+        "p_col_used": p_col,
+        "p_col_requested": requested,
+    }'''
+
+def _calibration_metrics(joined: pd.DataFrame, cfg: FoldMetricsConfig) -> Dict[str, object]:
+    p_col = _resolve_p_col(joined, cfg.p_col)
+
+    df = joined[[p_col, "realized"]].dropna().copy()
+    if df.empty:
+        return {
+            "ece": np.nan, "brier": np.nan, "n_deciles": 0,
+            "decile_table": pd.DataFrame(columns=["decile", "p_mean", "y_rate", "count"])
+        }
+
+    p = df[p_col].astype(float).clip(0.0, 1.0)
+    y = df["realized"].astype(float)
+
+    brier = float(np.mean((p - y) ** 2))
+
+    try:
+        dec = pd.qcut(p, 10, labels=False, duplicates="drop")
+    except ValueError:
+        dec = pd.Series(np.zeros(len(p), dtype=int), index=p.index)
+
+    tab = (
+        pd.DataFrame({"p": p, "y": y, "dec": dec})
+        .groupby("dec", as_index=False)
+        .agg(p_mean=("p", "mean"), y_rate=("y", "mean"), count=("y", "size"))
+        .sort_values("dec")
+        .rename(columns={"dec": "decile"})
+    )
+
+    n = len(df)
+    ece = float(np.sum(np.abs(tab["p_mean"] - tab["y_rate"]) * (tab["count"] / n)))
     return {"ece": ece, "brier": brier, "n_deciles": int(tab.shape[0]), "decile_table": tab}
+
 
 
 def _plot_reliability_curve(cal: Dict[str, object], out_png: Path, dpi: int = 110) -> None:

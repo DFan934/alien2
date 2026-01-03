@@ -1,21 +1,21 @@
 {
   "fold_idx": 2,
   "windows": {
-    "train_start": "1998-08-26 00:00:00",
-    "train_end": "1998-11-13 23:59:59.999999999",
+    "train_start": "1998-08-26 00:00:00+00:00",
+    "train_end": "1998-11-13 23:59:59.999999999+00:00",
     "purge_bars": 3,
-    "test_start": "1998-11-17 00:00:00",
-    "test_end": "1998-12-06 23:59:59.999999999"
+    "test_start": "1998-11-17 00:00:00+00:00",
+    "test_end": "1998-12-06 23:59:59.999999999+00:00"
   },
   "gates": {
-    "p_gate": 0.6,
-    "full_p": 0.72,
-    "mode": "normal"
+    "p_gate": 0.017632241813602016,
+    "full_p": 0.0206794682422452,
+    "mode": "widened"
   },
   "prepro_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\scripts\\artifacts\\a2\\fold_02\\prepro",
   "ev_artifacts": {
-    "start": "1998-08-26 00:00:00",
-    "end": "1998-11-13 23:50:59.999999999",
+    "start": "1998-08-26 00:00:00+00:00",
+    "end": "1998-11-13 23:56:59.999999999+00:00",
     "symbols": [
       "BBY"
     ],
@@ -26,9 +26,10 @@
       "pca_3",
       "pca_4",
       "pca_5",
-      "pca_6"
+      "pca_6",
+      "pca_7"
     ],
-    "sha": "e0e5eb6d4dc8",
+    "sha": "c2845e2f171f",
     "label_horizon": "O->C",
     "source_dir": "C:\\Users\\donav\\Downloads\\TheFinalProject5\\weights"
   },

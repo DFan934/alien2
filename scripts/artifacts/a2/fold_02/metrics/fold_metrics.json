@@ -1,74 +1,32 @@
 {
-  "n_decisions": 3896,
-  "n_trades_matched": 32,
-  "ece": 0.4963258143506736,
-  "brier": 0.24830522159436205,
-  "deciles": 10,
+  "n_decisions": 692,
+  "n_trades_matched": 0,
+  "ece": 0.012352511140818312,
+  "brier": 0.00020840936741940038,
+  "deciles": 3,
   "decile_table": [
     {
       "decile": 0,
-      "p_mean": 0.45237112223553166,
+      "p_mean": 0.0018157368475618144,
       "y_rate": 0.0,
-      "count": 390
+      "count": 227
     },
     {
       "decile": 1,
-      "p_mean": 0.47170459415014626,
+      "p_mean": 0.017273618264082417,
       "y_rate": 0.0,
-      "count": 390
+      "count": 430
     },
     {
       "decile": 2,
-      "p_mean": 0.482777393479845,
+      "p_mean": 0.020231702614122896,
       "y_rate": 0.0,
-      "count": 389
-    },
-    {
-      "decile": 3,
-      "p_mean": 0.490475564723865,
-      "y_rate": 0.0,
-      "count": 390
-    },
-    {
-      "decile": 4,
-      "p_mean": 0.4967286209868469,
-      "y_rate": 0.0,
-      "count": 389
-    },
-    {
-      "decile": 5,
-      "p_mean": 0.5032776499296221,
-      "y_rate": 0.0,
-      "count": 390
-    },
-    {
-      "decile": 6,
-      "p_mean": 0.5098646412578547,
-      "y_rate": 0.0,
-      "count": 389
-    },
-    {
-      "decile": 7,
-      "p_mean": 0.5142094776151744,
-      "y_rate": 0.0,
-      "count": 390
-    },
-    {
-      "decile": 8,
-      "p_mean": 0.5211067181174601,
-      "y_rate": 0.0,
-      "count": 389
-    },
-    {
-      "decile": 9,
-      "p_mean": 0.5361915254115162,
-      "y_rate": 0.015384615384615385,
-      "count": 390
+      "count": 35
     }
   ],
   "fallback_rate": null,
   "analog_fidelity_by_bucket": {},
-  "residual_cusum_3sigma_breaches": 3896,
+  "residual_cusum_3sigma_breaches": 691,
   "psi": null,
   "notes": {
     "ece_bins": "deciles",

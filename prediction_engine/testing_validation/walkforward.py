@@ -544,6 +544,12 @@ class WalkForwardRunner:
 
         for f in folds:
             fold_dir = self.artifacts_root / f"fold_{f.idx:02d}"
+
+            # Phase 1.1 guard: prevent duplicated "a2\\a2" style roots
+            _fold_path_norm = str(fold_dir).lower().replace("/", "\\")
+            if "\\a2\\a2\\" in _fold_path_norm:
+                raise AssertionError(f"[Phase1.1] illegal duplicated a2 segment in fold_dir: {fold_dir}")
+
             calib_dir = fold_dir / "calibration"
             plots_dir = fold_dir / "plots"
             for d in (calib_dir, plots_dir):
@@ -741,6 +747,13 @@ class WalkForwardRunner:
             # ---- 5.3: run fold TEST via backtest callable ------------------------------
             from scripts.run_backtest import run_batch as run_bt
 
+            # --- execution rules required by scripts.run_backtest.run_batch ---
+            # Keep it minimal + compatible with your current simulator.
+            execution_rules = self.__dict__.get("execution_rules") or {
+                "max_fill_frac_of_bar": 1.0,
+                "allow_partial": True,
+            }
+
             test_cfg = {
                 "parquet_root": str(self.parquet_root),
                 "universe": [self.symbol],  # or a list of symbols in your universe
@@ -755,6 +768,8 @@ class WalkForwardRunner:
                 # optional: if you have a ready test features frame:
                 # "test_features_df": feats_scan_te,
                 "horizon_bars": int(self.horizon_bars),
+                "execution_rules": execution_rules,
+
             }
 
             bt_metrics = run_bt(test_cfg, artifacts_dir=fold_dir, ev_artifacts_dir=ev_dst)
@@ -1300,8 +1315,22 @@ class WalkForwardRunner:
                 qty = np.ones(int(keep.sum()), dtype=float)
 
                 # Costs (respect your debug flag); extend with your BasicCostModel if desired
-                commission = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
-                slippage = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
+                #commission = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
+                #slippage = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
+
+                # Costs (Phase 1.1): commission must be non-zero when enabled.
+                commission_per_share = float(getattr(self, "commission", self.cfg.get("commission", 0.0)))
+                slippage_bp = float(getattr(self, "slippage_bp", self.cfg.get("slippage_bp", 0.0)))
+
+                if self.debug_no_costs:
+                    commission = np.zeros_like(qty, dtype=float)
+                    slippage = np.zeros_like(qty, dtype=float)
+                else:
+                    # charge commission on entry + exit (2 legs)
+                    commission = 2.0 * commission_per_share * qty
+                    # slippage modeled as bps of notional on entry + exit (2 legs)
+                    slippage = 2.0 * (slippage_bp / 1e4) * entry_px[keep] * qty
+
 
                 realized_pnl = (exit_px[keep] - entry_px[keep]) * qty - commission - slippage
 

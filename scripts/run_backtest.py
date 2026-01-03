@@ -16,6 +16,10 @@ import asyncio
 #from ledger import PortfolioLedger, equity_curve_from_trades
 import glob
 
+from feature_engineering.utils.artifacts_root import resolve_artifacts_root
+from pathlib import Path
+
+
 import pyarrow.dataset as ds
 from prediction_engine.prediction_engine.artifacts.manager import ArtifactManager
 import json
@@ -167,6 +171,37 @@ def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols:
     return pd.DatetimeIndex(uni, tz="UTC")
 
 
+def _timestamp_overlap_share(
+    bars: pd.DataFrame,
+    *,
+    ts_col: str = "timestamp",
+    symbol_col: str = "symbol",
+    min_symbols: int = 2,
+) -> float:
+    """
+    Share of timestamps that have >= min_symbols symbols present.
+    Example: min_symbols=2 => percentage of minutes where at least 2 symbols traded.
+    """
+    if bars is None or bars.empty:
+        return 0.0
+    if ts_col not in bars.columns or symbol_col not in bars.columns:
+        return 0.0
+
+    b = bars[[ts_col, symbol_col]].copy()
+    b[ts_col] = pd.to_datetime(b[ts_col], utc=True, errors="coerce")
+    b = b.dropna(subset=[ts_col, symbol_col])
+
+    if b.empty:
+        return 0.0
+
+    # Count distinct symbols per timestamp
+    counts = b.groupby(ts_col)[symbol_col].nunique()
+    if len(counts) == 0:
+        return 0.0
+
+    good = (counts >= int(min_symbols)).sum()
+    total = len(counts)
+    return float(good) / float(total)
 
 
 from typing import Any, Dict, List
@@ -176,202 +211,202 @@ from prediction_engine.testing_validation.walkforward import WalkForwardRunner
 # ---- 5.3: callable backtest entrypoint (fold TEST runner) --------------------
 from typing import Any, Dict
 
-def run_batch(cfg: dict,
-        *,
-        artifacts_dir: str | Path | None = None,
-        ev_artifacts_dir: str | Path | None = None) -> dict:
-    # --- BEGIN: fold/test compatibility shim ---
-    # Allow tests to pass explicit output locations (fold_dir) and EV artefacts dir.
+def run_batch(
+    cfg: dict,
+    *,
+    artifacts_dir: str | Path | None = None,
+    ev_artifacts_dir: str | Path | None = None,
+) -> dict:
+    """
+    Canonical, fold-safe batch backtest runner.
+
+    Guarantees:
+      - single artifacts root
+      - no duplicated resolution logic
+      - run_context.json always written
+      - out_dir always defined
+    """
+
+    # ------------------------------------------------------------------
+    # Imports
+    # ------------------------------------------------------------------
     from pathlib import Path
+    from datetime import datetime, timezone
+    import json
+    import pandas as pd
 
-    # Where to write outputs for this run (decisions.parquet, trades.parquet, etc.)
-    '''artifacts_root = Path(artifacts_dir) if artifacts_dir is not None \
-        else Path(cfg.get("artifacts_dir", "artifacts"))
-    artifacts_root.mkdir(parents=True, exist_ok=True)
+    from feature_engineering.utils.artifacts_root import resolve_artifacts_root
+    from prediction_engine.run_context import RunContext
 
-    # Where EV artefacts live (if not provided, default to <artifacts_root>/ev)
-    ev_dir = Path(ev_artifacts_dir) if ev_artifacts_dir is not None \
-        else artifacts_root / "ev"
-    ev_dir.mkdir(parents=True, exist_ok=True)'''
+    # ------------------------------------------------------------------
+    # Phase 1.1 — Resolve ONE artifacts root
+    # ------------------------------------------------------------------
 
-    # --- Phase 3: single canonical artifacts root (no scripts/ fallback) ---
-    # Allow CLI override via artifacts_dir, but normalize into cfg["artifacts_root"].
     if artifacts_dir is not None:
-        cfg["artifacts_root"] = str(artifacts_dir)
+        # Fold mode: caller provides leaf directory (e.g. fold_01)
+        artifacts_root = Path(artifacts_dir).expanduser().resolve()
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        cfg["artifacts_root"] = str(artifacts_root)
+        #print(f"[RunContext] (fold) artifacts_root={artifacts_root}")
 
-    artifacts_root = resolve_artifacts_root(cfg, create=True)
-    print(f"[RunContext] artifacts_root={artifacts_root}")
+    else:
+        # Top-level mode: create run directory under canonical base
+        base_root = resolve_artifacts_root(cfg, create=True)
+        if not base_root.is_absolute():
+            raise AssertionError(
+                f"[Phase1.1] artifacts_root must be absolute, got: {base_root}"
+            )
 
-    # --- Task3: reject any root drift (e.g., scripts/artifacts vs artifacts) ---
-    expected = Path(cfg["artifacts_root"])
-    got = Path(artifacts_root)
+        run_id = str(cfg.get("run_id") or cfg.get("RUN_ID") or "").strip()
+        if not run_id:
+            raise RuntimeError("[Phase1.1] Missing run_id in cfg")
 
-    # Normalize (string compare is fine; Windows path casing can differ, so use resolve)
-    try:
-        expected_r = expected.resolve()
-        got_r = got.resolve()
-    except Exception:
-        expected_r = expected
-        got_r = got
-
-    if expected_r != got_r:
-        raise RuntimeError(
-            f"[Task3] Artifact root drift detected.\n"
-            f"  expected cfg['artifacts_root']={expected_r}\n"
-            f"  got resolve_artifacts_root(...)={got_r}\n"
-            f"Refusing to proceed (this causes split decisions/trades/reporting)."
+        run_ctx = RunContext.create(
+            run_id=run_id,
+            cfg={"artifacts_root": str(base_root)},
+            universe_hash=str(cfg.get("universe_hash") or ""),
+            window=f"{cfg.get('start')}→{cfg.get('end')}",
         )
 
-    # EV artifacts live under the same root unless explicitly overridden.
+        artifacts_root = run_ctx.run_dir
+        cfg["artifacts_root"] = str(artifacts_root)
+
+        print(f"[RunContext] artifacts_root(base)={base_root}")
+        #print(f"[RunContext] run_dir={artifacts_root}")
+
+        # Hard forbid scripts\artifacts for BOTH base_root and artifacts_root
+        base_norm = str(base_root).lower().replace("/", "\\")
+        run_norm = str(artifacts_root).lower().replace("/", "\\")
+        if "\\scripts\\artifacts" in base_norm:
+            raise AssertionError(f"[Phase1.1] Forbidden base_root: {base_root}")
+        if "\\scripts\\artifacts" in run_norm:
+            raise AssertionError(f"[Phase1.1] Forbidden run_dir: {artifacts_root}")
+
+    # Hard guards
+    artifacts_root = artifacts_root.resolve()
+    if "\\scripts\\artifacts" in str(artifacts_root).lower().replace("/", "\\"):
+        raise AssertionError(
+            f"[Phase1.1] Forbidden artifacts location: {artifacts_root}"
+        )
+
+    # Unified output directory alias (kept for backward compatibility)
+    out_dir = artifacts_root
+
+    # ------------------------------------------------------------------
+    # EV artifacts directory
+    # ------------------------------------------------------------------
     if ev_artifacts_dir is not None:
-        ev_dir = Path(ev_artifacts_dir)
-        if not ev_dir.is_absolute():
-            # treat relative EV dir as relative-to-repo as well by reusing cfg base
-            tmp_cfg = dict(cfg)
-            tmp_cfg["artifacts_root"] = str(ev_dir)
-            ev_dir = resolve_artifacts_root(tmp_cfg, create=True)
-        else:
-            ev_dir.mkdir(parents=True, exist_ok=True)
+        ev_dir = Path(ev_artifacts_dir).expanduser().resolve()
+        ev_dir.mkdir(parents=True, exist_ok=True)
     else:
         ev_dir = artifacts_root / "ev"
         ev_dir.mkdir(parents=True, exist_ok=True)
-    # --- end Phase 3 canonical root ---
 
-    # Make these visible to the rest of the function (if existing code expects names)
-    # Prefer local variables, but keep fallbacks if older code references these symbols.
-    _ARTIFACTS_ROOT = artifacts_root
-    _EV_DIR = ev_dir
-    # --- END: fold/test compatibility shim ---
+    # Back-compat globals (some legacy helpers still expect these)
+    globals()["_ARTIFACTS_ROOT"] = artifacts_root
+    globals()["_EV_DIR"] = ev_dir
 
-    """
-    Fold-TEST backtest runner.
-    Assumes EV artefacts are already built and available under `ev_artifacts_dir`.
-    Writes:
-      decisions.parquet, trades.parquet, signals_out.csv,
-      portfolio_metrics.json, equity.csv  into `artifacts_dir`.
+    # ------------------------------------------------------------------
+    # Phase 1.1 observables (required by Task3)
+    # ------------------------------------------------------------------
+    (artifacts_root / "_ARTIFACTS_ROOT.txt").write_text(
+        str(artifacts_root), encoding="utf-8"
+    )
 
-    Required cfg keys (min):
-      - parquet_root: str|Path
-      - universe: list[str] or StaticUniverse
-      - start: 'YYYY-MM-DD'
-      - end:   'YYYY-MM-DD'
-      - equity, commission, debug_no_costs (optional but recommended)
-      - vectorized_scoring: True to keep runtime bounded
-    """
-    #out_dir = Path(artifacts_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    run_context = {
+        "run_id": cfg.get("run_id"),
+        "artifacts_root": str(artifacts_root),
+        "start": str(cfg.get("start")),
+        "end": str(cfg.get("end")),
+        "universe": cfg.get("universe"),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    (artifacts_root / "run_context.json").write_text(
+        json.dumps(run_context, indent=2),
+        encoding="utf-8",
+    )
 
-    out_dir = artifacts_root
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Resolve symbols & dates
+    # ------------------------------------------------------------------
+    # Universe + bars loading
+    # ------------------------------------------------------------------
     u = cfg.get("universe")
     if hasattr(u, "symbols"):
         symbols = list(u.symbols)
     elif isinstance(u, (list, tuple)):
         symbols = [str(s).upper() for s in u]
     else:
-        raise TypeError("cfg['universe'] must be a StaticUniverse or list[str]")
+        raise TypeError("cfg['universe'] must be StaticUniverse or list[str]")
 
     start, end = cfg["start"], cfg["end"]
     pq_root = _resolve_path(cfg.get("parquet_root", "parquet"))
-    # Load bars for TEST window
 
     print("[PARQUET] root:", pq_root)
-    #print("[PARQUET] filter:", start, end, symbol)
-    import os
-    from pathlib import Path
-
-    root = Path(pq_root)
-    print("[PARQUET] total files:", sum(1 for _ in root.rglob("*.parquet")))
-    print("[PARQUET] sample files:", [str(p) for p in list(root.rglob("*.parquet"))[:10]])
 
     bars = []
     for s in symbols:
-        df_s = _load_bars_for_symbol({"parquet_root": str(pq_root), "start": start, "end": end}, s)
+        df_s = _load_bars_for_symbol(
+            {"parquet_root": str(pq_root), "start": start, "end": end}, s
+        )
         if not df_s.empty:
             bars.append(df_s)
-    bars = pd.concat(bars, ignore_index=True) if bars else pd.DataFrame(
-        columns=["timestamp","open","high","low","close","volume","symbol"]
+
+    bars = (
+        pd.concat(bars, ignore_index=True)
+        if bars
+        else pd.DataFrame(
+            columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"]
+        )
     )
 
-    # --- Task 2: persist grid audit artifact ---
+    # Grid audit artifact (Task2)
     if hasattr(bars, "attrs") and "grid_audit" in bars.attrs:
-        grid_audit = grid_audit_to_json(bars.attrs["grid_audit"])
-        out_path = Path(artifacts_root) / "grid_audit.json"
-        out_path.write_text(json.dumps(grid_audit, indent=2, default=str))
-        print(f"[Grid] wrote {out_path}")
+        from feature_engineering.utils.timegrid import grid_audit_to_json
 
+        audit = grid_audit_to_json(bars.attrs["grid_audit"])
+        (artifacts_root / "grid_audit.json").write_text(
+            json.dumps(audit, indent=2, default=str)
+        )
 
-
+    # ------------------------------------------------------------------
+    # Empty-bar fast exit
+    # ------------------------------------------------------------------
     if bars.empty:
-        # Write empty outputs so the fold still has artifacts
-        (out_dir / "decisions.parquet").write_bytes(b"")
-        (out_dir / "trades.parquet").write_bytes(b"")
-        pd.DataFrame(columns=["timestamp", "symbol", "p_raw", "p_cal", "mu", "sigma", "target_qty"]).to_parquet(
-            out_dir / "decisions.parquet", index=False)
         pd.DataFrame(
-            columns=["symbol", "entry_ts", "entry_price", "exit_ts", "exit_price", "qty", "realized_pnl"]).to_parquet(
-            out_dir / "trades.parquet", index=False)
+            columns=["timestamp", "symbol", "p_raw", "p_cal", "mu", "sigma", "target_qty"]
+        ).to_parquet(out_dir / "decisions.parquet", index=False)
+
+        pd.DataFrame(
+            columns=[
+                "symbol",
+                "entry_ts",
+                "entry_price",
+                "exit_ts",
+                "exit_price",
+                "qty",
+                "realized_pnl",
+            ]
+        ).to_parquet(out_dir / "trades.parquet", index=False)
 
         (out_dir / "signals_out.csv").write_text("")
-        (out_dir / "portfolio_metrics.json").write_text(json.dumps({"n_trades": 0}, indent=2))
         (out_dir / "equity.csv").write_text("timestamp,equity\n")
+        (out_dir / "portfolio_metrics.json").write_text(
+            json.dumps({"n_trades": 0}, indent=2)
+        )
+
         return {"n_trades": 0, "symbols": symbols}
 
-    # Feature side: we assume the FE basis used during TRAIN is compatible with EV artefacts.
-    # If you saved fold FE metadata (e.g., PCA columns) under fold_dir/prepro, you can pick it up here if passed via cfg.
-    pc_cols = None
-    prepro_dir = cfg.get("prepro_dir")
-    if prepro_dir:
-        fp = Path(prepro_dir) / "feature_cols.json"
-        if fp.exists():
-            pc_cols = json.loads(fp.read_text())
-
-    # Load EV artefacts
-    #ev = EVEngine.from_artifacts(ev_artifacts_dir, cost_model=None if cfg.get("debug_no_costs") else BasicCostModel())
-
-    ev = EVEngine.from_artifacts(_EV_DIR, cost_model=None if cfg.get("debug_no_costs") else BasicCostModel())
-
-    # Vectorized minute scoring across symbols (fast)
-    # Expect the caller’s FE pipeline to have produced PCA projections for TEST rows.
-    # If your pipeline wrote per-minute features somewhere, read them here; otherwise use a light inline transform.
-    # Minimal inline: build PCA-like matrix from bars "on the minute" (fallback – ok for smoke).
-    # For production, prefer calling your real FE transform and taking only rows in [start,end].
-    # Here we compute decisions directly from the EV engine over whatever feature matrix vectorize_minute_batch expects.
-    # If you already have features for TEST, pass them through via cfg['test_features_df'] to avoid recomputation.
-    '''feats_df = cfg.get("test_features_df")
-    if feats_df is None:
-        # Fallback: let the pipeline compute quickly in-memory for TEST window
-        pipe = CoreFeaturePipeline(parquet_root=Path(prepro_dir) if prepro_dir else Path(""))
-        feats_df = pipe.run_mem(bars)[0]  # returns (feats, meta)
-    if pc_cols:
-        feats_df = feats_df[[c for c in feats_df.columns if c in pc_cols or c == "timestamp"] + ["symbol"]]'''
-
-    # --- FE: ALWAYS use fold-fitted pipeline (do not refit here) ---
+    # ------------------------------------------------------------------
+    # Feature engineering (fold-fitted pipeline only)
+    # ------------------------------------------------------------------
     feats_df = cfg.get("test_features_df")
     if feats_df is None:
-        pipe = CoreFeaturePipeline(parquet_root=Path(prepro_dir) if prepro_dir else Path(""))
-        # Use the *fitted* fold pipeline: transform only, no re-fit
+        from feature_engineering.pipelines.core import CoreFeaturePipeline
+        from feature_engineering.utils.timegrid import standardize_bars_to_grid
 
-        # --- CANONICALIZE BARS BEFORE FE ---
-        from feature_engineering.utils.time import ensure_utc_timestamp_col  # if you have it
-        from feature_engineering.utils.timegrid import standardize_bars_to_grid  # wherever it lives
-
-        # Ensure tz-aware UTC timestamp column
         bars = bars.copy()
         bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
 
-        # Force symbol column exists (if it's coming from partition/index)
-        if "symbol" not in bars.columns:
-            raise RuntimeError("[run_bt] bars missing symbol column before standardization")
-
-        import inspect
-        print("[DBG] standardize_bars_to_grid =", standardize_bars_to_grid)
-        print("[DBG] signature:", inspect.signature(standardize_bars_to_grid))
-
-        print("[DBG] BEFORE standardize symbol counts:\n", bars["symbol"].value_counts().head(10))
-
-        bars, grid_audit = standardize_bars_to_grid(
+        bars, _ = standardize_bars_to_grid(
             bars,
             symbol_col="symbol",
             ts_col="timestamp",
@@ -381,236 +416,120 @@ def run_batch(cfg: dict,
             keep_ohlc_nan=True,
         )
 
-        print("[DBG] AFTER  standardize symbol counts:\n", bars["symbol"].value_counts().head(10))
+        # ------------------------------------------------------------------
+        # Phase 1.1 HARD GATE: multi-symbol timestamp overlap
+        # Only enforce when this run is a multi-symbol portfolio run.
+        # Walkforward fold runs are often single-symbol and must not trip this.
+        # ------------------------------------------------------------------
+        enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", False))
 
-        print("[DBG] after standardize:", bars["symbol"].nunique(), "symbols",
-              "rows=", len(bars),
-              "ts_tz=", getattr(bars["timestamp"].dtype, "tz", None))
+        n_syms = int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0
+        overlap = _timestamp_overlap_share(bars, min_symbols=2)
 
-        # Optional: hard assert right here (so you see it before FE)
-        _dbg(bars, "run_bt: bars after standardize_bars_to_grid")
-        # --- END CANONICALIZE ---
+        # Always write audit (useful debugging), but only hard-fail when enforced.
+        (artifacts_root / "overlap_audit.json").write_text(
+            json.dumps(
+                {
+                    "enforced": enforce_overlap_gate,
+                    "min_symbols": 2,
+                    "overlap_share": overlap,
+                    "min_required": float(cfg.get("min_overlap_share_ge2", 0.10)),
+                    "n_rows": int(len(bars)),
+                    "n_symbols": n_syms,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
+        print(
+            f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} "
+            f"(min_required={float(cfg.get('min_overlap_share_ge2', 0.10)):.2f}) "
+            f"n_symbols={n_syms} enforced={enforce_overlap_gate}"
+        )
+
+        if enforce_overlap_gate:
+            if n_syms < 2:
+                raise RuntimeError(
+                    f"[Phase1.1][HARD FAIL] Overlap gate enforced but run has n_symbols={n_syms}. "
+                    f"This gate is only valid for multi-symbol portfolio runs."
+                )
+
+            min_overlap = float(cfg.get("min_overlap_share_ge2", 0.10))
+            if overlap < min_overlap:
+                raise RuntimeError(
+                    f"[Phase1.1][HARD FAIL] Overlap gate failed: share(timestamps with >=2 symbols)={overlap:.4f} "
+                    f"< {min_overlap:.2f}. Fix ingestion/grid alignment before producing portfolio artifacts."
+                )
+
+        pipe = CoreFeaturePipeline(
+            parquet_root=Path(cfg.get("prepro_dir", ""))
+        )
         feats_df = pipe.transform_mem(bars)
 
-    # If the fold saved the exact PCA columns, enforce them here
-    if pc_cols:
-        # Keep timestamp + symbol + the exact PCA columns in fold order
-        keep = ["timestamp", "symbol"] + [c for c in pc_cols if c in feats_df.columns]
-        feats_df = feats_df[[c for c in keep if c in feats_df.columns]]
+    # ------------------------------------------------------------------
+    # EV scoring
+    # ------------------------------------------------------------------
+    from prediction_engine.ev_engine import EVEngine
+    from prediction_engine.tx_cost import BasicCostModel
 
-    print("[FE] feats rows=", len(feats_df), "cols=", len(feats_df.columns))
-    print("[FE] has timestamp/symbol:", ("timestamp" in feats_df.columns), ("symbol" in feats_df.columns))
+    ev = EVEngine.from_artifacts(
+        ev_dir,
+        cost_model=None if cfg.get("debug_no_costs") else BasicCostModel(),
+    )
+
     pca_cols = [c for c in feats_df.columns if c.startswith("pca_")]
-    print("[FE] pca_cols=", len(pca_cols), "sample=", pca_cols[:5])
-    print("[FE] feats ts dtype=", feats_df["timestamp"].dtype if "timestamp" in feats_df.columns else None)
+    if not pca_cols:
+        raise RuntimeError("No PCA columns available for EV scoring")
 
-    # Phase-1: hard fail if tz-naive leaks out of FE
-    if "timestamp" in feats_df.columns:
-        if str(feats_df["timestamp"].dtype) != "datetime64[ns, UTC]":
-            raise RuntimeError(f"[PHASE1] FE timestamp is not tz-aware UTC: {feats_df['timestamp'].dtype}")
-
-    if not bars.empty and "timestamp" in feats_df.columns:
-        bt = pd.to_datetime(bars["timestamp"], utc=True).dt.floor("min")
-        ft = pd.to_datetime(feats_df["timestamp"], utc=True).dt.floor("min")
-        overlap = len(set(bt.unique()) & set(ft.unique()))
-        print(f"[FE] minute overlap bars∩feats = {overlap} | bars={bt.nunique()} feats={ft.nunique()}")
-
-    # Score p (calibrated if your EVEngine encapsulates calibration; else add map_mu_to_prob here)
-    #decisions = vectorize_minute_batch(ev, feats_df, symbols=symbols)
-
-    # Build feature column list for the batch scorer (expects PCA columns)
-    #_pca = [c for c in feats_df.columns if c.startswith("pca_")]
-    #res = vectorize_minute_batch(ev, feats_df, _pca if _pca else None)
-
-    # Build feature column list for the batch scorer (expects PCA columns)
-    pca_list = pc_cols if pc_cols else [c for c in feats_df.columns if c.startswith("pca_")]
-    if not pca_list:
-        raise ValueError(
-            "No PCA columns found for scoring. Ensure fold prepro wrote feature_cols.json or your FE emits pca_*.")
-
-    # Optional sanity: if EV exposes an expected length, check it
-    _expected = getattr(ev, "expected_len", None)
-    if _expected is not None and len(pca_list) != int(_expected):
-        raise ValueError(f"PCA column count {len(pca_list)} != EV expected {_expected}. "
-                         f"Check fold prepro_dir={prepro_dir} feature_cols.json.")
-
-    res = vectorize_minute_batch(ev, feats_df, pca_list)
-
-    # Older/newer API compatibility: sometimes returns an object with .frame
+    res = vectorize_minute_batch(ev, feats_df, pca_cols)
     decisions = getattr(res, "frame", res)
 
-    print("[EV] decisions rows=", len(decisions), "cols=", list(decisions.columns)[:12])
-    for c in ("p_raw", "p_cal", "mu", "sigma"):
-        if c in decisions.columns:
-            s = pd.to_numeric(decisions[c], errors="coerce")
-            print(f"[EV] {c} nan={int(s.isna().sum())} mean={float(s.mean())} std={float(s.std(ddof=1) or 0)} "
-                  f"p01={float(s.quantile(0.01))} p99={float(s.quantile(0.99))}")
+    # ------------------------------------------------------------------
+    # Sizing + simulation
+    # ------------------------------------------------------------------
+    decisions = _apply_sizer_to_decisions(
+        decisions, bars, cfg, target_qty_col="target_qty"
+    )
 
-    if "p_cal" in decisions.columns:
-        s = decisions["p_cal"].dropna()
-        if len(s) and float(s.std(ddof=1) or 0) < 1e-6:
-            print("[EV][WARN] p_cal nearly constant — scoring likely broken or features identical.")
+    #trades = _simulate_trades_from_decisions(decisions, bars)
+    # --- Execution rules (required) ---
+    rules = cfg.get("execution_rules")
 
-    # Ensure we carry symbol + timestamp through (needed later for sizing/sim)
-    '''if "symbol" not in decisions.columns and "symbol" in feats_df.columns:
-        # merge on timestamp; feats_df already aligned to minute grid
-        decisions = decisions.merge(
-            feats_df[["timestamp", "symbol"]],
-            on="timestamp",
-            how="left",
-            validate="m:1",
-        )
-        # After the merge that adds 'symbol' to decisions:
-        dup_mask = decisions.duplicated(["timestamp", "symbol"], keep=False)
-        if dup_mask.any():
-            # In dev, make it loud; in prod you could drop_duplicates instead
-            raise ValueError(f"Duplicate (timestamp,symbol) rows in decisions: {int(dup_mask.sum())}")
-    '''
-
-    if "symbol" not in decisions.columns:
-        raise ValueError(
-            "Decisions are missing 'symbol'. Fix vectorize_minute_batch to carry symbol through, "
-            "or ensure feats_df passed into scoring includes symbol and the scorer copies it."
+    if rules is None:
+        raise RuntimeError(
+            "[run_batch] Missing cfg['execution_rules'] required by "
+            "_simulate_trades_from_decisions"
         )
 
-    # Ensure required columns exist
-    if "horizon_bars" not in decisions.columns:
-        decisions["horizon_bars"] = int(cfg.get("horizon_bars", 20))
+    trades = _simulate_trades_from_decisions(
+        decisions,
+        bars,
+        rules=rules,
+    )
 
-    # Apply position sizing (dose–response ramp + cost hurdle)
-    decisions = _apply_sizer_to_decisions(decisions, bars, cfg, target_qty_col="target_qty")
-
-    if "p_cal" in decisions.columns and "target_qty" in decisions.columns:
-        d = decisions.copy()
-        d["abs_qty"] = d["target_qty"].abs()
-        print("[Sizer] pct sized>0:", float((d["abs_qty"] > 0).mean()))
-        hi = d.loc[d["p_cal"] >= float(cfg.get("p_gate_quantile", 0.55))]
-        if len(hi):
-            print("[Sizer] above gate count=", len(hi),
-                  "but zero-sized=", int((hi["abs_qty"] == 0).sum()))
-        # inspect a few examples
-        ex = d.loc[(d["p_cal"] >= float(cfg.get("p_gate_quantile", 0.55))) & (d["abs_qty"] == 0)].head(5)
-        if len(ex):
-            print("[Sizer][EX] gate-but-zero samples:\n", ex[["timestamp", "symbol", "p_cal", "target_qty"]])
-
-    # Simulate trades (entry at next open; exit after H bars)
-    rules = {
-        "max_fill_frac_of_bar": 1.0,
-        "allow_partial": True,
-    }
-    trades = _simulate_trades_from_decisions(decisions, bars, rules=rules)
-
-    print("[Sim] trades rows=", len(trades), "symbols=",
-          sorted(trades["symbol"].unique().tolist()) if len(trades) else [])
-    if len(trades):
-        print("[Sim] qty stats: mean=", float(trades["qty"].abs().mean()), "p50=", float(trades["qty"].abs().median()),
-              "p95=", float(trades["qty"].abs().quantile(0.95)))
-        print("[Sim] bars_held unique:", sorted(trades["bars_held"].unique().tolist())[:10])
-        # time sanity: entry after decision (if you carry decision_ts), and exit after entry
-        bad = (pd.to_datetime(trades["exit_ts"], utc=True) <= pd.to_datetime(trades["entry_ts"], utc=True)).mean()
-        print(f"[Sim] bad exit<=entry rate: {bad:.3%}")
-
-    # Attach modeled costs unless debug_no_costs=True
     trades = _apply_modeled_costs_to_trades(trades, cfg)
 
-    if len(trades):
-        if "modeled_cost_total" in trades.columns:
-            costs = trades["modeled_cost_total"].fillna(0.0)
-            pnl = trades.get("realized_pnl", pd.Series(0.0, index=trades.index)).fillna(0.0)
-            pnl_net = trades.get("realized_pnl_after_costs", pd.Series(0.0, index=trades.index)).fillna(0.0)
-            print("[Cost] mean cost/trade=", float(costs.mean()), "p95=", float(costs.quantile(0.95)))
-            print("[Cost] gross_pnl sum=", float(pnl.sum()), "net_pnl sum=", float(pnl_net.sum()))
-            if float(abs(pnl.sum()) or 1e-9) > 0:
-                print("[Cost] total_cost / |gross_pnl| =", float(costs.sum() / (abs(pnl.sum()) or 1e-9)))
-
+    # ------------------------------------------------------------------
     # Persist outputs
+    # ------------------------------------------------------------------
     decisions.to_parquet(out_dir / "decisions.parquet", index=False)
     trades.to_parquet(out_dir / "trades.parquet", index=False)
     decisions.to_csv(out_dir / "signals_out.csv", index=False)
 
-    # Simple portfolio metrics + equity
-    '''eq = (trades[["exit_ts", "realized_pnl_after_costs"]]
-          .rename(columns={"exit_ts": "timestamp", "realized_pnl_after_costs": "equity"})
-          .copy())
-    eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True)
-    eq["equity"] = eq["equity"].cumsum()
-    eq.sort_values("timestamp").to_csv(out_dir / "equity.csv", index=False)
-
-    metrics = {
-        "symbols": symbols,
-        "start": str(start),
-        "end": str(end),
-        "n_decisions": int(len(decisions)),
-        "n_trades": int(len(trades)),
-        "gross_pnl": float(trades.get("realized_pnl", pd.Series(dtype=float)).sum()),
-        "net_pnl": float(trades.get("realized_pnl_after_costs", pd.Series(dtype=float)).sum()),
-    }
-    (out_dir / "portfolio_metrics.json").write_text(json.dumps(metrics, indent=2))'''
-
-    # -------------------------------
-    # Simple portfolio metrics + equity (robust)
-    # -------------------------------
-    if trades is None:
-        trades = pd.DataFrame()
-
-    # If no trades, still write artifacts and return cleanly
+    # Equity
     if trades.empty:
-        eq = pd.DataFrame({
-            "timestamp": pd.Series([], dtype="datetime64[ns, UTC]"),
-            "equity": pd.Series([], dtype=float),
-        })
-        eq.to_csv(out_dir / "equity.csv", index=False)
-
-        metrics = {
-            "symbols": symbols,
-            "start": str(start),
-            "end": str(end),
-            "n_decisions": int(len(decisions)),
-            "n_trades": 0,
-            "gross_pnl": 0.0,
-            "net_pnl": 0.0,
-        }
-        (out_dir / "portfolio_metrics.json").write_text(json.dumps(metrics, indent=2))
-        return metrics
-
-    # Determine usable timestamp column for exits
-    ts_col = "exit_ts"
-    if ts_col not in trades.columns:
-        for alt in ("exit_time", "exit_timestamp", "exit_dt", "timestamp"):
-            if alt in trades.columns:
-                ts_col = alt
-                break
-
-    # Ensure pnl-after-costs exists
-    if "realized_pnl_after_costs" not in trades.columns:
-        if "realized_pnl" in trades.columns:
-            trades["realized_pnl_after_costs"] = pd.to_numeric(trades["realized_pnl"], errors="coerce").fillna(0.0)
-        else:
-            trades["realized_pnl_after_costs"] = 0.0
-
-    # Build equity safely
-    if ts_col not in trades.columns:
-        eq = pd.DataFrame({
-            "timestamp": pd.Series([], dtype="datetime64[ns, UTC]"),
-            "equity": pd.Series([], dtype=float),
-        })
+        equity = pd.DataFrame(
+            {"timestamp": [], "equity": []}, dtype="datetime64[ns, UTC]"
+        )
     else:
-        eq = trades[[ts_col, "realized_pnl_after_costs"]].rename(
-            columns={ts_col: "timestamp", "realized_pnl_after_costs": "equity"}
-        ).copy()
-        eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True, errors="coerce")
-        eq["equity"] = pd.to_numeric(eq["equity"], errors="coerce").fillna(0.0).cumsum()
-        eq = eq.dropna(subset=["timestamp"]).sort_values("timestamp")
+        equity = trades[["exit_ts", "realized_pnl_after_costs"]].rename(
+            columns={"exit_ts": "timestamp", "realized_pnl_after_costs": "equity"}
+        )
+        equity["timestamp"] = pd.to_datetime(equity["timestamp"], utc=True)
+        equity["equity"] = equity["equity"].cumsum()
 
-    eq.to_csv(out_dir / "equity.csv", index=False)
-
-    # Metrics (robust sums)
-    gross = 0.0
-    if "realized_pnl" in trades.columns:
-        gross = float(pd.to_numeric(trades["realized_pnl"], errors="coerce").fillna(0.0).sum())
-
-    net = float(pd.to_numeric(trades["realized_pnl_after_costs"], errors="coerce").fillna(0.0).sum())
+    equity.to_csv(out_dir / "equity.csv", index=False)
 
     metrics = {
         "symbols": symbols,
@@ -618,46 +537,20 @@ def run_batch(cfg: dict,
         "end": str(end),
         "n_decisions": int(len(decisions)),
         "n_trades": int(len(trades)),
-        "gross_pnl": gross,
-        "net_pnl": net,
-    }
-    (out_dir / "portfolio_metrics.json").write_text(json.dumps(metrics, indent=2))
-
-    # --- BEGIN: ensure required outputs exist for smoke/tests ---
-    # Your code above may have already written real outputs; if not, touch/create minimal ones.
-    import json as _json
-
-    req_files = {
-        "decisions.parquet": None,   # touch empty file OK (test only reads if size > 0)
-        "trades.parquet": None,      # same logic
-        "signals_out.csv": "",       # write empty CSV (headerless is fine for this smoke test)
-        "equity.csv": "timestamp,equity\n",  # tiny header helps some tools
-        "portfolio_metrics.json": _json.dumps(
-            {"n_trades": int(locals().get("n_trades", 0))}, indent=2
+        "gross_pnl": float(
+            trades.get("realized_pnl", pd.Series(dtype=float)).sum()
+        ),
+        "net_pnl": float(
+            trades.get("realized_pnl_after_costs", pd.Series(dtype=float)).sum()
         ),
     }
 
-    for name, payload in req_files.items():
-        p = _ARTIFACTS_ROOT / name
-        if not p.exists():
-            p.parent.mkdir(parents=True, exist_ok=True)
-            if payload is None:
-                # create zero-byte parquet placeholder; test won’t read if size == 0
-                p.touch()
-            else:
-                p.write_text(payload, encoding="utf-8")
-
-    # Make sure we return at least n_trades for the test assertion.
-    metrics = locals().get("metrics", {}) or {}
-    if "n_trades" not in metrics:
-        # If your real code computed a different value, prefer that; this is only a fallback.
-        metrics = {**metrics, "n_trades": int(locals().get("n_trades", 0))}
-    # --- END: ensure required outputs exist for smoke/tests ---
-
-
-
+    (out_dir / "portfolio_metrics.json").write_text(
+        json.dumps(metrics, indent=2)
+    )
 
     return metrics
+
 
 
 
@@ -1446,9 +1339,12 @@ CONFIG.update({
 
 
 
-import datetime as dt
-CONFIG["artifacts_root"] = f"artifacts/a2_{dt.datetime.utcnow():%Y%m%d_%H%M%S}"
+#import datetime as dt
+#CONFIG["artifacts_root"] = f"artifacts/a2_{dt.datetime.utcnow():%Y%m%d_%H%M%S}"
 
+# Phase 1.1: Do NOT set artifacts_root here.
+# RunContext will choose a single canonical root once per run.
+CONFIG.pop("artifacts_root", None)
 
 # ────────────────────────────────────────────────────────────────────────
 
@@ -1517,6 +1413,63 @@ def _find_symbol_outputs(artifacts_root: Path, sym: str) -> dict:
     print(f"[AggFind] {sym} trades candidates:", cand_trd[:3])
 
     return out
+
+
+
+def _overlap_metrics(bars: pd.DataFrame, *, ts_col="timestamp", symbol_col="symbol") -> dict:
+    """
+    Returns:
+      - global_share_ge2: share of timestamps that have >=2 symbols present
+      - conditional_share_sparse_in_dense: of sparse-symbol timestamps, what fraction are also present in the densest symbol
+      - per_symbol_minutes: dict(symbol -> count unique timestamps)
+    """
+    if bars is None or bars.empty:
+        return {
+            "global_share_ge2": 0.0,
+            "conditional_share_sparse_in_dense": 0.0,
+            "per_symbol_minutes": {},
+        }
+
+    df = bars[[ts_col, symbol_col]].copy()
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    df = df.dropna(subset=[ts_col, symbol_col])
+    if df.empty:
+        return {
+            "global_share_ge2": 0.0,
+            "conditional_share_sparse_in_dense": 0.0,
+            "per_symbol_minutes": {},
+        }
+
+    # unique minutes per symbol
+    per_symbol = (
+        df.drop_duplicates([symbol_col, ts_col])
+          .groupby(symbol_col)[ts_col]
+          .size()
+          .to_dict()
+    )
+
+    # global share with >=2 symbols present
+    counts = df.drop_duplicates([symbol_col, ts_col]).groupby(ts_col)[symbol_col].nunique()
+    global_share_ge2 = float((counts >= 2).mean()) if len(counts) else 0.0
+
+    # conditional overlap: sparse symbol timestamps in densest symbol timestamps
+    if len(per_symbol) < 2:
+        conditional = 0.0
+    else:
+        sparse_sym = min(per_symbol, key=per_symbol.get)
+        dense_sym = max(per_symbol, key=per_symbol.get)
+
+        sparse_ts = set(df.loc[df[symbol_col] == sparse_sym, ts_col].unique())
+        dense_ts  = set(df.loc[df[symbol_col] == dense_sym, ts_col].unique())
+
+        conditional = float(len(sparse_ts & dense_ts) / len(sparse_ts)) if sparse_ts else 0.0
+
+    return {
+        "global_share_ge2": global_share_ge2,
+        "conditional_share_sparse_in_dense": conditional,
+        "per_symbol_minutes": {str(k): int(v) for k, v in per_symbol.items()},
+    }
+
 
 
 def _read_any(path: str) -> pd.DataFrame:
@@ -2336,8 +2289,28 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     print("[RAW DF] min/max=", ts.min(), "→", ts.max())
     print("[RAW DF] NaT count=", ts.isna().sum())
 
-    runner = WalkForwardRunner(
+    '''runner = WalkForwardRunner(
         artifacts_root=_resolve_path(cfg.get("artifacts_root", "artifacts/a2")),
+        parquet_root=resolved_parquet_root,
+        ev_artifacts_root=_resolve_path(cfg["artefacts"]),
+        symbol=sym,
+        horizon_bars=int(cfg.get("horizon_bars", 20)),
+        longest_lookback_bars=int(cfg.get("longest_lookback_bars", 60)),
+        p_gate_q=float(cfg.get("p_gate_quantile", 0.65)),
+        full_p_q=float(cfg.get("full_p_quantile", 0.80)),
+        debug_no_costs=bool(cfg.get("debug_no_costs", False)),
+    )'''
+
+    #from feature_engineering.utils.artifacts_root import resolve_artifacts_root
+
+    #base_artifacts_root = resolve_artifacts_root(cfg, create=True) / "a2"
+
+    # Canonical Phase 1.1 run directory: <repo_root>/artifacts/a2_<RUN_ID>
+    base_artifacts_root = resolve_artifacts_root(cfg, run_id=RUN_ID, create=True)
+    cfg["artifacts_root"] = str(base_artifacts_root)
+
+    runner = WalkForwardRunner(
+        artifacts_root=base_artifacts_root,
         parquet_root=resolved_parquet_root,
         ev_artifacts_root=_resolve_path(cfg["artefacts"]),
         symbol=sym,
@@ -2696,7 +2669,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print("[Clock] per-symbol minute coverage:", cover)
 
     # Optional: persist for debugging/inspection alongside portfolio outputs
-    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    '''arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
     (arte_root / "portfolio").mkdir(parents=True, exist_ok=True)
     clock_out = arte_root / "portfolio" / "unified_clock.csv"
     if len(uni_clock):
@@ -2704,6 +2677,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print(f"[Clock] wrote unified clock → {clock_out}")
     else:
         print("[Clock] WARNING: unified clock is empty for the requested window/universe.")
+    '''
 
 
     if not symbols:
@@ -2722,7 +2696,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
 
     # ─── Phase 4: Universe portfolio aggregation ────────────────────────
-    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    #arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    arte_root = Path(cfg["artifacts_root"])
 
     dec_df, trd_df = _aggregate_universe_outputs(arte_root, symbols)
 
@@ -2733,6 +2708,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print("[Agg] trades by symbol:", trd_df["symbol"].value_counts().to_dict())
 
     # Make a portfolio folder
+    #port_dir = arte_root / "portfolio"
+    #port_dir.mkdir(parents=True, exist_ok=True)
+
     port_dir = arte_root / "portfolio"
     port_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3107,6 +3085,13 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         if {'timestamp','symbol'}.issubset(dec.columns):
             multi = (dec.groupby('timestamp')['symbol'].nunique() >= 2).mean()
             print("share of timestamps with >=2 symbols present:", round(float(multi), 3))
+            # Phase 1.1 hard gate: do not proceed to portfolio artifacts if overlap is too low
+            min_share = float(cfg.get("min_share_multisymbol", 0.10))
+            if float(multi) < min_share:
+                raise RuntimeError(
+                    f"[GATE] multi-symbol share < {min_share:.2f} "
+                    f"(got {float(multi):.3f}). Refusing to emit/accept portfolio artifacts."
+                )
 
         # optional: decision→entry causality check (if you persist these)
         if {'decision_ts','entry_ts'}.issubset(dec.columns):
@@ -3187,6 +3172,47 @@ if __name__ == "__main__":
     #artifacts_root = Path(CONFIG["artifacts_root"])
 
     run_id = RUN_ID
+
+    # Phase 1.1: single canonical artifacts root for the whole run
+    base_root = resolve_artifacts_root(CONFIG, create=True)  # => <repo_root>/artifacts
+    run_dir = resolve_artifacts_root({"artifacts_root": str(base_root)}, run_id=RUN_ID, create=True)
+    # run_dir => <repo_root>/artifacts/a2_<RUN_ID>
+
+    # Hard gate: must never include scripts/artifacts
+    if "scripts" in [p.lower() for p in run_dir.parts] and "artifacts" in [p.lower() for p in run_dir.parts]:
+        s = str(run_dir).lower().replace("/", "\\")
+        if "\\scripts\\artifacts\\" in s:
+            raise RuntimeError(f"[Phase 1.1] Illegal artifacts root (scripts/artifacts): {run_dir}")
+
+    # Single source of truth downstream
+    CONFIG["artifacts_root"] = str(run_dir)
+
+    print(f"[RunContext] artifacts_root={run_dir}")  # <-- the ONE line you keep
+
+    # Required observable artifact
+    (run_dir / "_ARTIFACTS_ROOT.txt").write_text(str(run_dir.resolve()), encoding="utf-8")
+
+    import json
+    from datetime import datetime, timezone
+
+    u = CONFIG.get("universe")
+    if hasattr(u, "symbols"):
+        u_ser = list(u.symbols)
+    elif isinstance(u, (list, tuple)):
+        u_ser = list(u)
+    else:
+        u_ser = str(u)
+
+    run_context = {
+        "run_id": run_id,
+        "artifacts_root": str(run_dir.resolve()),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        # optional but useful:
+        "window": {"start": str(CONFIG.get("start")), "end": str(CONFIG.get("end"))},
+        "universe": CONFIG.get("universe"),
+        "git": CONFIG.get("git", None),
+    }
+    (run_dir / "run_context.json").write_text(json.dumps(run_context, indent=2), encoding="utf-8")
 
     # Source of truth: the run directory chosen by RunContext, persisted at run start
     # (never trust CONFIG["artifacts_root"] if it could be a base dir or scripts/artifacts)

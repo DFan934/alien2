@@ -4,8 +4,8 @@
   ],
   "start": "1998-11-17",
   "end": "1998-12-06",
-  "n_decisions": 3896,
-  "n_trades": 32,
-  "gross_pnl": -364.4248939243122,
-  "net_pnl": -454.4440921395169
+  "n_decisions": 24867,
+  "n_trades": 0,
+  "gross_pnl": 0.0,
+  "net_pnl": 0.0
 }

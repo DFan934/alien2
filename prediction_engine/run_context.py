@@ -61,12 +61,22 @@ def _canonicalize_artifacts_root(root: Path) -> Path:
     return root
 
 
-@dataclass(frozen=True)
+'''@dataclass(frozen=True)
 class RunContext:
     run_id: str
     artifacts_root: Path
     universe_hash: Optional[str] = None
     window: Optional[str] = None  # (optional) human-readable window, not a source of truth
+'''
+
+@dataclass(frozen=True)
+class RunContext:
+    run_id: str
+    artifacts_root: Path      # base root (absolute)
+    run_dir: Path             # per-run directory under artifacts_root
+    universe_hash: Optional[str] = None
+    window: Optional[str] = None  # (optional) human-readable window
+
 
     @classmethod
     def create(
@@ -86,7 +96,7 @@ class RunContext:
         - Immediately persist run_context.json so downstream phases can sanity-check.
         """
         # Prefer: caller already set cfg["artifacts_root"] to the run directory
-        raw = cfg.get("artifacts_root")
+        '''raw = cfg.get("artifacts_root")
 
         if raw:
             root = Path(str(raw))
@@ -119,7 +129,68 @@ class RunContext:
         )
 
         print("[RunContext] artifacts_root=" + str(ctx.artifacts_root))
+        return ctx'''
+
+
+        raw = cfg.get("artifacts_root") or cfg.get("artifacts_dir")
+        if raw:
+            base = Path(str(raw))
+            base = _canonicalize_artifacts_root(base)
+        else:
+            repo = _find_repo_root(Path(__file__))
+            base = (repo / "artifacts").resolve()
+
+        # Hard invariant: base root must be absolute
+        base = base.expanduser().resolve()
+        if not base.is_absolute():
+            raise RuntimeError(f"[RunContext] artifacts_root must be absolute, got: {base}")
+
+        base.mkdir(parents=True, exist_ok=True)
+
+        # Compute run_dir: always a unique per-run folder
+        # Policy: run folder name is "a2_<run_id>" unless run_id already starts with "a2_"
+        run_name = str(run_id)
+        if not run_name.startswith("a2_"):
+            run_name = f"a2_{run_name}"
+        run_dir = _canonicalize_artifacts_root(base / run_name)
+
+        # Collision must explode loudly
+        run_dir.mkdir(parents=True, exist_ok=False)
+
+        ctx = cls(
+            run_id=str(run_id),
+            artifacts_root=base,
+            run_dir=run_dir,
+            universe_hash=universe_hash,
+            window=window,
+        )
+
+        # Persist run context (in run_dir, not base)
+        (run_dir / "run_context.json").write_text(
+            json.dumps(
+                {
+                    "run_id": ctx.run_id,
+                    "artifacts_root": str(ctx.artifacts_root),
+                    "run_dir": str(ctx.run_dir),
+                    "universe_hash": ctx.universe_hash,
+                    "window": ctx.window,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        # Required: tiny file containing the absolute root + run_dir
+        (run_dir / "_ARTIFACTS_ROOT.txt").write_text(
+            f"artifacts_root={ctx.artifacts_root}\nrun_dir={ctx.run_dir}\n",
+            encoding="utf-8",
+        )
+
+        print("[RunContext] artifacts_root=" + str(ctx.artifacts_root))
+        print("[RunContext] run_dir=" + str(ctx.run_dir))
         return ctx
+
 
     def resolve(self, rel: str) -> Path:
         """
@@ -128,7 +199,7 @@ class RunContext:
 
         This is the guardrail that makes scripts\\artifacts divergence impossible.
         """
-        rel = str(rel).lstrip("/\\")
+        '''rel = str(rel).lstrip("/\\")
         p = (self.artifacts_root / rel).resolve()
 
         # Invariant: p is a child of artifacts_root
@@ -138,4 +209,16 @@ class RunContext:
         except Exception:
             raise ArtifactRootMismatchError(expected_root=root, got_path=p, rel=rel)
 
+        return p'''
+
+        rel = str(rel).lstrip("/\\")
+        p = (self.run_dir / rel).resolve()
+
+        root = self.run_dir.resolve()
+        try:
+            p.relative_to(root)
+        except Exception:
+            raise ArtifactRootMismatchError(expected_root=root, got_path=p, rel=rel)
+
         return p
+
