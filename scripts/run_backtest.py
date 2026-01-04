@@ -2949,11 +2949,33 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
 
     # --- Phase-4: consolidate per-fold/per-symbol outputs into single files ---
-    artifacts_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    '''artifacts_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
     dec_path, trd_path = _consolidate_phase4_outputs(artifacts_root)
 
     # --- Always mirror consolidated outputs into portfolio/ for 4.8 checks ---
+    port_dir = artifacts_root / "portfolio"'''
+
+    # --- Phase-4: consolidate per-fold/per-symbol outputs into single files ---
+    # Never re-resolve here. Use the run directory chosen at start.
+    artifacts_root = Path(cfg["artifacts_root"]).resolve()
+
+    # Hard gates (repeat here because Phase-4 is where the split used to occur)
+    if not artifacts_root.is_absolute():
+        raise RuntimeError(f"[Phase-4] artifacts_root must be absolute, got: {artifacts_root}")
+
+    s = str(artifacts_root).lower().replace("/", "\\")
+    if "\\scripts\\artifacts\\" in s:
+        raise RuntimeError(f"[Phase-4] Illegal artifacts_root (scripts/artifacts): {artifacts_root}")
+
+    rc = artifacts_root / "run_context.json"
+    if not rc.exists():
+        raise RuntimeError(f"[Phase-4] Refusing to consolidate: missing {rc}")
+
+    dec_path, trd_path = _consolidate_phase4_outputs(artifacts_root)
+
+    # Mirror consolidated outputs into portfolio/ under THIS SAME artifacts_root
     port_dir = artifacts_root / "portfolio"
+
     port_dir.mkdir(parents=True, exist_ok=True)
 
     if dec_path is not None:
