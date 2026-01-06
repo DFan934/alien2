@@ -109,6 +109,46 @@ def _write_run_context_json(artifacts_root: Path, payload: dict) -> None:
 
 
 
+def _hard_fail_if_fake_multisymbol(portfolio_decisions_path, *, min_share: float = 0.10):
+    import pandas as pd
+
+    dec = pd.read_parquet(portfolio_decisions_path)
+    if "timestamp" not in dec.columns:
+        raise RuntimeError(f"[Gate] decisions missing timestamp column: {portfolio_decisions_path}")
+
+    # Ensure timestamp is datetime (UTC-safe parsing if needed)
+    ts = pd.to_datetime(dec["timestamp"], utc=True, errors="coerce")
+    if ts.isna().any():
+        raise RuntimeError("[Gate] decisions contain unparseable timestamps")
+
+    # share of timestamps where >=2 symbols exist
+    '''share = (dec.assign(_ts=ts)
+               .groupby("_ts")["symbol"].nunique()
+               .ge(2)
+               .mean())'''
+
+    d = dec.assign(_ts=ts)
+
+    # If bar_present exists, only count decisions where the underlying bar was real.
+    if "bar_present" in d.columns:
+        d = d[d["bar_present"] == 1]
+
+    share = (
+        d.groupby("_ts")["symbol"].nunique()
+        .ge(2)
+        .mean()
+    )
+
+    print(f"[Gate] multi-symbol overlap on decisions: {share:.3f} (min={min_share:.3f})")
+
+    if share < min_share:
+        raise SystemExit(
+            f"[HARD-FAIL] Fake multi-symbol detected: share_multisymbol={share:.3f} < {min_share:.3f}"
+        )
+
+    return float(share)
+
+
 
 def _arrow_ts_between_filter(dataset: ds.Dataset, col: str, start: str, end: str):
     """
@@ -171,7 +211,7 @@ def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols:
     return pd.DatetimeIndex(uni, tz="UTC")
 
 
-def _timestamp_overlap_share(
+'''def _timestamp_overlap_share(
     bars: pd.DataFrame,
     *,
     ts_col: str = "timestamp",
@@ -202,6 +242,44 @@ def _timestamp_overlap_share(
     good = (counts >= int(min_symbols)).sum()
     total = len(counts)
     return float(good) / float(total)
+'''
+
+
+def _timestamp_overlap_share(
+    bars: pd.DataFrame,
+    *,
+    ts_col: str = "timestamp",
+    symbol_col: str = "symbol",
+    min_symbols: int = 2,
+    presence_col: str = "close",
+    # BACKWARD COMPAT ALIAS:
+    present_col: str | None = None,
+) -> float:
+    # If caller used the old kwarg name, map it to the new one.
+    if present_col is not None:
+        presence_col = present_col
+
+    if bars is None or bars.empty:
+        return 0.0
+    if ts_col not in bars.columns or symbol_col not in bars.columns:
+        return 0.0
+
+    b = bars.copy()
+    b[ts_col] = pd.to_datetime(b[ts_col], utc=True, errors="coerce")
+    b = b.dropna(subset=[ts_col, symbol_col])
+
+    if presence_col in b.columns:
+        b = b[b[presence_col].notna()]
+
+    if b.empty:
+        return 0.0
+
+    counts = b.groupby(ts_col)[symbol_col].nunique()
+    if len(counts) == 0:
+        return 0.0
+
+    good = (counts >= int(min_symbols)).sum()
+    return float(good) / float(len(counts))
 
 
 from typing import Any, Dict, List
@@ -268,11 +346,30 @@ def run_batch(
             window=f"{cfg.get('start')}→{cfg.get('end')}",
         )
 
-        artifacts_root = run_ctx.run_dir
-        cfg["artifacts_root"] = str(artifacts_root)
+        '''artifacts_root = run_ctx.run_dir
+        cfg["artifacts_root"] = str(artifacts_root)'''
+
+
+        run_dir = run_ctx.run_dir
+
+        # IMPORTANT: do NOT overwrite cfg["artifacts_root"] with run_dir.
+        # artifacts_root should mean the canonical BASE root (e.g., <repo>/artifacts).
+        # run_dir is the per-run directory (e.g., <repo>/artifacts/a2_<run_id>).
+        cfg["run_dir"] = str(run_dir)
+
+        # Keep a local name for downstream code that needs the per-run directory
+        artifacts_root = run_dir
+
+
+        #print(f"[RunContext] artifacts_root(base)={base_root}")
+        #print(f"[RunContext] run_dir={artifacts_root}")
 
         print(f"[RunContext] artifacts_root(base)={base_root}")
-        #print(f"[RunContext] run_dir={artifacts_root}")
+        print(f"[RunContext] run_dir={artifacts_root}")
+
+        # Persist BOTH base and run_dir so there's no ambiguity later.
+        (artifacts_root / "_ARTIFACTS_BASE_ROOT.txt").write_text(str(base_root), encoding="utf-8")
+        (artifacts_root / "_ARTIFACTS_RUN_DIR.txt").write_text(str(artifacts_root), encoding="utf-8")
 
         # Hard forbid scripts\artifacts for BOTH base_root and artifacts_root
         base_norm = str(base_root).lower().replace("/", "\\")
@@ -309,7 +406,7 @@ def run_batch(
     # ------------------------------------------------------------------
     # Phase 1.1 observables (required by Task3)
     # ------------------------------------------------------------------
-    (artifacts_root / "_ARTIFACTS_ROOT.txt").write_text(
+    '''(artifacts_root / "_ARTIFACTS_ROOT.txt").write_text(
         str(artifacts_root), encoding="utf-8"
     )
 
@@ -324,6 +421,22 @@ def run_batch(
     (artifacts_root / "run_context.json").write_text(
         json.dumps(run_context, indent=2),
         encoding="utf-8",
+    )'''
+
+    # Write a single unambiguous marker (run_dir) for backward compat.
+    (artifacts_root / "_ARTIFACTS_ROOT.txt").write_text(str(artifacts_root), encoding="utf-8")
+
+    # Canonical root contract: record both base_root and run_dir.
+    _write_run_context_json(
+        artifacts_root,
+        {
+            "run_id": cfg.get("run_id"),
+            "start": str(cfg.get("start")),
+            "end": str(cfg.get("end")),
+            "universe": cfg.get("universe"),
+            "base_root": str(base_root) if "base_root" in locals() else None,
+            "run_dir": str(artifacts_root),
+        },
     )
 
     # ------------------------------------------------------------------
@@ -342,7 +455,7 @@ def run_batch(
 
     print("[PARQUET] root:", pq_root)
 
-    bars = []
+    '''bars = []
     for s in symbols:
         df_s = _load_bars_for_symbol(
             {"parquet_root": str(pq_root), "start": start, "end": end}, s
@@ -356,7 +469,94 @@ def run_batch(
         else pd.DataFrame(
             columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"]
         )
+    )'''
+
+    bars_list = []
+    symbol_audit = {}
+
+    for s in symbols:
+        try:
+            df_s = _load_bars_for_symbol(
+                {"parquet_root": str(pq_root), "start": start, "end": end},
+                s,
+            )
+
+            info = {
+                "loaded": True,
+                "n_rows": int(len(df_s)),
+            }
+
+            if len(df_s) > 0:
+                ts = pd.to_datetime(df_s["timestamp"], utc=True, errors="coerce")
+                info.update(
+                    {
+                        "min_ts": str(ts.min()),
+                        "max_ts": str(ts.max()),
+                        "n_bad_ts": int(ts.isna().sum()),
+                    }
+                )
+                bars_list.append(df_s)
+            else:
+                info["empty_reason"] = "df_empty_after_load"
+
+            symbol_audit[s] = info
+
+        except Exception as e:
+            symbol_audit[s] = {
+                "loaded": False,
+                "error": repr(e),
+            }
+
+    # BEFORE the per-symbol load loop:
+    loaded_symbols: list[str] = []
+    missing_symbols: list[str] = []
+
+    # INSIDE the loop over symbols, AFTER you attempt the load and have df_sym:
+    if df_s is None or len(df_s) == 0:
+        missing_symbols.append(str(s))
+    else:
+        loaded_symbols.append(str(s))
+
+    # AFTER the loop, once `bars` is built (concat of loaded dfs), BEFORE overlap/FE:
+    is_portfolio_run = (cfg.get("is_fold_run") is not True)
+
+    # If the user asked for >=2 symbols, treat missing loads as a hard integrity failure.
+    if is_portfolio_run and len(symbols) >= 2:
+        if len(loaded_symbols) < 2:
+            raise RuntimeError(
+                "[Phase1.1][HARD FAIL] Universe collapsed during ingestion. "
+                f"Requested={symbols} Loaded={loaded_symbols} MissingOrEmpty={missing_symbols}. "
+                "This makes the run non-multi-symbol and invalidates performance metrics."
+            )
+
+    # Also fail if any requested symbol was missing/empty (optional but recommended):
+    if is_portfolio_run and missing_symbols:
+        raise RuntimeError(
+            "[Phase1.1][HARD FAIL] One or more requested symbols did not load any rows. "
+            f"MissingOrEmpty={missing_symbols}. Check parquet partition paths and timestamp filters."
+        )
+
+    # Write audit immediately (even if run later fails)
+    (artifacts_root / "symbol_load_audit.json").write_text(
+        json.dumps(symbol_audit, indent=2),
+        encoding="utf-8",
     )
+
+    bars = (
+        pd.concat(bars_list, ignore_index=True)
+        if bars_list
+        else pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
+    )
+
+    # --- Phase 1.0 HARD ASSERT: universe must survive ingestion unless explicitly allowed ---
+    if len(symbols) >= 2:
+        present = sorted(bars["symbol"].unique().tolist()) if (not bars.empty and "symbol" in bars.columns) else []
+        if len(present) < 2 and not bool(cfg.get("allow_universe_collapse", False)):
+            raise RuntimeError(
+                "[Phase1.0][HARD FAIL] Universe collapsed during ingestion. "
+                f"Requested={symbols} Present={present}. "
+                "See symbol_load_audit.json for why symbols were dropped."
+            )
 
     # Grid audit artifact (Task2)
     if hasattr(bars, "attrs") and "grid_audit" in bars.attrs:
@@ -406,6 +606,59 @@ def run_batch(
         bars = bars.copy()
         bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
 
+        # ------------------------------------------------------------------
+        # Phase 1.1 HARD FAIL: reject broken per-symbol time series BEFORE grid standardization
+        # This prevents "fake overlap" / corrupted series from reaching the overlap gate.
+        # ------------------------------------------------------------------
+        bad = []
+
+        # 1) NaT timestamps (coercion failures)
+        nat_ct = int(bars["timestamp"].isna().sum())
+        if nat_ct > 0:
+            bad.append(f"NaT timestamps after UTC coercion: {nat_ct}")
+
+        # 2) Ensure per-symbol monotonic increasing timestamps (after sorting)
+        bars = bars.sort_values(["symbol", "timestamp"], kind="mergesort")
+
+        # 3) Duplicate timestamps per symbol (can cause bogus reindex/aggregation behavior)
+        dup_mask = bars.duplicated(subset=["symbol", "timestamp"], keep=False)
+        dup_ct = int(dup_mask.sum())
+        if dup_ct > 0:
+            # include a tiny sample so the error is actionable
+            sample = (
+                bars.loc[dup_mask, ["symbol", "timestamp"]]
+                .head(10)
+                .astype({"timestamp": "string"})
+                .to_dict("records")
+            )
+            bad.append(f"Duplicate (symbol,timestamp) rows: {dup_ct} (sample={sample})")
+
+        # 4) Non-increasing timestamp steps within symbol (after sort)
+        #    (diff <= 0 means duplicates or backwards time)
+        dt = bars.groupby("symbol", sort=False)["timestamp"].diff()
+        noninc_ct = int((dt <= pd.Timedelta(0)).sum(skipna=True))
+        if noninc_ct > 0:
+            bad.append(f"Non-increasing timestamp steps within symbol: {noninc_ct}")
+
+        if bad:
+            (artifacts_root / "time_series_health.json").write_text(
+                json.dumps(
+                    {
+                        "status": "HARD_FAIL",
+                        "issues": bad,
+                        "n_rows": int(len(bars)),
+                        "n_symbols": int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0,
+                    },
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            raise RuntimeError(
+                "[Phase1.1][HARD FAIL] Invalid per-symbol time series detected before grid standardization: "
+                + " | ".join(bad)
+            )
+
         bars, _ = standardize_bars_to_grid(
             bars,
             symbol_col="symbol",
@@ -416,56 +669,159 @@ def run_batch(
             keep_ohlc_nan=True,
         )
 
+        # Mark whether a (timestamp,symbol) row corresponds to a REAL bar.
+        # This prevents "grid placeholder rows" from being counted as overlap.
+        if "close" in bars.columns:
+            bars["bar_present"] = bars["close"].notna().astype("int8")
+        else:
+            bars["bar_present"] = 1  # fallback (shouldn't happen)
+
         # ------------------------------------------------------------------
         # Phase 1.1 HARD GATE: multi-symbol timestamp overlap
         # Only enforce when this run is a multi-symbol portfolio run.
         # Walkforward fold runs are often single-symbol and must not trip this.
         # ------------------------------------------------------------------
-        enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", False))
+        #enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", False))
 
-        n_syms = int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0
-        overlap = _timestamp_overlap_share(bars, min_symbols=2)
+        # ------------------------------------------------------------------
+        # Phase 1.1 HARD GATE: multi-symbol timestamp overlap
+        #
+        # Intent:
+        #   - Only enforce for TOP-LEVEL multi-symbol portfolio runs.
+        #   - NEVER enforce for walkforward fold runs that are single-symbol.
+        #   - NEVER enforce when the requested universe is < 2.
+        # ------------------------------------------------------------------
 
-        # Always write audit (useful debugging), but only hard-fail when enforced.
-        (artifacts_root / "overlap_audit.json").write_text(
-            json.dumps(
-                {
-                    "enforced": enforce_overlap_gate,
-                    "min_symbols": 2,
-                    "overlap_share": overlap,
-                    "min_required": float(cfg.get("min_overlap_share_ge2", 0.10)),
-                    "n_rows": int(len(bars)),
-                    "n_symbols": n_syms,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        # Mark whether a (timestamp,symbol) row corresponds to a REAL bar.
+        # This prevents "grid placeholder rows" from being counted as overlap.
+        if "close" in bars.columns:
+            bars["bar_present"] = bars["close"].notna().astype("int8")
+        else:
+            bars["bar_present"] = 1  # fallback (shouldn't happen)
+
+        # How many symbols were requested?
+        requested_syms = []
+        if "symbols" in locals() and isinstance(symbols, (list, tuple)):
+            requested_syms = list(symbols)
+        elif isinstance(cfg.get("universe"), (list, tuple)):
+            requested_syms = list(cfg["universe"])
+
+        requested_n = len(requested_syms)
+
+        # Determine if this is a fold run
+        is_fold_run = (cfg.get("is_fold_run") is True)
+
+        # Only enforce overlap on top-level multi-symbol runs (>=2 requested)
+        default_enforce = (not is_fold_run) and (requested_n >= 2)
+
+        enforce_overlap_gate = bool(
+            cfg.get("phase11_enforce_multisymbol_overlap_gate", default_enforce)
         )
+
+        # Compute overlap using REAL bars only
+        n_syms_actual = int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0
+        overlap = _timestamp_overlap_share(
+            bars,
+            min_symbols=2,
+            ts_col="timestamp",
+            symbol_col="symbol",
+            presence_col="bar_present",
+        )
+
+        # Always write an audit artifact (even if not enforced)
+        try:
+            overlap_audit = {
+                "requested_symbols": requested_syms,
+                "requested_n": requested_n,
+                "actual_n_symbols": n_syms_actual,
+                "overlap_share_ge2": overlap,
+                "min_required": float(cfg.get("min_overlap_share_ge2", 0.10)),
+                "is_fold_run": is_fold_run,
+                "enforced": enforce_overlap_gate,
+            }
+            (artifacts_root / "overlap_audit.json").write_text(
+                json.dumps(overlap_audit, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[WARN] failed to write overlap_audit.json: {e}")
 
         print(
             f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} "
             f"(min_required={float(cfg.get('min_overlap_share_ge2', 0.10)):.2f}) "
-            f"n_symbols={n_syms} enforced={enforce_overlap_gate}"
+            f"requested_n={requested_n} actual_n_symbols={n_syms_actual} "
+            f"is_fold_run={is_fold_run} enforced={enforce_overlap_gate}"
         )
 
-        if enforce_overlap_gate:
-            if n_syms < 2:
-                raise RuntimeError(
-                    f"[Phase1.1][HARD FAIL] Overlap gate enforced but run has n_symbols={n_syms}. "
-                    f"This gate is only valid for multi-symbol portfolio runs."
-                )
 
-            min_overlap = float(cfg.get("min_overlap_share_ge2", 0.10))
-            if overlap < min_overlap:
-                raise RuntimeError(
-                    f"[Phase1.1][HARD FAIL] Overlap gate failed: share(timestamps with >=2 symbols)={overlap:.4f} "
-                    f"< {min_overlap:.2f}. Fix ingestion/grid alignment before producing portfolio artifacts."
-                )
 
         pipe = CoreFeaturePipeline(
             parquet_root=Path(cfg.get("prepro_dir", ""))
         )
         feats_df = pipe.transform_mem(bars)
+
+
+        # --- Phase 2 HARD ASSERT: multi-symbol must survive FE ---
+        if len(symbols) >= 2:
+            if "symbol" not in feats_df.columns:
+                raise RuntimeError(
+                    "[Phase2][HARD FAIL] feats_df lost 'symbol' column. "
+                    "This can collapse a multi-symbol run into a single stream."
+                )
+
+            feats_nsyms = int(feats_df["symbol"].nunique())
+            if feats_nsyms < 2:
+                raise RuntimeError(
+                    f"[Phase2][HARD FAIL] Multi-symbol run collapsed after FE: feats_df has n_symbols={feats_nsyms}. "
+                    f"Requested symbols={symbols}. Investigate ingestion filters or FE merge logic."
+                )
+
+
+        # --- HARD ASSERT: multi-symbol must survive FE ---
+        if len(symbols) >= 2:
+            if "symbol" not in feats_df.columns:
+                raise RuntimeError(
+                    "[Phase2][HARD FAIL] feats_df lost 'symbol' column. "
+                    "This can collapse a multi-symbol run into a single stream."
+                )
+            n_feat_syms = int(feats_df["symbol"].nunique())
+            if n_feat_syms < 2:
+                raise RuntimeError(
+                    f"[Phase2][HARD FAIL] feats_df has only {n_feat_syms} symbol(s) "
+                    f"but universe has {len(symbols)}. Fake multi-symbol risk."
+                )
+
+    def _merge_safe_frame(df: "pd.DataFrame", keys: list[str]) -> "pd.DataFrame":
+        """
+        Ensure merge keys are unambiguous:
+          - If a key exists both as an index level name and a column name, drop the index.
+          - If a key exists only as an index level, materialize it as a column.
+        We choose correctness over preserving index semantics, because merges should be column-based here.
+        """
+        import pandas as pd
+
+        if df is None:
+            return df
+        if not isinstance(df, pd.DataFrame):
+            return df
+        if df.empty:
+            # still fix ambiguity in structure
+            pass
+
+        idx_names = [n for n in df.index.names if n is not None]
+
+        # If any merge key is BOTH an index level name and a column label, pandas will error.
+        if any((k in idx_names) and (k in df.columns) for k in keys):
+            # Drop index entirely (keep existing columns, including the key column).
+            df = df.reset_index(drop=True)
+            idx_names = [n for n in df.index.names if n is not None]
+
+        # If any merge key exists ONLY as an index level, materialize it as a column.
+        to_materialize = [k for k in keys if (k in idx_names) and (k not in df.columns)]
+        if to_materialize:
+            df = df.reset_index(level=to_materialize)
+
+        return df
 
     # ------------------------------------------------------------------
     # EV scoring
@@ -484,6 +840,22 @@ def run_batch(
 
     res = vectorize_minute_batch(ev, feats_df, pca_cols)
     decisions = getattr(res, "frame", res)
+
+    # Attach bar_present to decisions so downstream gates can enforce "real overlap".
+    if {"timestamp", "symbol"}.issubset(decisions.columns) and {"timestamp", "symbol", "bar_present"}.issubset(
+            bars.columns):
+
+        # --- CRASH FIX: make merge keys unambiguous (timestamp cannot be both index+column) ---
+        decisions = _merge_safe_frame(decisions, keys=["timestamp", "symbol"])
+        bars = _merge_safe_frame(bars, keys=["timestamp", "symbol"])
+
+        decisions = decisions.merge(
+            bars[["timestamp", "symbol", "bar_present"]],
+            on=["timestamp", "symbol"],
+            how="left",
+            validate="m:1",
+        )
+        decisions["bar_present"] = decisions["bar_present"].fillna(0).astype("int8")
 
     # ------------------------------------------------------------------
     # Sizing + simulation
@@ -509,6 +881,18 @@ def run_batch(
     )
 
     trades = _apply_modeled_costs_to_trades(trades, cfg)
+
+    # --- HARD FAIL: multi-symbol portfolio must trade >=2 symbols unless explicitly allowed ---
+    if len(symbols) >= 2 and not bool(cfg.get("allow_single_symbol_portfolio", False)):
+        if "symbol" not in trades.columns:
+            raise RuntimeError("[Phase2][HARD FAIL] trades missing 'symbol' column.")
+        n_trade_syms = int(trades["symbol"].nunique()) if not trades.empty else 0
+        if n_trade_syms < 2:
+            raise RuntimeError(
+                f"[Phase2][HARD FAIL] trades contain only {n_trade_syms} symbol(s) "
+                f"with universe={symbols}. Fake multi-symbol portfolio."
+            )
+
 
     # ------------------------------------------------------------------
     # Persist outputs
@@ -872,6 +1256,28 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
                 # tolerate partial/corrupt fold outputs
                 pass
 
+
+    # --- NEW: accept root-level decisions/trades when runner already wrote them ---
+    # If run_batch wrote decisions.parquet directly under artifacts_root, the
+    # "parts" scan intentionally finds nothing (it only looks for fold/symbol parts).
+    # In that case, treat the root file as authoritative.
+    if not dec_parts:
+        root_dec = artifacts_root / "decisions.parquet"
+        if root_dec.exists() and root_dec.stat().st_size > 100:
+            try:
+                dec = pd.read_parquet(root_dec)
+                # minimal UTC enforcement for required col
+                dec = _drop_if_all_nat(dec, "decision_ts", who="[Root decisions]")
+                if "timestamp" not in dec.columns:
+                    raise RuntimeError("[UTC] root decisions missing required 'timestamp'")
+                dec = _enforce_utc_ts_cols(dec, ("timestamp",), who="[Root decisions REQUIRED]")
+                # write back through the same writer for schema consistency (optional)
+                write_parquet_utc(dec, decisions_out, timestamp_cols=("timestamp", "decision_ts"))
+                decisions_path = decisions_out
+            except Exception as e:
+                print(f"[Consolidate] Failed reading root decisions.parquet: {e}")
+
+
     if dec_parts:
         '''dec = pd.concat(dec_parts, ignore_index=True).drop_duplicates()
         # normalize timestamps to tz-naive UTC on disk (single pass, no re-adding tz!)
@@ -1147,7 +1553,7 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
     """
     start, end = cfg["start"], cfg["end"]
     # Try CSV first if user points to a per-symbol file like raw_data/RRC.csv
-    csv_path = cfg.get("csv")
+    '''csv_path = cfg.get("csv")
     if csv_path:
         p = _resolve_path(csv_path)
         if p.exists():
@@ -1161,7 +1567,49 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
             df["symbol"] = symbol
             df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].sort_values("timestamp").reset_index(drop=True)
             if not df.empty:
+                return df'''
+
+    # Try CSV first ONLY if it is explicitly for this symbol.
+    # Supported cfg["csv"] forms:
+    #   1) dict: {"RRC": "raw_data/RRC.csv", "BBY": "raw_data/BBY.csv"}
+    #   2) str with "{symbol}" template: "raw_data/{symbol}.csv"
+    #   3) str path whose filename stem contains the symbol (e.g. ".../RRC.csv")
+    csv_cfg = cfg.get("csv")
+    csv_path_for_symbol = None
+
+    if isinstance(csv_cfg, dict):
+        csv_path_for_symbol = csv_cfg.get(symbol)
+    elif isinstance(csv_cfg, str) and csv_cfg:
+        if "{symbol}" in csv_cfg:
+            csv_path_for_symbol = csv_cfg.format(symbol=symbol)
+        else:
+            # Only accept if the filename looks symbol-specific
+            p0 = _resolve_path(csv_cfg)
+            stem = p0.stem.upper()
+            if symbol.upper() in stem:
+                csv_path_for_symbol = csv_cfg
+
+    if csv_path_for_symbol:
+        p = _resolve_path(csv_path_for_symbol)
+        if p.exists():
+            df = pd.read_csv(p)
+            ts = pd.to_datetime(df["Date"] + " " + df["Time"])
+            df = df.rename(columns={
+                "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+            })
+            df["timestamp"] = ts
+            df["symbol"] = symbol
+            df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].sort_values("timestamp").reset_index(drop=True)
+            if not df.empty:
                 return df
+    elif csv_cfg:
+        # If the user supplied csv but we couldn't prove it's symbol-specific,
+        # refuse silently using parquet fallback OR hard-fail (recommended).
+        raise RuntimeError(
+            f"[DATA] cfg['csv'] was provided but is not symbol-specific for {symbol}. "
+            f"Use dict mapping, a '{{symbol}}' template, or per-symbol filenames."
+        )
+
 
     # Fallback: hive-partitioned parquet
     '''parquet_root = _resolve_path(cfg.get("parquet_root", "parquet"))
@@ -2322,8 +2770,18 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     )
 
     # metadata
-    meta_path = _resolve_path(cfg.get("artifacts_root", "artifacts/a2")) / "meta.json"
+    #meta_path = _resolve_path(cfg.get("artifacts_root", "artifacts/a2")) / "meta.json"
+    #meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # metadata (STRICT: always write under the canonical per-run artifacts root)
+    meta_path = base_artifacts_root / "meta.json"
     meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Defensive assertion: forbid any scripts/artifacts leakage
+    norm_meta = str(meta_path.resolve()).lower().replace("/", "\\")
+    if "\\scripts\\artifacts" in norm_meta:
+        raise RuntimeError(f"Illegal artifacts path under scripts/: {meta_path}")
+
     label_meta = {
         "label_horizon": f"open→open log-return, H={int(cfg['horizon_bars'])} bars",
         "label_function": "feature_engineering.labels.labeler.one_bar_ahead",
@@ -3139,7 +3597,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # ─── Step 4.8: evaluate readiness (requires portfolio/ files & costs ON) ───
     try:
-        port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
+        #port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
+
+        port_dir = Path(cfg["artifacts_root"]).expanduser().resolve() / "portfolio"
+        port_dir.mkdir(parents=True, exist_ok=True)
+
         promo = _promotion_checks_step4_8(port_dir=port_dir, cfg=cfg)
         print(f"[4.8] passed={promo['passed']}  "
               f"multi={promo['share_multisymbol']:.3f}  "
@@ -3181,7 +3643,7 @@ __all__ = ["run", "run_batch", "CONFIG"]
 #    asyncio.run(run(CONFIG))
 
 
-if __name__ == "__main__":
+'''if __name__ == "__main__":
     asyncio.run(run(CONFIG))
 
     from pathlib import Path
@@ -3298,4 +3760,73 @@ if __name__ == "__main__":
             consolidated_path=cons.consolidated_path,
             report_path=rep.report_path,
         )
+    )'''
+
+
+if __name__ == "__main__":
+    # ------------------------------------------------------------------
+    # Phase 1.1 (MUST RUN FIRST): lock a single canonical run_dir
+    # ------------------------------------------------------------------
+    from prediction_engine.run_context import RunContext  # adjust import if needed
+    from datetime import datetime, timezone
+    import json
+    from pathlib import Path
+
+    # Ensure we have a run_id in CONFIG (RUN_ID already exists in your file)
+    CONFIG["run_id"] = str(RUN_ID)
+
+    # Decide the base artifacts root ONCE (repo-root based), then create a unique run_dir
+    # NOTE: cfg["artifacts_root"] should be the BASE (e.g., <repo>/artifacts), not scripts/artifacts, not a2/
+    # If CONFIG already has artifacts_root set, RunContext.create() will canonicalize scripts/artifacts -> artifacts.
+    run_ctx = RunContext.create(
+        run_id=str(RUN_ID),
+        cfg=CONFIG,
+        universe_hash=str(CONFIG.get("universe_hash") or ""),
+        window=f"{CONFIG.get('start')}→{CONFIG.get('end')}",
     )
+
+    # SINGLE SOURCE OF TRUTH: everything writes under run_ctx.run_dir
+    CONFIG["artifacts_root"] = str(run_ctx.run_dir)
+
+    # Optional but nice: explicit status marker
+    (run_ctx.run_dir / "RUN_STATUS.json").write_text(
+        json.dumps(
+            {"status": "STARTED", "created_utc": datetime.now(timezone.utc).isoformat()},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # ------------------------------------------------------------------
+    # Now run the actual backtest (safe: artifacts_root already locked)
+    # ------------------------------------------------------------------
+    import asyncio
+    asyncio.run(run(CONFIG))
+
+    # ------------------------------------------------------------------
+    # Post-run consolidation MUST also use run_ctx.run_dir (not _resolve_path defaults)
+    # ------------------------------------------------------------------
+    from feature_engineering.utils.consolidate_decisions import consolidate_decisions
+    from feature_engineering.utils.walkforward_report import generate_walkforward_report
+    from feature_engineering.utils.consistency_gate import ConsistencyGateInputs, run_consistency_gate
+
+    # Example: portfolio dir under the canonical run_dir
+    port_dir = run_ctx.run_dir / "portfolio"
+    port_dir.mkdir(parents=True, exist_ok=True)
+
+    # If you consolidate per-symbol folders, use run_ctx.run_dir as the root
+    # (adjust arguments to your real consolidate_decisions signature)
+    # consolidate_decisions(root_dir=run_ctx.run_dir, out_dir=port_dir)
+
+    # If you generate a WF report, also write under run_ctx.run_dir
+    # generate_walkforward_report(run_dir=run_ctx.run_dir)
+
+    # Mark end-of-run
+    (run_ctx.run_dir / "RUN_STATUS.json").write_text(
+        json.dumps(
+            {"status": "FINISHED", "finished_utc": datetime.now(timezone.utc).isoformat()},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+

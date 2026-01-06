@@ -772,6 +772,10 @@ class WalkForwardRunner:
 
             }
 
+            test_cfg["is_fold_run"] = True
+            # fold runs are often single-symbol, so never enforce multi-symbol overlap here
+            test_cfg["phase11_enforce_multisymbol_overlap_gate"] = False
+
             bt_metrics = run_bt(test_cfg, artifacts_dir=fold_dir, ev_artifacts_dir=ev_dst)
 
             # Sanity gate for entries (helps acceptance)
