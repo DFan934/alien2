@@ -35,14 +35,36 @@ class BacktestScannerLoop:
 
     # ----------------------------------------------
     def __iter__(self) -> Iterator[Tuple[pd.Timestamp, str, pd.Series]]:
-        for ts, slice_df in self.df.groupby(self.df.index):
-            mask = self.detectors(slice_df)
-            if not mask.any():
-                continue
-            for _, row in slice_df[mask].iterrows():
-                # Enforce canonical feature order for downstream pipelines
-                #row = row.loc[list(FEATURE_ORDER)]
+        # Iterate per symbol so detectors see a real time-series (not a 1-minute cross-section).
+        for sym, df_sym in self.df.groupby("symbol", sort=False):
+            # --- diagnostics: INPUT (per symbol) ---
+            try:
+                print(
+                    f"[Scanner-INPUT] {sym} "
+                    f"rows={len(df_sym)} "
+                    f"ts_min={df_sym.index.min()} "
+                    f"ts_max={df_sym.index.max()}"
+                )
+            except Exception as e:
+                print(f"[Scanner-INPUT] {sym} (failed to print) err={type(e).__name__}: {e}")
 
+            mask = self.detectors(df_sym)
+            mask = pd.Series(mask, index=df_sym.index).astype(bool)
+
+            df_kept = df_sym.loc[mask]
+
+            # --- diagnostics: OUTPUT (per symbol) ---
+            print(
+                f"[Scanner-OUTPUT] {sym} "
+                f"rows={len(df_kept)} "
+                f"kept_pct={len(df_kept) / max(len(df_sym), 1):.2%}"
+            )
+
+            if df_kept.empty:
+                continue
+
+            for ts, row in df_kept.iterrows():
+                # enforce schema order (same code you already have)
                 missing = [c for c in FEATURE_ORDER if c not in row.index]
                 if missing:
                     raise KeyError(
@@ -51,7 +73,6 @@ class BacktestScannerLoop:
                         + (f" ... (+{len(missing) - 25} more)" if len(missing) > 25 else "")
                     )
                 row = row.reindex(list(FEATURE_ORDER))
-
-                sym = row["symbol"]
-                self.builder.log_sync(ts, sym, row)  # <-- sync write
+                self.builder.log_sync(ts, sym, row)
                 yield ts, sym, row
+

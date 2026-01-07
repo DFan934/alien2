@@ -173,7 +173,22 @@ def generate_report(*, artifacts_root: str | Path, csv_path: str | Path, out_dir
 
     print(f"[RunContext] artifacts_root={artifacts_root}")
 
-    csv_path = Path(csv_path)
+    #csv_path = Path(csv_path)
+
+    # Accept either a file or a directory (or a dict mapping).
+    csv_cfg = csv_path
+
+    if isinstance(csv_cfg, dict):
+        # Multi-symbol mapping → pick one for legacy single-symbol report,
+        # or skip report entirely (recommended for now).
+        raise RuntimeError(
+            "[Report] cfg['csv'] is a dict mapping (multi-symbol). "
+            "This report path expects a single CSV file. "
+            "Either (a) extend report to multi-symbol returns, or (b) disable report for now."
+        )
+
+    csv_path = Path(csv_cfg)
+
     if out_dir is None:
         out_dir = artifacts_root
     out_dir = Path(out_dir)

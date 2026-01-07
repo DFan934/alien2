@@ -23,7 +23,7 @@ from pathlib import Path
 import pyarrow.dataset as ds
 from prediction_engine.prediction_engine.artifacts.manager import ArtifactManager
 import json
-from feature_engineering.utils.timegrid import grid_audit_to_json
+from feature_engineering.utils.timegrid import grid_audit_to_json, standardize_bars_to_grid
 
 import numpy as np
 import pandas as pd
@@ -107,7 +107,75 @@ def _write_run_context_json(artifacts_root: Path, payload: dict) -> None:
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     tmp_path.replace(out_path)  # atomic on Windows if same volume
 
+def _preflight_symbol_loads(cfg: dict, symbols: list[str], artifacts_root: "Path") -> None:
+    import json
+    audit = {"requested": list(symbols), "per_symbol": {}}
 
+    ok = []
+    bad = []
+
+    for s in symbols:
+        try:
+            df = _load_bars_for_symbol(cfg, s)
+            info = {"ok": True, "n_rows": int(len(df))}
+            if len(df) > 0 and "timestamp" in df.columns:
+                ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+                info.update({
+                    "min_ts": str(ts.min()),
+                    "max_ts": str(ts.max()),
+                    "n_bad_ts": int(ts.isna().sum()),
+                })
+            audit["per_symbol"][s] = info
+            ok.append(s)
+        except Exception as e:
+            audit["per_symbol"][s] = {"ok": False, "error": repr(e)}
+            bad.append(s)
+
+    # Always write audit so you can debug even when failing.
+    (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (artifacts_root / "diagnostics" / "symbol_load_preflight.json").write_text(
+        json.dumps(audit, indent=2),
+        encoding="utf-8",
+    )
+
+    if bad:
+        raise RuntimeError(
+            "[HARD FAIL] Symbol load preflight failed. "
+            f"ok={ok} bad={bad}. See diagnostics/symbol_load_preflight.json"
+        )
+
+
+def _dbg_symbols(df, tag: str, *, max_syms: int = 10, ts_col: str = "timestamp") -> None:
+    """Print symbol presence + row counts + basic timestamp span."""
+    try:
+        if df is None:
+            print(f"[{tag}] df=None")
+            return
+        if len(df) == 0:
+            print(f"[{tag}] df empty")
+            return
+
+        cols = list(df.columns) if hasattr(df, "columns") else []
+        shape = getattr(df, "shape", None)
+        print(f"[{tag}] shape={shape} cols_has_symbol={'symbol' in cols} cols_has_ts={ts_col in cols}")
+
+        if "symbol" not in cols:
+            return
+
+        vc = df["symbol"].value_counts(dropna=False)
+        syms = list(vc.index[:max_syms])
+        print(f"[{tag}] nunique={df['symbol'].nunique(dropna=False)} symbols_head={syms}")
+        print(f"[{tag}] symbol_counts_head:\n{vc.head(max_syms)}")
+
+        if ts_col in cols:
+            ts = df[ts_col]
+            # avoid expensive full conversions; just show min/max if possible
+            try:
+                print(f"[{tag}] ts_min={ts.min()} ts_max={ts.max()}")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[{tag}] dbg failed: {e!r}")
 
 def _hard_fail_if_fake_multisymbol(portfolio_decisions_path, *, min_share: float = 0.10):
     import pandas as pd
@@ -474,6 +542,11 @@ def run_batch(
     bars_list = []
     symbol_audit = {}
 
+    # --- Phase 1.0: universe load audit + integrity ---
+    loaded_symbols: list[str] = []
+    missing_symbols: list[str] = []
+
+
     for s in symbols:
         try:
             df_s = _load_bars_for_symbol(
@@ -487,6 +560,8 @@ def run_batch(
             }
 
             if len(df_s) > 0:
+                loaded_symbols.append(str(s))
+
                 ts = pd.to_datetime(df_s["timestamp"], utc=True, errors="coerce")
                 info.update(
                     {
@@ -497,25 +572,20 @@ def run_batch(
                 )
                 bars_list.append(df_s)
             else:
+                missing_symbols.append(str(s))
                 info["empty_reason"] = "df_empty_after_load"
 
             symbol_audit[s] = info
 
+
         except Exception as e:
+            missing_symbols.append(str(s))
             symbol_audit[s] = {
                 "loaded": False,
                 "error": repr(e),
             }
 
-    # BEFORE the per-symbol load loop:
-    loaded_symbols: list[str] = []
-    missing_symbols: list[str] = []
 
-    # INSIDE the loop over symbols, AFTER you attempt the load and have df_sym:
-    if df_s is None or len(df_s) == 0:
-        missing_symbols.append(str(s))
-    else:
-        loaded_symbols.append(str(s))
 
     # AFTER the loop, once `bars` is built (concat of loaded dfs), BEFORE overlap/FE:
     is_portfolio_run = (cfg.get("is_fold_run") is not True)
@@ -548,15 +618,39 @@ def run_batch(
         else pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
     )
 
-    # --- Phase 1.0 HARD ASSERT: universe must survive ingestion unless explicitly allowed ---
-    if len(symbols) >= 2:
-        present = sorted(bars["symbol"].unique().tolist()) if (not bars.empty and "symbol" in bars.columns) else []
-        if len(present) < 2 and not bool(cfg.get("allow_universe_collapse", False)):
+    _dbg_symbols(bars, "A_AFTER_CONCAT")
+
+    # --- Phase 1.0 HARD FAIL: requested multi-symbol universe must survive ingestion ---
+    present = sorted(bars["symbol"].unique().tolist()) if (not bars.empty and "symbol" in bars.columns) else []
+
+    universe_audit = {
+        "requested": list(symbols),
+        "loaded_symbols": list(loaded_symbols),
+        "missing_or_empty": list(missing_symbols),
+        "present_in_concat": present,
+        "n_rows_total": int(len(bars)),
+    }
+
+    # Write immediately so failures are diagnosable
+    try:
+        (artifacts_root / "universe_audit.json").write_text(
+            json.dumps(universe_audit, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[WARN] failed to write universe_audit.json: {e}")
+
+    is_portfolio_run = (cfg.get("is_fold_run") is not True)
+    requested_n = len(symbols)
+
+    if is_portfolio_run and requested_n >= 2 and not bool(cfg.get("allow_universe_collapse", False)):
+        if len(present) < 2:
             raise RuntimeError(
                 "[Phase1.0][HARD FAIL] Universe collapsed during ingestion. "
-                f"Requested={symbols} Present={present}. "
-                "See symbol_load_audit.json for why symbols were dropped."
+                f"Requested={symbols} Present={present} MissingOrEmpty={missing_symbols}. "
+                "See symbol_load_audit.json and universe_audit.json."
             )
+
 
     # Grid audit artifact (Task2)
     if hasattr(bars, "attrs") and "grid_audit" in bars.attrs:
@@ -659,6 +753,8 @@ def run_batch(
                 + " | ".join(bad)
             )
 
+        _dbg_symbols(bars, "C_BEFORE_TIMEGRID")
+
         bars, _ = standardize_bars_to_grid(
             bars,
             symbol_col="symbol",
@@ -668,6 +764,20 @@ def run_batch(
             fill_volume_zero=True,
             keep_ohlc_nan=True,
         )
+
+        _dbg_symbols(bars, "D_AFTER_TIMEGRID")
+
+        if not bool(cfg.get("is_fold_run", False)):
+            requested = cfg.get("universe") or []
+            if isinstance(requested, (list, tuple)) and len(requested) >= 2:
+                present = sorted(bars["symbol"].unique().tolist()) if (
+                            "symbol" in bars.columns and len(bars) > 0) else []
+                if len(present) < 2:
+                    raise RuntimeError(
+                        "[HARD FAIL] Universe collapsed after timegrid standardization. "
+                        f"Requested={requested} Present={present}. "
+                        "This indicates scanner/timegrid is dropping symbols."
+                    )
 
         # Mark whether a (timestamp,symbol) row corresponds to a REAL bar.
         # This prevents "grid placeholder rows" from being counted as overlap.
@@ -694,31 +804,26 @@ def run_batch(
 
         # Mark whether a (timestamp,symbol) row corresponds to a REAL bar.
         # This prevents "grid placeholder rows" from being counted as overlap.
+        # ------------------------------------------------------------------
+        # Phase 1.1 HARD GATE: multi-symbol timestamp overlap (REAL bars only)
+        # Must run AFTER grid standardization and AFTER universe integrity.
+        # ------------------------------------------------------------------
         if "close" in bars.columns:
             bars["bar_present"] = bars["close"].notna().astype("int8")
         else:
             bars["bar_present"] = 1  # fallback (shouldn't happen)
 
-        # How many symbols were requested?
-        requested_syms = []
-        if "symbols" in locals() and isinstance(symbols, (list, tuple)):
-            requested_syms = list(symbols)
-        elif isinstance(cfg.get("universe"), (list, tuple)):
-            requested_syms = list(cfg["universe"])
-
+        requested_syms = list(symbols)
         requested_n = len(requested_syms)
-
-        # Determine if this is a fold run
         is_fold_run = (cfg.get("is_fold_run") is True)
 
-        # Only enforce overlap on top-level multi-symbol runs (>=2 requested)
+        # enforce only on top-level portfolio runs requesting >= 2 symbols
         default_enforce = (not is_fold_run) and (requested_n >= 2)
 
-        enforce_overlap_gate = bool(
-            cfg.get("phase11_enforce_multisymbol_overlap_gate", default_enforce)
-        )
+        
 
-        # Compute overlap using REAL bars only
+        enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", default_enforce))
+
         n_syms_actual = int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0
         overlap = _timestamp_overlap_share(
             bars,
@@ -728,17 +833,19 @@ def run_batch(
             presence_col="bar_present",
         )
 
-        # Always write an audit artifact (even if not enforced)
+        min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+
+        overlap_audit = {
+            "requested_symbols": requested_syms,
+            "requested_n": requested_n,
+            "actual_n_symbols": n_syms_actual,
+            "overlap_share_ge2": float(overlap),
+            "min_required": min_required,
+            "is_fold_run": bool(is_fold_run),
+            "enforced": bool(enforce_overlap_gate),
+        }
+
         try:
-            overlap_audit = {
-                "requested_symbols": requested_syms,
-                "requested_n": requested_n,
-                "actual_n_symbols": n_syms_actual,
-                "overlap_share_ge2": overlap,
-                "min_required": float(cfg.get("min_overlap_share_ge2", 0.10)),
-                "is_fold_run": is_fold_run,
-                "enforced": enforce_overlap_gate,
-            }
             (artifacts_root / "overlap_audit.json").write_text(
                 json.dumps(overlap_audit, indent=2, default=str),
                 encoding="utf-8",
@@ -746,14 +853,15 @@ def run_batch(
         except Exception as e:
             print(f"[WARN] failed to write overlap_audit.json: {e}")
 
-        print(
-            f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} "
-            f"(min_required={float(cfg.get('min_overlap_share_ge2', 0.10)):.2f}) "
-            f"requested_n={requested_n} actual_n_symbols={n_syms_actual} "
-            f"is_fold_run={is_fold_run} enforced={enforce_overlap_gate}"
-        )
+        print(f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} (min_required={min_required:.2f}) "
+              f"requested_n={requested_n} actual_n_symbols={n_syms_actual} enforced={enforce_overlap_gate}")
 
-
+        if enforce_overlap_gate and (overlap < min_required):
+            raise RuntimeError(
+                "[Phase1.1][HARD FAIL] Multi-symbol overlap gate failed. "
+                f"overlap={overlap:.4f} < min_required={min_required:.2f}. "
+                "This run is not multi-asset-realistic; performance metrics invalid."
+            )
 
         pipe = CoreFeaturePipeline(
             parquet_root=Path(cfg.get("prepro_dir", ""))
@@ -1588,12 +1696,18 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
             stem = p0.stem.upper()
             if symbol.upper() in stem:
                 csv_path_for_symbol = csv_cfg
+    print(f"[DATA] csv_cfg={csv_cfg!r} csv_path_for_symbol({symbol})={csv_path_for_symbol!r}")
 
     if csv_path_for_symbol:
         p = _resolve_path(csv_path_for_symbol)
+        print(f"[LOAD] {symbol} source=CSV path={str(p)}")
+
         if p.exists():
             df = pd.read_csv(p)
-            ts = pd.to_datetime(df["Date"] + " " + df["Time"])
+            #ts = pd.to_datetime(df["Date"] + " " + df["Time"])
+
+            ts = pd.to_datetime(df["Date"] + " " + df["Time"], utc=True, errors="coerce")
+
             df = df.rename(columns={
                 "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
             })
@@ -1602,13 +1716,27 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
             df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].sort_values("timestamp").reset_index(drop=True)
             if not df.empty:
                 return df
-    elif csv_cfg:
+    elif isinstance(csv_cfg, str) and csv_cfg:
         # If the user supplied csv but we couldn't prove it's symbol-specific,
-        # refuse silently using parquet fallback OR hard-fail (recommended).
+        # either hard-fail (strict) or ignore CSV and fall back to parquet.
+        '''if bool(cfg.get("csv_strict", True)):
+            raise RuntimeError(
+                f"[DATA] cfg['csv'] was provided but is not symbol-specific for {symbol}. "
+                f"csv={csv_cfg!r}. Use dict mapping, a '{{symbol}}' template, or per-symbol filenames."
+            )
+        else:
+            print(
+                f"[DATA] csv provided but not symbol-specific for {symbol}; "
+                f"csv_strict=False so ignoring CSV and falling back to parquet. csv={csv_cfg!r}"
+            )'''
+        # If the user supplied a string csv path but we couldn't prove it's symbol-specific,
+        # hard-fail (this prevents silent single-symbol backtests).
         raise RuntimeError(
             f"[DATA] cfg['csv'] was provided but is not symbol-specific for {symbol}. "
             f"Use dict mapping, a '{{symbol}}' template, or per-symbol filenames."
         )
+
+
 
 
     # Fallback: hive-partitioned parquet
@@ -1674,7 +1802,7 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
     if table.num_rows == 0:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
 
-    df = table.to_pandas()
+    '''df = table.to_pandas()
 
     print(f"[LOAD] {symbol} rows={len(df)} cols={list(df.columns)}")
     print(f"[LOAD] {symbol} ts dtype={df['timestamp'].dtype} tz_aware={getattr(df['timestamp'].dt, 'tz', None)}")
@@ -1686,11 +1814,53 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
     if sym_dir.exists():
         parts = list(sym_dir.glob("year=*/month=*/*.parquet"))
         print(f"[LOAD] {symbol} parquet parts={len(parts)} (sample={parts[:2]})")
+    
+    print(f"[LOAD] {symbol} source=PARQUET sym_dir={str(sym_dir)}")
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
     # ensure unique, ordered minutes (helps later searchsorted calls)
-    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")'''
+
+    df = table.to_pandas()
+
+    print(f"[LOAD] {symbol} rows_raw={len(df)} cols={list(df.columns)}")
+    print(f"[LOAD] {symbol} ts dtype={df['timestamp'].dtype} tz_aware={getattr(df['timestamp'].dt, 'tz', None)}")
+    print(f"[LOAD] {symbol} min/max_raw={df['timestamp'].min()} → {df['timestamp'].max()}")
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    # ensure unique, ordered minutes
+    n_before = len(df)
+    #df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+
+    # Convert to UTC-aware
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+    # Floor to minute and aggregate OHLCV properly
+    df["timestamp"] = df["timestamp"].dt.floor("min")
+
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    df = (
+        df.sort_values("timestamp")
+        .groupby("timestamp", as_index=False)
+        .agg(agg)
+    )
+
+    df["symbol"] = str(symbol)
+    return df.reset_index(drop=True)
+
+    n_after = len(df)
+    print(f"[LOAD] {symbol} rows_dedup={n_after} dup_ts_removed={n_before - n_after}")
+    print(f"[LOAD] {symbol} min/max_utc={df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(f"[LOAD] {symbol} sample_ts={df['timestamp'].head(3).tolist()} ... {df['timestamp'].tail(3).tolist()}")
+
     df["symbol"] = str(symbol)
     return df.reset_index(drop=True)
     #return df.sort_values("timestamp").reset_index(drop=True)
@@ -1717,7 +1887,13 @@ def _slice_features_at(df_features: pd.DataFrame, t: pd.Timestamp) -> pd.DataFra
 # ────────────────────────────────────────────────────────────────────────
 CONFIG: Dict[str, Any] = {
     # raw minute-bar CSV (Date, Time, Open, High, Low, Close, Volume)
-    "csv": "raw_data/RRC.csv",
+    #"csv": "raw_data/RRC.csv",
+    #"csv": "raw_data/{symbol}.csv",
+"csv": {
+  "RRC": "raw_data/RRC.csv",
+  "BBY": "raw_data/BBY.csv",
+},
+
     "parquet_root": "parquet",
     #"symbol": "RRC",
     "universe": StaticUniverse(["RRC", "BBY"]),
@@ -2490,6 +2666,81 @@ def _enforce_risk_on_decisions(decisions: pd.DataFrame,
     return _pd.DataFrame(kept_rows, columns=dec.columns) if kept_rows else dec.iloc[:0]
 
 
+def _csv_path_for_symbol(cfg: dict, symbol: str) -> str:
+    """
+    Resolve cfg['csv'] into a concrete per-symbol CSV path.
+    Supports:
+      1) dict mapping: {"RRC": "raw_data/RRC.csv", ...}
+      2) template string: "raw_data/{symbol}.csv"
+      3) single string per-symbol path (only if it contains the symbol in filename stem)
+      4) fallback: "raw_data/{symbol}.csv"
+    """
+    csv_cfg = cfg.get("csv")
+
+    if isinstance(csv_cfg, dict):
+        p = csv_cfg.get(symbol)
+        if not p:
+            raise RuntimeError(f"[REPORT] cfg['csv'] dict missing entry for symbol={symbol}. keys={list(csv_cfg.keys())}")
+        return p
+
+    if isinstance(csv_cfg, str) and csv_cfg:
+        if "{symbol}" in csv_cfg:
+            return csv_cfg.format(symbol=symbol)
+
+        # Accept only if it *looks* symbol-specific
+        try:
+            stem = Path(csv_cfg).stem.upper()
+        except Exception:
+            stem = ""
+        if symbol.upper() in stem:
+            return csv_cfg
+
+        # If they provided a non-symbol-specific string, don’t silently use it for a multi-symbol run.
+        raise RuntimeError(
+            f"[REPORT] cfg['csv'] is a string but not symbol-specific for {symbol}: {csv_cfg!r}. "
+            f"Use dict mapping or a '{{symbol}}' template."
+        )
+
+    # No cfg['csv'] provided → assume conventional raw_data layout
+    return f"raw_data/{symbol}.csv"
+
+
+from pathlib import Path
+
+def _resolve_csv_root_for_reporting(cfg: dict) -> Path:
+    """
+    Reporting utilities sometimes want a 'csv_path' for legacy reasons.
+    In multi-symbol mode cfg['csv'] may be a dict or template; return a safe directory Path.
+    """
+    csv_cfg = cfg.get("csv")
+
+    # Default
+    if not csv_cfg:
+        return _resolve_path("raw_data", create=False, is_dir=True)
+
+    # Dict mapping: {"RRC": "raw_data/RRC.csv", ...}
+    if isinstance(csv_cfg, dict):
+        # pick any mapped file (if present) and return its parent dir
+        if len(csv_cfg) == 0:
+            return _resolve_path("raw_data", create=False, is_dir=True)
+        any_path = next(iter(csv_cfg.values()))
+        p = _resolve_path(any_path, create=False)
+        return p.parent if p.suffix else p
+
+    # Templated string: "raw_data/{symbol}.csv"
+    if isinstance(csv_cfg, str):
+        if "{symbol}" in csv_cfg:
+            # Path("raw_data/{symbol}.csv").parent -> "raw_data"
+            return _resolve_path(Path(csv_cfg).parent, create=False, is_dir=True)
+        # Plain path: could be file or dir
+        p = _resolve_path(csv_cfg, create=False)
+        return p.parent if p.suffix else p
+
+    # Anything else: fall back safely
+    return _resolve_path("raw_data", create=False, is_dir=True)
+
+
+
 async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
     log = logging.getLogger("backtest")
@@ -2497,10 +2748,24 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     if not bool(cfg.get("verbose_print", False)):
         logging.getLogger().setLevel(logging.WARNING)
 
+    print(f"[OneSym-START] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
+
+
     # 1) Load bars for this symbol
     df_raw = _load_bars_for_symbol(cfg, sym)
+
+
+    print(f"[OneSym-AFTER-LOAD] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
+
     if df_raw.empty:
         raise ValueError(f"Date filter returned zero rows for symbol {sym}")
+
+    print(
+        f"[Scanner-INPUT] {sym} "
+        f"rows={len(df_raw)} "
+        f"ts_min={df_raw['timestamp'].min()} "
+        f"ts_max={df_raw['timestamp'].max()}"
+    )
 
     # --- enrich raw (as you already do) ---
     df_raw["trigger_ts"] = df_raw["timestamp"]
@@ -2515,9 +2780,33 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     #mask = await detector(df_raw)
 
+    # --- Scanner diagnostics (INPUT) ---
+    # Place this immediately before: mask = detector(df_raw)
+    try:
+        print(
+            f"[Scanner-INPUT] {sym} "
+            f"rows={len(df_raw)} "
+            f"ts_min={df_raw['timestamp'].min()} "
+            f"ts_max={df_raw['timestamp'].max()}"
+        )
+    except Exception as e:
+        print(f"[Scanner-INPUT] {sym} (failed to print) err={type(e).__name__}: {e}")
+
     mask = detector(df_raw)
 
-    print(f"[Scanner] {sym} kept={int(mask.sum())}/{len(mask)}")
+    # --- Scanner diagnostics (OUTPUT) ---
+    df_kept = df_raw.loc[pd.Series(mask, index=df_raw.index).astype(bool)]
+
+    print(
+        f"[Scanner-OUTPUT] {sym} "
+        f"rows={len(df_kept)} "
+        f"kept_pct={len(df_kept) / max(len(df_raw), 1):.2%}"
+    )
+
+    # Keep your original quick summary if you still want it:
+    print(f"[Scanner] {sym} kept={int(len(df_kept))}/{len(df_raw)}")
+
+    #print(f"[Scanner] {sym} kept={int(mask.sum())}/{len(mask)}")
 
     # quick drift / sanity: compare basic OHLCV stats before vs after
     def _stats(tag, d):
@@ -2531,6 +2820,21 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
 
     mask = pd.Series(mask, index=df_raw.index).astype(bool)
+
+    # capture pre-filter size for correct kept_pct
+    n_in = len(df_raw)
+
+    # apply filter ONCE
+    df_kept = df_raw.loc[mask].reset_index(drop=True)
+
+    print(
+        f"[Scanner-OUTPUT] {sym} "
+        f"rows={len(df_kept)} "
+        f"kept_pct={len(df_kept) / max(n_in, 1):.2%}"
+    )
+
+    # from here on, use df_kept as your filtered bar set
+    df_raw = df_kept
 
     pass_rate = mask.mean() * 100
     print(f"[Scanner KPI] {sym}: Bars passing filters: {mask.sum()} / {len(mask)} = {pass_rate:.2f}%")
@@ -2594,9 +2898,23 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         if bad:
             print("[GridAudit] non-60s after standardize:", bad)
 
+    if grid_audits:
+        print("[GridAudit] summary:")
+        for a in grid_audits:
+            print(" ", a)
+
     #df_raw = df_raw.loc[mask].reset_index(drop=True)
 
     df_raw = df_raw.loc[mask].copy()  # keep original index so fold merge can key on it
+
+    df_kept = df_raw
+    print(
+        f"[Scanner-OUTPUT] {sym} "
+        f"rows={len(df_kept)} "
+        f"kept_pct={len(df_kept) / max(int(mask.shape[0]), 1):.2%}"
+    )
+
+    df_raw = df_kept
 
     df_raw["adv_shares"] = df_raw["volume"].rolling(20, min_periods=1).mean()
     df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
@@ -2757,6 +3075,8 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     base_artifacts_root = resolve_artifacts_root(cfg, run_id=RUN_ID, create=True)
     cfg["artifacts_root"] = str(base_artifacts_root)
 
+    #_preflight_symbol_loads(cfg, symbols, base_artifacts_root)
+
     runner = WalkForwardRunner(
         artifacts_root=base_artifacts_root,
         parquet_root=resolved_parquet_root,
@@ -2824,10 +3144,38 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     )
 
     # per-symbol report (your script already does this)
+    '''generate_report(
+        artifacts_root=cfg.get("artifacts_root", "artifacts/a2"),
+        #csv_path=_resolve_path(cfg.get("csv", "raw_data")),  # not used by report, but keep signature
+        #csv_path=_resolve_path(_csv_path_for_symbol(cfg, sym)),
+        csv_path=_resolve_csv_root_for_reporting(cfg),  # safe even if cfg['csv'] is dict/template
+
+    )'''
+
+    # per-symbol report
+    # IMPORTANT: do NOT pass a directory like "raw_data" as csv_path.
+    csv_path_for_report = None
+    csv_cfg = cfg.get("csv")
+
+    if isinstance(csv_cfg, str) and csv_cfg:
+        p = _resolve_path(csv_cfg)
+        if p.exists() and p.is_file():
+            csv_path_for_report = p
+    elif isinstance(csv_cfg, dict):
+        # If you ever use dict-form csv mapping, only pass a file for this symbol.
+        sym_csv = csv_cfg.get(sym)
+        if isinstance(sym_csv, str) and sym_csv:
+            p = _resolve_path(sym_csv)
+            if p.exists() and p.is_file():
+                csv_path_for_report = p
+
+    print(f"[REPORT] sym={sym} csv_path_for_report={csv_path_for_report}")
+
     generate_report(
         artifacts_root=cfg.get("artifacts_root", "artifacts/a2"),
-        csv_path=_resolve_path(cfg.get("csv", "raw_data")),  # not used by report, but keep signature
+        csv_path=csv_path_for_report,
     )
+
     return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(cfg.get("artifacts_root", "artifacts/a2"))}])
 
 
@@ -3092,6 +3440,36 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     parquet_root = _resolve_path(cfg.get("parquet_root", "parquet"))
     available = set(discover_parquet_symbols(parquet_root))
     symbols = [s for s in symbols_requested if s in available]
+
+    print(f"[Universe] symbols_source=cfg['universe'] resolved_symbols={symbols}")
+
+    # ------------------------------
+    # Preflight: csv config integrity
+    # ------------------------------
+    csv_cfg = cfg.get("csv")
+
+    if len(symbols) >= 2 and csv_cfg:
+        # Allowed:
+        #  1) dict mapping { "RRC": "raw_data/RRC.csv", "BBY": "raw_data/BBY.csv" }
+        #  2) templated string "raw_data/{symbol}.csv"
+        if isinstance(csv_cfg, dict):
+            missing = [s for s in symbols if s not in csv_cfg]
+            if missing:
+                print(
+                    "[Universe] NOTE: cfg['csv'] is a dict but has no entries for "
+                    f"{missing}. These symbols will fall back to parquet."
+                )
+
+        elif isinstance(csv_cfg, str):
+            if "{symbol}" not in csv_cfg:
+                raise RuntimeError(
+                    "[HARD FAIL] cfg['csv'] is a single path string, but universe has >=2 symbols. "
+                    f"csv={csv_cfg!r} universe={symbols}. "
+                    "Fix by using a dict mapping, a '{symbol}' template, or remove cfg['csv']."
+                )
+
+
+
     missing  = [s for s in symbols_requested if s not in available]
 
     # Phase-2 acceptance summary
@@ -3141,17 +3519,192 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     if not symbols:
         raise RuntimeError("No requested symbols were found under parquet/. Abort.")
 
+    # ------------------------------
+    # Scanner / universe provenance
+    # ------------------------------
+    scanner_seen_symbols: set[str] = set()
+
+    kept_frames: list[pd.DataFrame] = []
+    scanner_seen_symbols: set[str] = set()
+
+    print(f"[Scanner-START] requested_symbols={symbols}")
+    print(f"[Scanner-START] cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
+
+    import copy  # put this at top-of-file if not already present
+
+    symbols_requested = list(map(str, symbols))  # snapshot BEFORE anything can mutate it
+    print(f"[Scanner-START] symbols_requested_snapshot={symbols_requested}")
+
     # Loop over symbols, run one-symbol workflow
+
+    '''results = []
+    for sym in symbols_requested:
+
+        #for sym in symbols:
+        scanner_seen_symbols.add(str(sym))
+
+        # snapshot original cfg state (mutation probe)
+        print(f"[Scanner-LOOP] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
+
+        #sym_cfg = {**cfg, "symbol": sym}  # pass symbol to runner
+
+        sym_cfg = copy.deepcopy(cfg)
+        sym_cfg["symbol"] = sym
+
+        log.info(f"=== Running backtest for {sym} ===")
+
+        try:
+            res = await _run_one_symbol(sym, sym_cfg)
+            results.append(res)
+        except Exception as e:
+            print(f"[Scanner-ERROR] sym={sym} err={type(e).__name__}: {e}")
+            raise'''
+
+    # ------------------------------
+    # PREFLIGHT: load bars for all symbols (this is what overlap gating uses)
+    # ------------------------------
+    kept_frames = []
+    scanner_seen_symbols = set()
+
+    for sym in symbols_requested:
+        sym = str(sym)
+        scanner_seen_symbols.add(sym)
+
+        print(f"[Scanner-LOOP] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
+
+        df = _load_bars_for_symbol(cfg, sym)
+        print(
+            f"[Scanner-INPUT] {sym} "
+            f"cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r} "
+            f"rows={len(df)} "
+            f"ts_min={df['timestamp'].min() if len(df) else None} "
+            f"ts_max={df['timestamp'].max() if len(df) else None}"
+        )
+
+        if df is None or len(df) == 0:
+            print(f"[Scanner-OUTPUT] {sym} rows=0 kept_pct=0.00% (empty after load)")
+            continue
+
+        # Minimal "keep" rule for now: keep everything loaded.
+        # (If you want real scanner predicates here, apply them and name the output df_kept.)
+        df_kept = df
+
+        print(
+            f"[Scanner-OUTPUT] {sym} "
+            f"rows={len(df_kept)} "
+            f"kept_pct={len(df_kept) / max(len(df), 1):.2%}"
+        )
+
+        kept_frames.append(df_kept)
+
+    print(f"[Scanner-END] symbols_requested_snapshot={symbols_requested} (unchanged)")
+    print(f"[Scanner-END] symbols_current={symbols}")
+
+    print(f"[Scanner-END] seen_symbols={sorted(scanner_seen_symbols)}")
+    #missing = set(map(str, symbols)) - set(scanner_seen_symbols)
+
+    # ------------------------------
+    # AFTER scanner loop: combine bars across symbols
+    # ------------------------------
+    print(f"[Scanner-END] seen_symbols={sorted(scanner_seen_symbols)}")
+    #missing = set(symbols) - set(scanner_seen_symbols)
+    missing = set(map(str, symbols_requested)) - set(scanner_seen_symbols)
+
+    if missing:
+        raise RuntimeError(
+            f"[HARD FAIL] Scanner never processed symbols={sorted(missing)} (requested={symbols})"
+        )
+
+    if not kept_frames:
+        raise RuntimeError("[HARD FAIL] Scanner produced zero bars across all symbols.")
+
+    bars_all = pd.concat(kept_frames, ignore_index=True)
+    if "symbol" not in bars_all.columns:
+        raise RuntimeError("[HARD FAIL] bars_all missing 'symbol' column after concat.")
+    bars_all["symbol"] = bars_all["symbol"].astype(str)
+
+    print("[Bars-ALL] per-symbol rows:",
+          bars_all.groupby("symbol")["timestamp"].count().to_dict())
+
+    print(
+        f"[Bars-ALL] rows={len(bars_all)} "
+        f"symbols={sorted(bars_all['symbol'].unique().tolist())} "
+        f"ts_min={bars_all['timestamp'].min()} ts_max={bars_all['timestamp'].max()}"
+    )
+
+    grid_seconds = int(cfg.get("bar_grid_seconds", 60))
+
+    # ------------------------------
+    # Canonical grid enforcement + overlap gate (MULTI-SYMBOL)
+    # ------------------------------
+    '''bars_std = standardize_bars_to_grid(
+        bars_all,
+        freq=f"{grid_seconds}s",
+        expected_freq_s=int(grid_seconds),
+
+        ts_col="timestamp",
+        symbol_col="symbol",
+    )
+
+
+
+    cov = bars_std.groupby("symbol")["close"].apply(lambda s: s.notna().mean()).to_dict()'''
+
+    bars_std, grid_audits = standardize_bars_to_grid(
+        bars_all,
+        # keep your existing args here
+    )
+
+    cov = bars_std.groupby("symbol")["close"].apply(lambda s: s.notna().mean()).to_dict()
+    print("[Grid] per-symbol non-null close %:", cov)
+
+    # Optional: print audits
+    if grid_audits:
+        print("[GridAudit] rows:")
+        for a in grid_audits:
+            print(" ", a)
+
+    print("[Grid] per-symbol non-null close %:", cov)
+
+    print("[DBG] after standardize_bars_to_grid (MULTI)")
+    print(f"shape={bars_std.shape}")
+    print(f"symbol unique={sorted(bars_std['symbol'].unique().tolist())[:10]}")
+
+    overlap = _timestamp_overlap_share(
+        bars_std,
+        ts_col="timestamp",
+        symbol_col="symbol",
+        min_symbols=2,
+        presence_col="close",  # or 'bar_present' if you have it
+    )
+
+    print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
+    if overlap < float(cfg.get("min_multisymbol_share", 0.10)):
+        raise RuntimeError(
+            f"[GATE] multi-symbol share < {cfg.get('min_multisymbol_share', 0.10):.2f} "
+            f"(got {overlap:.3f}). Refusing to emit/accept portfolio artifacts."
+        )
+
+    # ------------------------------
+    # AFTER overlap gate passes: run the per-symbol workflows
+    # ------------------------------
     results = []
-    for sym in symbols:
-        sym_cfg = {**cfg, "symbol": sym}  # pass symbol to runner
+    for sym in symbols_requested:
+        sym = str(sym)
+        sym_cfg = copy.deepcopy(cfg)
+        sym_cfg["symbol"] = sym
+
         log.info(f"=== Running backtest for {sym} ===")
         res = await _run_one_symbol(sym, sym_cfg)
         results.append(res)
 
+    '''missing = set(symbols_requested) - set(scanner_seen_symbols)
 
-
-
+    if missing:
+        raise RuntimeError(
+            f"[HARD FAIL] Scanner never processed symbols={sorted(missing)} "
+            f"(requested={symbols})"
+        )'''
 
     # ─── Phase 4: Universe portfolio aggregation ────────────────────────
     #arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
