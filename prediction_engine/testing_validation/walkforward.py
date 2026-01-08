@@ -319,6 +319,8 @@ class WalkForwardRunner:
         symbol: str,
         horizon_bars: int,
         longest_lookback_bars: int,
+        unified_clock=None,
+        bar_grid_seconds:int=60,
         p_gate_q: float = 0.65,
         full_p_q: float = 0.80,
         tz: str = "America/New_York",
@@ -331,6 +333,8 @@ class WalkForwardRunner:
         self.symbol = symbol
         self.horizon_bars = int(horizon_bars)
         self.longest_lookback_bars = int(longest_lookback_bars)
+        self.unified_clock = unified_clock
+        self.bar_grid_seconds = int(bar_grid_seconds)
         self.p_gate_q = float(p_gate_q)
         self.full_p_q = float(full_p_q)
         self.tz = tz
@@ -700,7 +704,7 @@ class WalkForwardRunner:
             # ---- EV artefacts: build on TRAIN window only
             from scripts.rebuild_artefacts import rebuild_if_needed
 
-            rebuild_if_needed(
+            '''rebuild_if_needed(
                 artefact_dir=str(self.ev_artifacts_root),
                 parquet_root=str(self.parquet_root),
                 symbols=[self.symbol],
@@ -708,6 +712,54 @@ class WalkForwardRunner:
                 end=f.train_end - purge_cut,
                 n_clusters=64,
                 fitted_pipeline_dir=prepro_dir,  # ← ensures SAME PCA basis
+            )'''
+
+            from scripts.rebuild_artefacts import rebuild_if_needed
+
+            # Minimal cfg object (rebuild_if_needed requires it as its first arg)
+            '''rebuild_cfg = {
+                "parquet_root": str(self.parquet_root),
+                "universe": [self.symbol],
+                "start": str(pd.to_datetime(f.train_start).date()),
+                "end": str(pd.to_datetime((f.train_end - purge_cut)).date()),
+                "artifacts_root": str(self.ev_artifacts_root),
+            }'''
+
+            rebuild_cfg = {
+                "parquet_root": str(self.parquet_root),
+                "universe": [self.symbol],
+                "start": str(pd.to_datetime(f.train_start).date()),
+                "end": str(pd.to_datetime((f.train_end - purge_cut)).date()),
+                "artifacts_root": str(self.ev_artifacts_root),
+
+                "_unified_clock": self.unified_clock,  # <-- ADD
+                "_bar_grid_seconds": int(self.bar_grid_seconds),  # <-- ADD (recommended)
+            }
+
+            from scripts.rebuild_artefacts import rebuild_if_needed
+
+            '''rebuild_if_needed(
+                artefact_dir=str(self.ev_artifacts_root),
+                parquet_root=str(self.parquet_root),
+                symbols=[self.symbol],
+                start=f.train_start,
+                end=f.train_end - purge_cut,
+                n_clusters=64,
+                fitted_pipeline_dir=prepro_dir,
+            )'''
+
+            if self.unified_clock is None or len(self.unified_clock) == 0:
+                raise RuntimeError("[WalkForwardRunner] unified_clock missing; pass it from run_backtest.run()")
+
+            rebuild_if_needed(
+                artefact_dir=str(self.ev_artifacts_root),
+                parquet_root=str(self.parquet_root),
+                symbols=[self.symbol],
+                cfg=rebuild_cfg,  # <-- ADD THIS
+                start=f.train_start,
+                end=f.train_end - purge_cut,
+                n_clusters=64,
+                fitted_pipeline_dir=prepro_dir,
             )
 
             # --- 3.6: resolve artefact paths & distance contract for traceability ---

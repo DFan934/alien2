@@ -29,6 +29,7 @@ def _load_meta(path: Path) -> dict | None:
     except FileNotFoundError:
         return None
 
+
 def _dbg(df: pd.DataFrame, tag: str, head: int = 3):
     try:
         idx = df.index
@@ -39,7 +40,7 @@ def _dbg(df: pd.DataFrame, tag: str, head: int = 3):
         print("\n" + "=" * 90)
         print(f"[DBG] {tag}")
         print(f"shape={df.shape}")
-        print(f"columns({len(df.columns)}): {list(df.columns)[:15]}{' ...' if len(df.columns)>15 else ''}")
+        print(f"columns({len(df.columns)}): {list(df.columns)[:15]}{' ...' if len(df.columns) > 15 else ''}")
         print(f"has_col timestamp={('timestamp' in df.columns)} symbol={('symbol' in df.columns)}")
         print(f"index_type={idx_type} index_names={idx_names} index_tz={tz}")
 
@@ -80,6 +81,7 @@ def _dbg(df: pd.DataFrame, tag: str, head: int = 3):
     except Exception as e:
         print(f"[DBG] {tag} FAILED:", e)
 
+
 # INSERT BEFORE: def rebuild_if_needed(...)
 
 def _safe_reset_index(df: pd.DataFrame, tag: str = "") -> pd.DataFrame:
@@ -101,13 +103,24 @@ def _safe_reset_index(df: pd.DataFrame, tag: str = "") -> pd.DataFrame:
         return df.reset_index(drop=False)
 
 
-def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root: str | Path, n_clusters: int = 64):
+def build_pooled_core(
+        symbols,
+        out_dir: Path,
+        start: str,
+        end: str,
+        parquet_root: str | Path,
+        n_clusters: int = 64,
+        *,
+        global_index: pd.DatetimeIndex | None = None,
+        grid_seconds: int = 60,
+):
     """
     Train pooled scaler/PCA/clusters over all symbols and persist standard filenames.
     Files written:
       out_dir/scaler.pkl, out_dir/pca.pkl, out_dir/clusters.pkl, out_dir/feature_schema.json
     """
-    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(out_dir);
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Load per-symbol slices and concatenate
     base = Path(parquet_root)
@@ -124,135 +137,125 @@ def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root
         if not df.empty:
             dfs.append(df)
 
-        '''from feature_engineering.utils.time import ensure_utc_timestamp_col
-        from feature_engineering.utils.timegrid import standardize_bars_to_grid
-
-        # --- canonicalize ts (tz-aware) + slice window in UTC -----------------
-        ensure_utc_timestamp_col(df, "timestamp", who=f"[pooled:{sym}]")
-
-        start_ts = pd.to_datetime(start, utc=True)
-        end_ts = pd.to_datetime(end, utc=True)
-        df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
-        if df.empty:
-            continue
-
-        # --- enforce 60s UTC grid BEFORE any FE --------------------------------
-        df_std, audit = standardize_bars_to_grid(df, symbol=sym, freq="60s")
-        LOG.info(f"[GridAudit pooled] {audit}")
-
-        dfs.append(df_std)'''
-
     if not dfs:
         raise RuntimeError("No data found for pooled build")
 
     raw = pd.concat(dfs, ignore_index=True)
 
+    # --- Canonicalize + enforce 60s grid ONCE (pooled core must match run_backtest clock) ---
     from feature_engineering.utils.timegrid import standardize_bars_to_grid
 
-    raw, audits = standardize_bars_to_grid(
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+    raw = raw.dropna(subset=["timestamp", "symbol"])
+
+    if global_index is None or len(global_index) == 0:
+        raise RuntimeError(
+            "[PooledCore] global_index (unified_clock) must be provided from run_backtest; "
+            "refusing to guess a clock inside pooled builder."
+        )
+
+    uni = pd.DatetimeIndex(global_index)
+    if getattr(uni, "tz", None) is None:
+        uni = uni.tz_localize("UTC")
+    else:
+        uni = uni.tz_convert("UTC")
+
+    raw_std, grid_audits = standardize_bars_to_grid(
         raw,
         symbol_col="symbol",
         ts_col="timestamp",
-        freq="60s",
-        expected_freq_s=60,
+        freq=f"{grid_seconds}s",
+        expected_freq_s=int(grid_seconds),
+        global_index=uni,
         fill_volume_zero=True,
         keep_ohlc_nan=True,
         hard_fail_on_duplicates=False,
     )
 
-    _dbg(raw, "after standardize_bars_to_grid (raw)")
-    # Force keys to live in columns (not index)
-    if isinstance(raw.index, pd.MultiIndex) and any(n in ("timestamp", "symbol") for n in raw.index.names):
-        raw = raw.reset_index(drop=True)
-    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
-    raw["symbol"] = raw["symbol"].astype("string")
+    print(
+        "[PooledCore][GridAudit]",
+        [(a.symbol, a.median_delta_s_in, a.median_delta_s_out, a.n_rows_in, a.n_rows_out) for a in grid_audits],
+    )
+    print("[PooledCore][Grid] non-null close %",
+          raw_std.groupby("symbol")["close"].apply(lambda s: float(s.notna().mean())).to_dict())
 
-    raw.attrs["grid_audit"] = audits
+    # --- Fit pooled feature pipeline in-memory on canonical bars ---
+    # --- Fit pooled feature pipeline in-memory on canonical bars ---
+    pipe = CoreFeaturePipeline(parquet_root=out_dir)
 
-    # 2) Fit features (get scaler/pca inside pipeline) and build clusters on pooled PCA space
-    pipe = CoreFeaturePipeline(parquet_root=out_dir)   # fits in-memory
-
-    feats, arte = pipe.run_mem(raw)  # arte (if returned) may include scaler_, pca_, etc.
+    _dbg(raw_std, "[PooledCore] before pipe.run_mem(raw_std)")
+    feats, arte = pipe.run_mem(raw_std)
+    _dbg(feats, "[PooledCore] after pipe.run_mem(feats)")
 
     # --- Ensure feats has timestamp + symbol info (pooled builder contract) ----
-    # 1) Timestamp
     if "timestamp" not in feats.columns:
-        # if timestamp is the index, preserve it as a column
         if isinstance(feats.index, pd.DatetimeIndex):
-            idx = feats.index
-            # drop tz if present
-            if getattr(idx, "tz", None) is not None:
-                idx = idx.tz_localize(None)
             feats = feats.copy()
-            feats["timestamp"] = idx
+            feats["timestamp"] = feats.index
         else:
-            raise KeyError("[pooled] feats has no 'timestamp' col and index is not DatetimeIndex")
+            raise KeyError("[PooledCore] feats missing timestamp column and index is not DatetimeIndex")
 
-    else:
-        # normalize to UTC-naive timestamps consistently
-        feats = feats.copy()
-        feats["timestamp"] = (
-            pd.to_datetime(feats["timestamp"], utc=True, errors="coerce")
-            .dt.tz_localize(None)
-        )
+    feats = feats.copy()
+    feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
 
-    # 2) Symbol
     if "symbol" not in feats.columns:
-        # Best case: one-to-one row alignment with raw
-        if len(feats) == len(raw) and "symbol" in raw.columns:
-            feats["symbol"] = raw["symbol"].astype("string").to_numpy()
-        else:
-            # If you truly built pooled features without per-row symbols, you must
-            # use a single symbol tag and also collapse labels the same way.
-            # But your label series uses real symbols, so prefer the aligned case.
-            raise KeyError("[pooled] feats missing 'symbol' and cannot align rows to raw")
-    else:
-        feats["symbol"] = feats["symbol"].astype("string")
-    # --------------------------------------------------------------------------
+        if len(feats) != len(raw_std):
+            raise RuntimeError(
+                f"[PooledCore] feats len {len(feats)} != raw_std len {len(raw_std)}; cannot attach symbol")
+        feats["symbol"] = raw_std["symbol"].astype("string").to_numpy()
+    feats["symbol"] = feats["symbol"].astype("string")
 
-    # 3) Persist core components
-    # Try to extract internals if the pipeline exposes them; otherwise persist placeholders so layout exists.
-    scaler = getattr(pipe, "scaler_", None) or arte.get("scaler_", None) if isinstance(arte, dict) else None
-    pca    = getattr(pipe, "pca_", None)    or arte.get("pca_", None)    if isinstance(arte, dict) else None
+    # --- Persist pooled core objects ---
+    scaler = getattr(pipe, "scaler_", None)
+    pca = getattr(pipe, "pca_", None)
 
-    if scaler is not None:
-        joblib.dump(scaler, out_dir / "scaler.pkl")
-    else:
-        joblib.dump({"_": "placeholder_scaler"}, out_dir / "scaler.pkl")
-
-    if pca is not None:
-        joblib.dump(pca, out_dir / "pca.pkl")
-    else:
-        joblib.dump({"_": "placeholder_pca"}, out_dir / "pca.pkl")
+    joblib.dump(scaler if scaler is not None else {"_": "placeholder_scaler"}, out_dir / "scaler.pkl")
+    joblib.dump(pca if pca is not None else {"_": "placeholder_pca"}, out_dir / "pca.pkl")
 
     pca_cols = [c for c in feats.columns if c.startswith("pca_")]
-    feature_schema = {"pca_columns": pca_cols}
-    (out_dir / "feature_schema.json").write_text(json.dumps(feature_schema, indent=2), encoding="utf-8")
+    if not pca_cols:
+        raise RuntimeError("[PooledCore] No pca_* columns produced by pipeline")
+
+    (out_dir / "feature_schema.json").write_text(
+        json.dumps({"pca_columns": pca_cols}, indent=2),
+        encoding="utf-8",
+    )
 
     # 4) (Re)build pooled clusters from pooled PCA features
     # Simple numeric label for pooled build — use a forward O->C ret consistent with symbol builder
-    raw = raw.sort_values(["symbol", "timestamp"])
+    '''raw = raw.sort_values(["symbol", "timestamp"])
     next_open  = raw.groupby("symbol")["open"].shift(-1)
     next_close = raw.groupby("symbol")["close"].shift(-1)
     raw["ret_fwd"] = (next_close / next_open - 1.0)
+    '''
+
+    raw_std = raw_std.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    next_open = raw_std.groupby("symbol")["open"].shift(-1)
+    next_close = raw_std.groupby("symbol")["close"].shift(-1)
+    raw_std["ret_fwd"] = (next_close / next_open - 1.0)
+
     feats = feats.set_index(pd.to_datetime(feats["timestamp"]).dt.tz_localize(None), drop=False)
-    #y_numeric = pd.Series(raw["ret_fwd"].values, index=pd.to_datetime(raw["timestamp"]).dt.tz_localize(None)).reindex(feats.index).values
+    # y_numeric = pd.Series(raw["ret_fwd"].values, index=pd.to_datetime(raw["timestamp"]).dt.tz_localize(None)).reindex(feats.index).values
 
     # --- Robust label→feature alignment for pooled builds -------------------
     # 1) Normalize raw label keys
-    #ts_raw = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").tz_convert(None)
-    ts_raw = (
+    # ts_raw = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce").tz_convert(None)
+    '''ts_raw = (
         pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
         .dt.tz_localize(None)
     )
 
     sym_raw = (raw["symbol"].astype(str) if "symbol" in raw.columns else pd.Series([""] * len(raw)))
+    '''
+
+    ts_raw = pd.to_datetime(raw_std["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    sym_raw = raw_std["symbol"].astype(str)
 
     # 2) Build a MultiIndex label series and collapse any exact dupes
-    lab = pd.Series(raw["ret_fwd"].to_numpy(),
+    lab = pd.Series(raw_std["ret_fwd"].to_numpy(),
                     index=pd.MultiIndex.from_arrays([ts_raw, sym_raw],
                                                     names=["timestamp", "symbol"]))
-    #lab = lab.groupby(level=["timestamp", "symbol"]).mean().sort_index()
+    # lab = lab.groupby(level=["timestamp", "symbol"]).mean().sort_index()
 
     lab = lab.groupby(level=["timestamp", "symbol"]).mean().sort_index()  # ✅ keep
 
@@ -263,7 +266,7 @@ def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root
     else:
         # Try to synthesize a MultiIndex from columns/index
         if "timestamp" in feats.columns:
-            #ts_feat = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").tz_convert(None)
+            # ts_feat = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").tz_convert(None)
             ts_feat = (
                 pd.to_datetime(feats["timestamp"], utc=True, errors="coerce")
                 .dt.tz_localize(None)
@@ -285,7 +288,7 @@ def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root
             pd.Series("POOLED", index=feats.index, dtype="string")
         )
 
-        #fe_key = pd.MultiIndex.from_arrays([ts_feat.to_numpy(), sym_feat.to_numpy()],
+        # fe_key = pd.MultiIndex.from_arrays([ts_feat.to_numpy(), sym_feat.to_numpy()],
         #                                   names=["timestamp", "symbol"])
 
         # MultiIndex that matches feats row-for-row
@@ -294,7 +297,7 @@ def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root
             names=["timestamp", "symbol"]
         )
     # 4) Ensure unique, sorted feature key (pandas reindex requirement)
-    #fe_key = pd.MultiIndex.from_tuples(list(dict.fromkeys(fe_key.to_list())), names=["timestamp", "symbol"])
+    # fe_key = pd.MultiIndex.from_tuples(list(dict.fromkeys(fe_key.to_list())), names=["timestamp", "symbol"])
 
     # 4) DO NOT force uniqueness; preserve one-to-one length with feats
     # fe_key = pd.MultiIndex.from_tuples(list(dict.fromkeys(fe_key.to_list())), names=["timestamp", "symbol"])  # ❌ remove this
@@ -339,80 +342,11 @@ def build_pooled_core(symbols, out_dir: Path, start: str, end: str, parquet_root
     LOG.info("[pooled] core built at %s", out_dir)
 
 
-'''def fit_symbol_calibrator(symbol: str, pooled_dir: Path, start: str, end: str, parquet_root: str | Path):
-    """
-    Fit an isotonic calibrator for `symbol` using pooled PCA space.
-    Writes:  <pooled_dir>/calibrators/<SYMBOL>.isotonic.pkl
-             <pooled_dir>/calibrators/calibration_report.json (append/update entry)
-    """
-    pooled_dir = Path(pooled_dir)
-    cal_dir = pooled_dir / "calibrators"
-    cal_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load symbol slice
-    base = Path(parquet_root); p = base / f"symbol={symbol}"
-    df = pd.read_parquet(p, engine="pyarrow")
-    if df.empty:
-        raise RuntimeError(f"No data for calibrator: {symbol}")
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
-    df = df[(df["timestamp"] >= pd.to_datetime(start)) & (df["timestamp"] <= pd.to_datetime(end))]
-    if df.empty:
-        raise RuntimeError(f"No rows in window for calibrator: {symbol}")
-
-    # Labels: forward O->C return on next bar
-    df = df.sort_values(["symbol", "timestamp"])
-    next_open  = df.groupby("symbol")["open"].shift(-1)
-    next_close = df.groupby("symbol")["close"].shift(-1)
-    df["ret_fwd"] = (next_close / next_open - 1.0)
-
-    # Proxy 'raw score' for calibration: use sign-preserving scaled return as a stand-in
-    # (In P5 this will be your model's EV/probability)
-    score = df["ret_fwd"].fillna(0.0).clip(-0.02, 0.02).to_numpy()
-    # Binary target: did we beat 0?
-    y = (df["ret_fwd"] > 0).astype(int).to_numpy()
-
-    # Fit isotonic
-    iso = IsotonicRegression(out_of_bounds="clip")
-    # Map scores to [0,1] monotonically
-    p_hat = (score - score.min()) / (score.max() - score.min() + 1e-9)
-    iso.fit(p_hat, y)
-    joblib.dump(iso, cal_dir / f"{symbol}.isotonic.pkl")
-
-    # Basic quality numbers (wired now; thresholds enforced in P5)
-    try:
-        y_prob = iso.predict(p_hat)
-        auc = float(roc_auc_score(y, y_prob))
-        brier = float(brier_score_loss(y, y_prob))
-        # Simple ECE (10 bins)
-        bins = np.linspace(0, 1, 11)
-        idx = np.digitize(y_prob, bins) - 1
-        ece = 0.0
-        for b in range(10):
-            m = idx == b
-            if m.any():
-                ece += abs(y[m].mean() - y_prob[m].mean()) * (m.mean())
-        ece = float(ece)
-    except Exception:
-        auc, brier, ece = None, None, None
-
-    # Append/update symbol entry in calibration_report.json
-    rpt_path = cal_dir / "calibration_report.json"
-    try:
-        rpt = json.loads(rpt_path.read_text())
-    except Exception:
-        rpt = {}
-    rpt[symbol] = {"roc_auc": auc, "brier": brier, "ece": ece, "n": int(len(y))}
-    rpt_path.write_text(json.dumps(rpt, indent=2), encoding="utf-8")
-
-    LOG.info("[pooled] calibrator for %s written to %s", symbol, cal_dir)
-'''
-
-
 def rebuild_if_needed(
         artefact_dir: str | Path,
         parquet_root: str | Path,
         symbols: Sequence[str],
+        cfg: dict,
         start: str,
         end: str,
         n_clusters: int = 64,
@@ -425,21 +359,6 @@ def rebuild_if_needed(
     meta = _load_meta(artefact_dir / "meta.json")
 
     # Only skip if meta.json exactly matches our request params
-    '''if meta:
-        meta_start = str(meta.get("start"))
-        meta_end = str(meta.get("end"))
-        start_str = str(start)
-        end_str = str(end)
-
-        if (
-                meta_start == start_str
-                and meta_end == end_str
-                and meta.get("symbols") == list(symbols)
-                and meta.get("n_clusters") == n_clusters
-        ):
-            LOG.info("[artefacts] Artefacts up-to-date. Skipping rebuild.")
-            return'''
-
 
     if meta:
         meta_start = str(meta.get("start"))
@@ -449,11 +368,11 @@ def rebuild_if_needed(
         meta_hz = meta.get("label_horizon", "UNKNOWN")
 
         if (
-            meta_start == start_str
-            and meta_end == end_str
-            and meta.get("symbols") == list(symbols)
-            and meta.get("n_clusters") == n_clusters
-            and meta_hz == "O->C"
+                meta_start == start_str
+                and meta_end == end_str
+                and meta.get("symbols") == list(symbols)
+                and meta.get("n_clusters") == n_clusters
+                and meta_hz == "O->C"
         ):
             LOG.info("[artefacts] Artefacts up-to-date (label_horizon=%s). Skipping rebuild.", meta_hz)
             return
@@ -461,8 +380,6 @@ def rebuild_if_needed(
             LOG.info("[artefacts] Meta mismatch or horizon change (have=%s, need=O->C). Rebuilding…", meta_hz)
     else:
         LOG.info("[artefacts] No meta.json found. Rebuilding…")
-
-
 
     LOG.info("[artefacts] Artefacts outdated (range/symbols changed). Rebuilding…")
 
@@ -526,92 +443,6 @@ def rebuild_if_needed(
     # --- REFINEMENT: Use the artefact_dir for the pipeline's root ---
 
     # 2) Get features in the SAME PCA space as walk-forward
-    '''if fitted_pipeline_dir is not None:
-        pipe = CoreFeaturePipeline(parquet_root=Path(fitted_pipeline_dir))
-        feats = pipe.transform_mem(raw)  # ← NO FIT
-
-        # --- CONTRACT: feats must carry timestamp (+ symbol) aligned row-for-row ---
-        raw = raw.sort_values(["timestamp"]).reset_index(drop=True)
-
-        # If feats came back with a nontrivial index, drop it so we can align by position
-        feats = feats.reset_index(drop=True)
-
-        # 1) Ensure timestamp exists in feats
-        if "timestamp" not in feats.columns:
-            # Best assumption in your pipeline: transform_mem preserves row order
-            if len(feats) != len(raw):
-                raise RuntimeError(f"[rebuild] feats len {len(feats)} != raw len {len(raw)}; cannot attach timestamps")
-            feats["timestamp"] = raw["timestamp"].to_numpy()
-        else:
-            feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
-
-        # 2) Ensure symbol exists in feats (your labels are per-symbol)
-        if "symbol" not in feats.columns:
-            if len(feats) != len(raw):
-                raise RuntimeError(f"[rebuild] feats len {len(feats)} != raw len {len(raw)}; cannot attach symbols")
-            feats["symbol"] = raw["symbol"].astype("string").to_numpy()
-        else:
-            feats["symbol"] = feats["symbol"].astype("string")
-
-        # 3) Canonicalize timestamp to UTC-naive (matches your y_numeric_series)
-        feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
-        # -------------------------------------------------------------------------
-
-
-    else:
-        pipe = CoreFeaturePipeline(parquet_root=artefact_dir)
-        feats, _ = pipe.run_mem(raw)  # ← legacy path (fits)
-
-    #pipe = CoreFeaturePipeline(parquet_root=artefact_dir)
-    #feats, _ = pipe.run_mem(raw)
-
-    # 3) Resample minute data to DAILY to generate correct regime labels
-    daily_df = raw.set_index('timestamp').resample('D').agg({
-        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
-    }).dropna()
-    daily_regimes = label_days(daily_df, RegimeParams())
-
-    # Ensure all indexes are timezone-naive before joining
-    if 'timestamp' in feats.columns:
-        feats = feats.set_index('timestamp')
-    if feats.index.tz is not None:
-        feats.index = feats.index.tz_localize(None)
-
-    y_categorical = pd.Series(
-        feats.index.normalize().map(daily_regimes),
-        index=feats.index, name='regime'
-    ).ffill().bfill()
-
-    # 4) Generate numeric labels (forward returns)
-    raw = raw.sort_values(["symbol", "timestamp"])
-    raw["ret_fwd"] = raw.groupby("symbol")["open"].shift(-1) / raw["open"] - 1.0
-    y_numeric_series = pd.Series(
-        raw["ret_fwd"].values,
-        index=pd.to_datetime(raw["timestamp"]).dt.tz_localize(None),
-        name="ret_fwd"
-    )
-
-    # 4) Generate numeric labels (forward returns)  **O->C on NEXT bar**
-    raw = raw.sort_values(["symbol", "timestamp"])
-    next_open  = raw.groupby("symbol")["open"].shift(-1)
-    next_close = raw.groupby("symbol")["close"].shift(-1)
-    raw["ret_fwd"] = (next_close / next_open - 1.0)
-
-    y_numeric_series = pd.Series(
-        raw["ret_fwd"].values,
-        index=pd.to_datetime(raw["timestamp"]).dt.tz_localize(None),
-        name="ret_fwd"
-    )
-
-
-    # 5) Combine features and labels, then clean
-    df_combined = feats.join(y_numeric_series).join(y_categorical)
-    pca_cols = [c for c in feats.columns if c.startswith("pca_")]
-    required_cols = pca_cols + ["ret_fwd", "regime"]
-    df_clean = df_combined[required_cols].dropna()
-
-    if df_clean.empty:
-        raise RuntimeError("Data alignment resulted in an empty DataFrame. Check for NaNs or index mismatches.")'''
 
     # --- Canonical sort (IMPORTANT): raw order must be deterministic ----------
     raw = raw.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
@@ -621,12 +452,52 @@ def rebuild_if_needed(
         pipe = CoreFeaturePipeline(parquet_root=Path(fitted_pipeline_dir))
         _dbg(raw, "before transform_mem (raw)")
 
-        feats = pipe.transform_mem(raw)  # NO FIT (must preserve row order)
+        #feats = pipe.transform_mem(raw)  # NO FIT (must preserve row order)
+
+        from feature_engineering.utils.timegrid import standardize_bars_to_grid
+
+        # Pull canonical clock settings (MUST be passed into rebuild_if_needed)
+        #unified_clock = cfg.get("_unified_clock") or cfg.get("unified_clock")
+        unified_clock = cfg.get("_unified_clock", None)
+        if unified_clock is None:
+            unified_clock = cfg.get("unified_clock", None)
+
+        grid_seconds = int(cfg.get("_bar_grid_seconds", 60))
+
+        # unified_clock may be a DatetimeIndex; check emptiness safely
+        if unified_clock is None or (hasattr(unified_clock, "__len__") and len(unified_clock) == 0):
+            raise RuntimeError(
+                "[rebuild_if_needed] unified_clock missing. Must pass cfg['_unified_clock'] from run()."
+            )
+
+        #grid_seconds = int(cfg.get("_bar_grid_seconds", 60))
+
+        if unified_clock is None or len(unified_clock) == 0:
+            raise RuntimeError("[rebuild_if_needed] unified_clock missing. Must pass cfg['_unified_clock'] from run().")
+
+        raw_std, audits = standardize_bars_to_grid(
+            raw,
+            symbol_col="symbol",
+            ts_col="timestamp",
+            freq=f"{grid_seconds}s",
+            expected_freq_s=grid_seconds,
+            fill_volume_zero=True,
+            keep_ohlc_nan=True,
+            hard_fail_on_duplicates=False,
+            global_index=unified_clock,
+        )
+
+        # Safety: if still non-canonical, fail loud here (better error than deep in FE)
+        if audits:
+            bad = [a for a in audits if a.median_delta_s_out not in (None, float(grid_seconds))]
+            if bad:
+                raise RuntimeError(f"[rebuild_if_needed] non-canonical after standardize: {bad}")
+
+        feats = pipe.transform_mem(raw_std)  # NO FIT (must preserve row order)
+
         _dbg(feats, "after transform_mem (feats)")
 
         feats = feats.reset_index(drop=True)
-
-
 
         # --- CONTRACT: attach timestamp + symbol row-for-row ------------------
         if "timestamp" not in feats.columns:
@@ -649,13 +520,15 @@ def rebuild_if_needed(
         # Attach keys if pipeline didn't keep them
         if "timestamp" not in feats.columns:
             if len(feats) != len(raw):
-                raise RuntimeError(f"[rebuild] run_mem feats len {len(feats)} != raw len {len(raw)}; cannot attach timestamps")
+                raise RuntimeError(
+                    f"[rebuild] run_mem feats len {len(feats)} != raw len {len(raw)}; cannot attach timestamps")
             feats["timestamp"] = raw["timestamp"].to_numpy()
         feats["timestamp"] = pd.to_datetime(feats["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
 
         if "symbol" not in feats.columns:
             if len(feats) != len(raw):
-                raise RuntimeError(f"[rebuild] run_mem feats len {len(feats)} != raw len {len(raw)}; cannot attach symbols")
+                raise RuntimeError(
+                    f"[rebuild] run_mem feats len {len(feats)} != raw len {len(raw)}; cannot attach symbols")
             feats["symbol"] = raw["symbol"].astype("string").to_numpy()
         feats["symbol"] = feats["symbol"].astype("string")
 
@@ -684,7 +557,6 @@ def rebuild_if_needed(
     else:
         tmp = tmp.reset_index()
 
-
     # 3) Regime labels (by day) → broadcast to each (ts, sym)
 
     _dbg(raw, "before daily resample (raw)")
@@ -706,7 +578,7 @@ def rebuild_if_needed(
     ).ffill().bfill()
 
     # 4) Numeric labels: NEXT bar O->C return, per symbol
-    #raw_sorted = raw.reset_index().sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    # raw_sorted = raw.reset_index().sort_values(["symbol", "timestamp"]).reset_index(drop=True)
 
     _dbg(raw, "before raw_sorted build (raw)")
     # Force keys to live in columns (not index)
@@ -744,8 +616,6 @@ def rebuild_if_needed(
 
     # df_clean now has: pca_* + ret_fwd + regime and aligned MultiIndex
 
-
-
     # 6) Build centroids from the cleaned, aligned data
     LOG.info("Building clusters with data shape: %s", df_clean.shape)
     PathClusterEngine.build(
@@ -776,19 +646,19 @@ def rebuild_if_needed(
     LOG.info("[artefacts] Rebuild completed at %s (label_horizon=O->C)", artefact_dir)
 
 
-
-
 # --- 3.5: calibrator builder with quality metrics ---------------------------
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import json
 from sklearn.isotonic import IsotonicRegression
-from prediction_engine.calibration import calibrate_isotonic  # fits & persists iso  :contentReference[oaicite:2]{index=2}
+from prediction_engine.calibration import \
+    calibrate_isotonic  # fits & persists iso  :contentReference[oaicite:2]{index=2}
+
 
 def _ece(probs: np.ndarray, y: np.ndarray, bins: int = 10) -> float:
     probs = np.asarray(probs, float).ravel()
-    y     = np.asarray(y, float).ravel()
+    y = np.asarray(y, float).ravel()
     q = pd.qcut(pd.Series(probs), bins, duplicates="drop")
     df = pd.DataFrame({"p": probs, "y": y, "bin": q})
     g = df.groupby("bin", observed=True)
@@ -797,21 +667,25 @@ def _ece(probs: np.ndarray, y: np.ndarray, bins: int = 10) -> float:
     weights = g.size().to_numpy() / max(1, len(df))
     return float(np.sum(weights * np.abs(conf - frac)))
 
+
 def _brier(probs: np.ndarray, y: np.ndarray) -> float:
     probs = np.asarray(probs, float).ravel()
-    y     = np.asarray(y, float).ravel()
+    y = np.asarray(y, float).ravel()
     return float(np.mean((probs - y) ** 2))
+
 
 def _monotonic_adjacent_pairs(probs: np.ndarray, y: np.ndarray, bins: int = 10) -> int:
     probs = np.asarray(probs, float).ravel()
-    y     = np.asarray(y, float).ravel()
+    y = np.asarray(y, float).ravel()
     q = pd.qcut(pd.Series(probs), bins, duplicates="drop")
     df = pd.DataFrame({"p": probs, "y": y, "bin": q})
     # realized EV proxy = mean(y) per decile (works whether y∈{0,1} or small returns)
     m = df.groupby("bin", observed=True)["y"].mean().to_numpy()
     return int(np.sum(m[1:] >= m[:-1]))
 
-def _load_symbol_validation(mu_col: str, y_col: str, pooled_dir: Path, sym: str) -> tuple[np.ndarray, np.ndarray, float | None]:
+
+def _load_symbol_validation(mu_col: str, y_col: str, pooled_dir: Path, sym: str) -> tuple[
+    np.ndarray, np.ndarray, float | None]:
     """
     Minimal contract: find any per-symbol validation CSV/parquet nearby or in artifacts.
     Returns (mu_val, y_val, pooled_brier_benchmark)
@@ -824,9 +698,10 @@ def _load_symbol_validation(mu_col: str, y_col: str, pooled_dir: Path, sym: str)
     except Exception:
         rng = np.random.RandomState(abs(hash(sym)) % 10_000)
         mu_val = rng.normal(0, 0.2, size=120)
-        y_val  = (mu_val + rng.normal(0, 0.15, size=120) > 0).astype(float)
+        y_val = (mu_val + rng.normal(0, 0.15, size=120) > 0).astype(float)
         pooled_brier = 0.20  # placeholder benchmark; your real builder can compute this from pooled val
         return mu_val, y_val, pooled_brier
+
 
 # Unified builder: no report writing; return metrics; write only the .pkl
 def fit_symbol_calibrator(sym: str, pooled_dir: Path, start, end, parquet_root: Path):
@@ -854,17 +729,17 @@ def fit_symbol_calibrator(sym: str, pooled_dir: Path, start, end, parquet_root: 
             return None, None, None
         if df.empty or "timestamp" not in df:
             return None, None, None
-        #ts = pd.to_datetime(df["timestamp"], utc=True).tz_convert("UTC").tz_localize(None)
+        # ts = pd.to_datetime(df["timestamp"], utc=True).tz_convert("UTC").tz_localize(None)
 
         ts = pd.to_datetime(df["timestamp"], utc=True)
         ts = ts.dt.tz_localize(None)  # drop tz, keep UTC clock time as naive
 
         df = df.assign(timestamp=ts).sort_values(["timestamp"])
         df = df[(df["timestamp"] >= pd.to_datetime(start_ts)) & (df["timestamp"] <= pd.to_datetime(end_ts))]
-        if df.empty or not {"open","close"}.issubset(df.columns):
+        if df.empty or not {"open", "close"}.issubset(df.columns):
             return None, None, None
         # Forward O->C on next bar: proxy for direction
-        next_open  = df["open"].shift(-1)
+        next_open = df["open"].shift(-1)
         next_close = df["close"].shift(-1)
         ret_fwd = (next_close / next_open - 1.0).astype(float)
         # Stand-in score (until real EV/prob is wired here in P5):
@@ -878,7 +753,7 @@ def fit_symbol_calibrator(sym: str, pooled_dir: Path, start, end, parquet_root: 
         # --- Fallback: synthetic validation --------------------------------
         rng = np.random.default_rng(abs(hash(sym)) % 10_000)
         mu_val = rng.normal(0, 0.2, size=200)
-        y_val  = (mu_val + rng.normal(0, 0.15, size=200) > 0).astype(float)
+        y_val = (mu_val + rng.normal(0, 0.15, size=200) > 0).astype(float)
         pooled_brier = 0.20
 
     # Fit isotonic on normalized score → prob
@@ -891,7 +766,8 @@ def fit_symbol_calibrator(sym: str, pooled_dir: Path, start, end, parquet_root: 
     # Metrics for manager gates
     def _ece(probs: np.ndarray, y: np.ndarray, bins: int = 10) -> float:
         import pandas as pd, numpy as np
-        probs = np.asarray(probs, float).ravel(); y = np.asarray(y, float).ravel()
+        probs = np.asarray(probs, float).ravel();
+        y = np.asarray(y, float).ravel()
         q = pd.qcut(pd.Series(probs), bins, duplicates="drop")
         df = pd.DataFrame({"p": probs, "y": y, "bin": q})
         g = df.groupby("bin", observed=True)
@@ -902,7 +778,8 @@ def fit_symbol_calibrator(sym: str, pooled_dir: Path, start, end, parquet_root: 
 
     def _brier(probs: np.ndarray, y: np.ndarray) -> float:
         import numpy as np
-        probs = np.asarray(probs, float).ravel(); y = np.asarray(y, float).ravel()
+        probs = np.asarray(probs, float).ravel();
+        y = np.asarray(y, float).ravel()
         return float(np.mean((probs - y) ** 2))
 
     try:
@@ -933,7 +810,7 @@ def fit_symbol_calibrator(sym: str, pooled_dir: Path, start, end, parquet_root: 
         import pandas as pd
         q = pd.qcut(pd.Series(p_hat), 10, duplicates="drop")
         rel = pd.DataFrame({"p": p_hat, "y": y_val, "bin": q}).groupby("bin", observed=True).agg(
-            conf=("p","mean"), frac=("y","mean"), n=("y","size")
+            conf=("p", "mean"), frac=("y", "mean"), n=("y", "size")
         ).reset_index(drop=True)
         rel.to_csv(cal_dir / f"{sym}.reliability.csv", index=False)
     except Exception:

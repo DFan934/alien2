@@ -272,11 +272,25 @@ def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols:
     if not parts:
         return pd.DatetimeIndex([], tz="UTC")
 
-    uni = pd.Index(pd.concat(parts, ignore_index=True).unique())
+    '''uni = pd.Index(pd.concat(parts, ignore_index=True).unique())
     #uni = pd.to_datetime(uni, utc=True).floor("T").sort_values().unique()
     uni = pd.to_datetime(uni, utc=True).floor("min").sort_values().unique()
 
-    return pd.DatetimeIndex(uni, tz="UTC")
+    return pd.DatetimeIndex(uni, tz="UTC")'''
+
+    if not parts:
+        return pd.DatetimeIndex([], tz="UTC")
+
+    all_ts = pd.to_datetime(pd.concat(parts, ignore_index=True), utc=True, errors="coerce").dropna()
+    if all_ts.empty:
+        return pd.DatetimeIndex([], tz="UTC")
+
+    mn = all_ts.min().floor("min")
+    mx = all_ts.max().floor("min")
+
+    # CRITICAL: continuous 60s grid, even if the symbol is sparse
+    return pd.date_range(start=mn, end=mx, freq="60s", tz="UTC")
+
 
 
 '''def _timestamp_overlap_share(
@@ -523,6 +537,36 @@ def run_batch(
 
     print("[PARQUET] root:", pq_root)
 
+    # ------------------------------------------------------------------
+    # Phase 2.1 — Build ONE canonical universe clock (minute grid) and
+    #            reuse it everywhere (prevents per-symbol min..max expansion)
+    # ------------------------------------------------------------------
+    unified_clock = build_unified_clock(
+        pq_root,
+        start,
+        end,
+        symbols,
+    )
+
+    (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (artifacts_root / "diagnostics" / "unified_clock.json").write_text(
+        json.dumps(
+            {
+                "n": int(len(unified_clock)),
+                "min_ts": str(unified_clock.min()) if len(unified_clock) else None,
+                "max_ts": str(unified_clock.max()) if len(unified_clock) else None,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[Clock] unified minutes={len(unified_clock)} "
+        f"min={unified_clock.min() if len(unified_clock) else None} "
+        f"max={unified_clock.max() if len(unified_clock) else None}"
+    )
+
     '''bars = []
     for s in symbols:
         df_s = _load_bars_for_symbol(
@@ -755,15 +799,26 @@ def run_batch(
 
         _dbg_symbols(bars, "C_BEFORE_TIMEGRID")
 
-        bars, _ = standardize_bars_to_grid(
+        bars, grid_audits = standardize_bars_to_grid(
             bars,
             symbol_col="symbol",
             ts_col="timestamp",
             freq="60s",
             expected_freq_s=60,
+            global_index=unified_clock,
             fill_volume_zero=True,
             keep_ohlc_nan=True,
         )
+
+        # Persist grid audit (always)
+        try:
+            (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+            (artifacts_root / "diagnostics" / "grid_audit.json").write_text(
+                json.dumps(grid_audit_to_json(grid_audits), indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[WARN] failed to write diagnostics/grid_audit.json: {e}")
 
         _dbg_symbols(bars, "D_AFTER_TIMEGRID")
 
@@ -820,7 +875,7 @@ def run_batch(
         # enforce only on top-level portfolio runs requesting >= 2 symbols
         default_enforce = (not is_fold_run) and (requested_n >= 2)
 
-        
+
 
         enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", default_enforce))
 
@@ -2791,7 +2846,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         )
     except Exception as e:
         print(f"[Scanner-INPUT] {sym} (failed to print) err={type(e).__name__}: {e}")
-
+    '''
     mask = detector(df_raw)
 
     # --- Scanner diagnostics (OUTPUT) ---
@@ -2903,6 +2958,21 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         for a in grid_audits:
             print(" ", a)
 
+    # ---------------- HARD FAIL: grid health ----------------
+    if grid_audits:
+        # If we expanded to a nonsense clock, non-null close collapses.
+        close_pct = {
+            a.symbol: 1.0 - float(a.missing_ratio_out)  # missing_ratio_out approximates how much was introduced
+            for a in grid_audits
+        }
+        # You can tune this threshold; the point is "catch the 24h expansion bug instantly".
+        too_sparse = {sym: pct for sym, pct in close_pct.items() if pct < 0.20}
+        if too_sparse:
+            raise SystemExit(
+                f"[ABORT] Grid health failed: non-null close too low (likely bad clock expansion): {too_sparse}"
+            )
+    # --------------------------------------------------------
+
     #df_raw = df_raw.loc[mask].reset_index(drop=True)
 
     df_raw = df_raw.loc[mask].copy()  # keep original index so fold merge can key on it
@@ -2918,6 +2988,96 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     df_raw["adv_shares"] = df_raw["volume"].rolling(20, min_periods=1).mean()
     df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
+    '''
+
+    # -----------------------------
+    # 1) Start from RAW bars (never mutate "full" into "scan")
+    # -----------------------------
+    df_full = df_raw.copy()
+    df_full = df_full.sort_values("timestamp").reset_index(drop=True)
+
+    # Enrich (OK to do on full; detector will run on observed subset)
+    df_full["trigger_ts"] = df_full["timestamp"]
+    volume_ma = df_full["volume"].rolling(window=20, min_periods=1).mean()
+    df_full["volume_spike_pct"] = (df_full["volume"] / volume_ma) - 1.0
+    df_full["volume_spike_pct"] = df_full["volume_spike_pct"].fillna(0.0)
+    df_full["prev_close"] = df_full["close"].shift(1)
+
+    detector = build_detectors(dev_loose=bool(cfg.get("dev_scanner_loose", False)))
+    if cfg.get("dev_detector_mode", "").upper() in {"OR", "AND"}:
+        detector.mode = cfg["dev_detector_mode"].upper()
+
+    # -----------------------------
+    # 2) Build df_obs (observed rows only) for scanning.
+    #    IMPORTANT: scan should NOT redefine df_full / cadence.
+    # -----------------------------
+    df_obs = df_full.loc[df_full["close"].notna()].copy()
+    print(
+        f"[Scanner-INPUT] {sym} rows_obs={len(df_obs)} "
+        f"ts_min={df_obs['timestamp'].min()} ts_max={df_obs['timestamp'].max()}"
+    )
+
+    mask = detector(df_obs)
+    mask = pd.Series(mask, index=df_obs.index).astype(bool)
+
+    df_scanned_obs = df_obs.loc[mask].copy()
+    print(
+        f"[Scanner-OUTPUT] {sym} rows={len(df_scanned_obs)} "
+        f"kept_pct={len(df_scanned_obs) / max(len(df_obs), 1):.2%}"
+    )
+
+    # Keep scan timestamps (these are the "entry candidate" instants)
+    scan_ts = df_scanned_obs["timestamp"].dropna().unique()
+
+    # -----------------------------
+    # 3) STANDARDIZE FULL bars to the canonical 60s grid (using unified clock from run())
+    # -----------------------------
+    from feature_engineering.utils.timegrid import standardize_bars_to_grid
+
+    unified_clock = cfg.get("_unified_clock")
+    grid_seconds = int(cfg.get("_bar_grid_seconds", 60))
+    if unified_clock is None or len(unified_clock) == 0:
+        raise SystemExit("[ABORT] unified_clock missing/empty in cfg. Build it in run() and store cfg['_unified_clock'].")
+
+    df_full_std, grid_audits = standardize_bars_to_grid(
+        df_full,
+        symbol_col="symbol",
+        ts_col="timestamp",
+        freq=f"{grid_seconds}s",
+        expected_freq_s=grid_seconds,
+        fill_volume_zero=True,
+        keep_ohlc_nan=True,
+        hard_fail_on_duplicates=False,
+        global_index=unified_clock,   # <<< CRITICAL: ensures we use the same canonical clock
+    )
+
+    # Optional audit prints
+    if grid_audits:
+        bad = [a for a in grid_audits if (a.median_delta_s_out not in (None, float(grid_seconds)))]
+        if bad:
+            print("[GridAudit] non-canonical after standardize:", bad)
+        print("[GridAudit] summary:")
+        for a in grid_audits:
+            print(" ", a)
+
+    # IMPORTANT: df_full used downstream MUST be the standardized one
+    df_full = df_full_std.sort_values("timestamp").reset_index(drop=True)
+    df_full["_bar_id"] = np.arange(len(df_full), dtype=np.int64)
+
+    # -----------------------------
+    # 4) Build df_scanned as a timestamp-subset of the STANDARDIZED FULL bars
+    # -----------------------------
+    df_scanned = df_full.loc[df_full["timestamp"].isin(scan_ts)].copy()
+
+    # Attach ADV stats on scanned subset (sizer / cost modeling)
+    df_scanned["adv_shares"] = df_scanned["volume"].rolling(20, min_periods=1).mean()
+    df_scanned["adv_dollars"] = df_scanned["adv_shares"] * df_scanned["close"]
+
+    # From here on:
+    #   - pass df_full (standardized 60s) into WalkForwardRunner as df_full
+    #   - pass df_scanned into WalkForwardRunner as df_scanned
+    df_raw = df_scanned  # keep your existing variable name usage below
+
 
     # --- Test-only override: force constant p to exercise the full Phase-4 pipeline on bare OHLCV hives ---
     unit_p = float(cfg.get("unit_test_force_constant_p", float("nan")))
@@ -2930,7 +3090,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         dec["p_cal"] = unit_p
         dec["horizon_bars"] = int(cfg.get("horizon_bars", 3))
 
-        # AFTER creating `dec` with p_raw/p_cal and before sizing:
+        # AFTER creating dec with p_raw/p_cal and before sizing:
         # Attach quick y for sign check using open->open over H bars
         H = int(cfg.get("horizon_bars", 3))
         tmp = df_full[["timestamp", "symbol", "open"]].copy()
@@ -2967,7 +3127,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         if len(trades):
             trades.to_parquet(sym_dir / "trades.parquet", index=False)
 
-        # Short-circuit the per-symbol runner in this test mode; aggregation runs later in `run()`
+        # Short-circuit the per-symbol runner in this test mode; aggregation runs later in run()
         return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
 
 
@@ -3037,6 +3197,14 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     )'''
 
+    # --- pull unified clock + grid settings computed in run()
+    unified_clock = cfg.get("_unified_clock")
+    grid_seconds = int(cfg.get("_bar_grid_seconds", 60))
+
+    if unified_clock is None or len(unified_clock) == 0:
+        raise SystemExit(
+            "[ABORT] unified_clock missing/empty in cfg. Build it in run() and store cfg['_unified_clock'].")
+
     # Example of passing builders
     from scripts.rebuild_artefacts import build_pooled_core, fit_symbol_calibrator
     am.fit_or_load(
@@ -3044,9 +3212,28 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         strategy="pooled",
         config_hash_parts=cfg_hash_parts,
         schema_hash_parts=schema_hash_parts,
-        pooled_builder=lambda syms, out_dir, s, e: build_pooled_core(syms, out_dir, s, e, am.parquet_root,
-                                                                     n_clusters=int(cfg.get("k_max", 64))),
-        calibrator_builder=lambda sym, pooled_dir, s, e: fit_symbol_calibrator(sym, pooled_dir, s, e, am.parquet_root),
+
+
+        #pooled_builder=lambda syms, out_dir, s, e: build_pooled_core(syms, out_dir, s, e, am.parquet_root,
+
+        #unified_clock=cfg.get("_unified_clock", None),
+        #grid_seconds = int(cfg.get("_bar_grid_seconds", cfg.get("bar_grid_seconds", 60))),
+
+        #from scripts.rebuild_artefacts import build_pooled_core
+
+        pooled_builder = lambda syms, out_dir, s, e: build_pooled_core(
+            syms,
+            out_dir,
+            s,
+            e,
+            am.parquet_root,
+            n_clusters=int(cfg.get("k_max", 64)),
+            global_index=unified_clock,
+            grid_seconds=grid_seconds,
+        ),
+
+        #n_clusters=int(cfg.get("k_max", 64)),
+        calibrator_builder=lambda sym, pooled_dir, s, e: fit_symbol_calibrator(sym, pooled_dir, s, e, am.parquet_root)
     )
 
     print("[RAW DF] rows=", len(df_full))
@@ -3077,6 +3264,18 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     #_preflight_symbol_loads(cfg, symbols, base_artifacts_root)
 
+    '''runner = WalkForwardRunner(
+        artifacts_root=base_artifacts_root,
+        parquet_root=resolved_parquet_root,
+        ev_artifacts_root=_resolve_path(cfg["artefacts"]),
+        symbol=sym,
+        horizon_bars=int(cfg.get("horizon_bars", 20)),
+        longest_lookback_bars=int(cfg.get("longest_lookback_bars", 60)),
+        p_gate_q=float(cfg.get("p_gate_quantile", 0.65)),
+        full_p_q=float(cfg.get("full_p_quantile", 0.80)),
+        debug_no_costs=bool(cfg.get("debug_no_costs", False)),
+    )'''
+
     runner = WalkForwardRunner(
         artifacts_root=base_artifacts_root,
         parquet_root=resolved_parquet_root,
@@ -3087,6 +3286,10 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         p_gate_q=float(cfg.get("p_gate_quantile", 0.65)),
         full_p_q=float(cfg.get("full_p_quantile", 0.80)),
         debug_no_costs=bool(cfg.get("debug_no_costs", False)),
+
+        # ADD THESE TWO:
+        unified_clock=cfg.get("_unified_clock"),
+        bar_grid_seconds=int(cfg.get("_bar_grid_seconds", 60)),
     )
 
     # metadata
@@ -3129,7 +3332,8 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     _ = runner.run(
         df_full=df_full,
-        df_scanned=df_raw,
+        #df_scanned=df_raw,
+        df_scanned=df_scanned,
         start=cfg["start"],
         end=cfg["end"],
         calibrator_fn=lambda mu_val, y_val: _fit_isotonic_from_val(
@@ -3491,8 +3695,16 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # Phase 4.1: build the unified clock (audit only; scoring loop refactor comes later)
     uni_clock = build_unified_clock(parquet_root, cfg["start"], cfg["end"], symbols)
+
+    # --- Make unified clock available to all downstream builders (pooled core, per-symbol, etc.)
+    cfg["_unified_clock"] = uni_clock
+    cfg["_bar_grid_seconds"] = int(cfg.get("bar_grid_seconds", 60))  # canonical bar grid
+
     print(f"[Clock] unified minutes = {len(uni_clock)} from {uni_clock.min() if len(uni_clock) else '∅'} "
           f"to {uni_clock.max() if len(uni_clock) else '∅'}")
+
+    #cfg["_unified_clock"] = uni_clock
+    #cfg["_bar_grid_seconds"] = grid_seconds
 
     # after uni_clock built
     cover = {}
@@ -3650,10 +3862,52 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     cov = bars_std.groupby("symbol")["close"].apply(lambda s: s.notna().mean()).to_dict()'''
 
-    bars_std, grid_audits = standardize_bars_to_grid(
+    '''bars_std, grid_audits = standardize_bars_to_grid(
         bars_all,
         # keep your existing args here
+    )'''
+
+    # ------------------------------------------------------------------
+    # Build unified_clock from observed timestamps (prevents 24h expansion)
+    # ------------------------------------------------------------------
+    ts = pd.to_datetime(bars_all["timestamp"], utc=True, errors="coerce")
+    ts = ts.dropna().dt.floor(f"{grid_seconds}s")
+
+    unified_clock = pd.DatetimeIndex(ts.unique()).sort_values()
+
+    if len(unified_clock) == 0:
+        raise SystemExit("[ABORT] unified_clock is empty (no valid timestamps).")
+
+    print(
+        f"[Clock] unified minutes={len(unified_clock)} "
+        f"min={unified_clock.min()} max={unified_clock.max()}"
     )
+
+    bars_std, grid_audits = standardize_bars_to_grid(
+        bars_all,
+        symbol_col="symbol",
+        ts_col="timestamp",
+        freq=f"{grid_seconds}s",
+        expected_freq_s=int(grid_seconds),
+        global_index=unified_clock,
+        fill_volume_zero=True,
+        keep_ohlc_nan=True,
+        hard_fail_on_duplicates=False,
+    )
+
+    # --- HARD ASSERT: we must be using the unified trading-minutes clock ---
+    if unified_clock is None or len(unified_clock) == 0:
+        raise SystemExit("[ABORT] unified_clock is empty; cannot standardize to canonical grid.")
+
+    # grid_audits[0].n_rows_out should equal len(unified_clock) (same for every symbol)
+    if grid_audits:
+        expected = int(len(unified_clock))
+        bad = [a for a in grid_audits if int(a.n_rows_out) != expected]
+        if bad:
+            raise SystemExit(
+                "[ABORT] timegrid used the WRONG clock (likely min→max date_range expansion). "
+                f"Expected n_rows_out={expected}, got={[(a.symbol, a.n_rows_out) for a in bad]}"
+            )
 
     cov = bars_std.groupby("symbol")["close"].apply(lambda s: s.notna().mean()).to_dict()
     print("[Grid] per-symbol non-null close %:", cov)
@@ -3663,6 +3917,21 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print("[GridAudit] rows:")
         for a in grid_audits:
             print(" ", a)
+
+    # ---------------- HARD FAIL: grid health ----------------
+    if grid_audits:
+        # If we expanded to a nonsense clock, non-null close collapses.
+        close_pct = {
+            a.symbol: 1.0 - float(a.missing_ratio_out)  # missing_ratio_out approximates how much was introduced
+            for a in grid_audits
+        }
+        # You can tune this threshold; the point is "catch the 24h expansion bug instantly".
+        too_sparse = {sym: pct for sym, pct in close_pct.items() if pct < 0.20}
+        if too_sparse:
+            raise SystemExit(
+                f"[ABORT] Grid health failed: non-null close too low (likely bad clock expansion): {too_sparse}"
+            )
+    # --------------------------------------------------------
 
     print("[Grid] per-symbol non-null close %:", cov)
 
