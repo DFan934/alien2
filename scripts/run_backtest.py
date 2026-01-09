@@ -469,7 +469,8 @@ def run_batch(
         )
 
     # Unified output directory alias (kept for backward compatibility)
-    out_dir = artifacts_root
+    #out_dir = artifacts_root
+    out_dir = Path(cfg["artifacts_root"])
 
     # ------------------------------------------------------------------
     # EV artifacts directory
@@ -2095,6 +2096,37 @@ def _find_symbol_outputs(artifacts_root: Path, sym: str) -> dict:
 
 
 
+from pathlib import Path
+import pandas as pd
+
+def _ensure_utc_ts(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+    if df is None or df.empty or col not in df.columns:
+        return df
+    out = df.copy()
+    out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
+    return out
+
+def _write_symbol_outputs(artifacts_root: Path, sym: str,
+                          decisions: pd.DataFrame | None,
+                          trades: pd.DataFrame | None) -> None:
+    sym_root = Path(artifacts_root) / sym
+    sym_root.mkdir(parents=True, exist_ok=True)
+
+    if decisions is not None and not decisions.empty:
+        d = _ensure_utc_ts(decisions, "timestamp")
+        # if you have decision_ts too:
+        if "decision_ts" in d.columns:
+            d["decision_ts"] = pd.to_datetime(d["decision_ts"], utc=True, errors="coerce")
+        d.to_parquet(sym_root / "decisions.parquet", index=False)
+
+    if trades is not None and not trades.empty:
+        t = _ensure_utc_ts(trades, "timestamp")
+        t.to_parquet(sym_root / "trades.parquet", index=False)
+
+    print(f"[Emit] {sym} decisions={0 if decisions is None else len(decisions)} "
+          f"trades={0 if trades is None else len(trades)} → {sym_root}")
+
+
 def _overlap_metrics(bars: pd.DataFrame, *, ts_col="timestamp", symbol_col="symbol") -> dict:
     """
     Returns:
@@ -2182,6 +2214,17 @@ def _aggregate_universe_outputs(artifacts_root: Path, symbols: list[str]) -> tup
 
     dec = pd.concat(all_decisions, ignore_index=True) if all_decisions else pd.DataFrame()
     trd = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+
+    print("[DIAG][AGG] FINAL decisions rows=", len(dec), "cols=", list(dec.columns))
+    if "symbol" in dec.columns:
+        print("[DIAG][AGG] decisions symbols:", dec["symbol"].value_counts().to_dict())
+    else:
+        print("[DIAG][AGG][WARN] decisions has NO symbol column")
+
+    print("[DIAG][AGG] FINAL trades rows=", len(trd), "cols=", list(trd.columns))
+    if "symbol" in trd.columns:
+        print("[DIAG][AGG] trades symbols:", trd["symbol"].value_counts().to_dict())
+
     return dec, trd
 
 
@@ -2803,12 +2846,28 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     if not bool(cfg.get("verbose_print", False)):
         logging.getLogger().setLevel(logging.WARNING)
 
+    from pathlib import Path
+
+    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+
+    # If you have a run_dir / RUN_ID folder, use it; otherwise include it explicitly:
+    run_dir = arte_root / RUN_ID  # or however you define your per-run directory
+    out_dir = run_dir / sym
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sym_dir = out_dir  # single source of truth
+
     print(f"[OneSym-START] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
 
 
     # 1) Load bars for this symbol
     df_raw = _load_bars_for_symbol(cfg, sym)
 
+    print(f"[DIAG][RAW] {sym} rows={len(df_raw)} cols={list(df_raw.columns)}")
+    if len(df_raw):
+        print(f"[DIAG][RAW] {sym} ts_min={df_raw['timestamp'].min()} ts_max={df_raw['timestamp'].max()}")
+        print(f"[DIAG][RAW] {sym} dup_ts={df_raw['timestamp'].duplicated().sum()}")
+        print(f"[DIAG][RAW] {sym} null_ts={df_raw['timestamp'].isna().sum()}")
 
     print(f"[OneSym-AFTER-LOAD] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
 
@@ -3120,7 +3179,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         )
 
         # Persist per-symbol artifacts so the Phase-4.7 aggregator can pick them up
-        sym_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
+        '''sym_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
         sym_dir.mkdir(parents=True, exist_ok=True)
         if len(sized):
             sized.to_parquet(sym_dir / "decisions.parquet", index=False)
@@ -3129,7 +3188,17 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
         # Short-circuit the per-symbol runner in this test mode; aggregation runs later in run()
         return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
+        '''
 
+        sym_dir = out_dir
+        sym_dir.mkdir(parents=True, exist_ok=True)
+
+        if len(sized):
+            sized.to_parquet(sym_dir / "decisions.parquet", index=False)
+        if len(trades):
+            trades.to_parquet(sym_dir / "trades.parquet", index=False)
+
+        return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
 
     # 2) Walk-forward runner (unchanged, but pass symbol)
     resolved_parquet_root = _resolve_path(cfg["parquet_root"])
@@ -3205,6 +3274,14 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         raise SystemExit(
             "[ABORT] unified_clock missing/empty in cfg. Build it in run() and store cfg['_unified_clock'].")
 
+    print("[DIAG][CLOCK] unified_clock type=", type(unified_clock))
+    try:
+        print("[DIAG][CLOCK] unified_clock len=", len(unified_clock))
+        if len(unified_clock) > 0:
+            print("[DIAG][CLOCK] clock min/max =", unified_clock[0], unified_clock[-1])
+    except Exception as e:
+        print("[DIAG][CLOCK] could not inspect unified_clock:", repr(e))
+
     # Example of passing builders
     from scripts.rebuild_artefacts import build_pooled_core, fit_symbol_calibrator
     am.fit_or_load(
@@ -3260,7 +3337,9 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     # Canonical Phase 1.1 run directory: <repo_root>/artifacts/a2_<RUN_ID>
     base_artifacts_root = resolve_artifacts_root(cfg, run_id=RUN_ID, create=True)
-    cfg["artifacts_root"] = str(base_artifacts_root)
+    #cfg["artifacts_root"] = str(base_artifacts_root)
+
+
 
     #_preflight_symbol_loads(cfg, symbols, base_artifacts_root)
 
@@ -3277,7 +3356,8 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     )'''
 
     runner = WalkForwardRunner(
-        artifacts_root=base_artifacts_root,
+        #artifacts_root=base_artifacts_root,
+        artifacts_root=sym_dir,
         parquet_root=resolved_parquet_root,
         ev_artifacts_root=_resolve_path(cfg["artefacts"]),
         symbol=sym,
@@ -3375,12 +3455,20 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     print(f"[REPORT] sym={sym} csv_path_for_report={csv_path_for_report}")
 
-    generate_report(
+    '''generate_report(
         artifacts_root=cfg.get("artifacts_root", "artifacts/a2"),
         csv_path=csv_path_for_report,
-    )
+    )'''
 
-    return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(cfg.get("artifacts_root", "artifacts/a2"))}])
+    generate_report(artifacts_root=str(sym_dir), csv_path=csv_path_for_report)
+
+    #return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(cfg.get("artifacts_root", "artifacts/a2"))}])
+
+    return pd.DataFrame([{
+        "run_id": RUN_ID,
+        "symbol": sym,
+        "out_dir": str(out_dir),
+    }])
 
 
 def _score_minute_batch_shim(ev_engine, minute_df: pd.DataFrame) -> pd.DataFrame:
@@ -3559,6 +3647,12 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     #logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
     #log = logging.getLogger("backtest")
 
+    DIAG = bool(cfg.get("diag", True))  # default True while debugging
+
+    def dprint(*a, **k):
+        if DIAG:
+            print(*a, **k)
+
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
     log = logging.getLogger("backtest")
     _install_print_filter(enable_verbose=bool(cfg.get("verbose_print", False)))
@@ -3612,6 +3706,16 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     cfg["artifacts_root"] = str(arte_root)  # canonical absolute (repo-root based)
 
     print(f"[RunContext] artifacts_root={arte_root}")
+
+    from pathlib import Path
+    root = Path(cfg["artifacts_root"]).expanduser().resolve()
+    print("[DIAG][ROOT] cfg['artifacts_root'] =", cfg["artifacts_root"])
+    print("[DIAG][ROOT] resolved artifacts_root =", str(root))
+    print("[DIAG][ROOT] exists? ", root.exists())
+    print("[DIAG][ROOT] cwd =", str(Path.cwd()))
+
+    if "scripts\\artifacts" in str(root).lower():
+        dprint("[DIAG][ROOT][WARN] artifacts_root is under scripts/ — this is usually the split-root bug:", root)
 
     _write_run_context_json(
         arte_root,
@@ -3960,11 +4064,20 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     results = []
     for sym in symbols_requested:
         sym = str(sym)
-        sym_cfg = copy.deepcopy(cfg)
+        '''sym_cfg = copy.deepcopy(cfg)
         sym_cfg["symbol"] = sym
 
         log.info(f"=== Running backtest for {sym} ===")
+        res = await _run_one_symbol(sym, sym_cfg)'''
+        sym_cfg = copy.deepcopy(cfg)
+        sym_cfg["symbol"] = sym
+
+        sym_root = (Path(cfg["artifacts_root"]) / sym)
+        sym_root.mkdir(parents=True, exist_ok=True)
+        sym_cfg["artifacts_root"] = str(sym_root)
+
         res = await _run_one_symbol(sym, sym_cfg)
+
         results.append(res)
 
     '''missing = set(symbols_requested) - set(scanner_seen_symbols)
@@ -4266,7 +4379,24 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         trd = pd.read_parquet(trd_path)
         trd.to_parquet(port_dir / "trades.parquet", index=False)
 
+    root = Path(cfg["artifacts_root"]).expanduser().resolve()
+    root_dec = root / "decisions.parquet"
+    root_trd = root / "trades.parquet"
+    print("[DIAG][FILES] root decisions.parquet exists?", root_dec.exists(),
+           "size=", (root_dec.stat().st_size if root_dec.exists() else None))
+    print("[DIAG][FILES] root trades.parquet exists?", root_trd.exists(),
+           "size=", (root_trd.stat().st_size if root_trd.exists() else None))
+
     print(f"[Portfolio] mirrored consolidated → {port_dir}")
+
+    if {"timestamp", "symbol"}.issubset(dec.columns) and len(dec):
+        per_ts = dec.groupby("timestamp")["symbol"].nunique()
+        print("[DIAG][DEC] per-timestamp nunique(symbol) summary:",
+               per_ts.describe().to_dict())
+        print("[DIAG][DEC] worst 10 timestamps (lowest symbol count):")
+        print(per_ts.sort_values().head(10))
+        print("[DIAG][DEC] best 10 timestamps (highest symbol count):")
+        print(per_ts.sort_values(ascending=False).head(10))
 
     # --- Ensure portfolio equity curve exists (even if earlier branch skipped) ---
     try:
@@ -4384,7 +4514,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             print(f"[Diag] Skipped EV-by-decile: {_e!r}")
 
         # unified clock sanity: timestamps with >=2 symbols
-        if {'timestamp','symbol'}.issubset(dec.columns):
+        '''if {'timestamp','symbol'}.issubset(dec.columns):
             multi = (dec.groupby('timestamp')['symbol'].nunique() >= 2).mean()
             print("share of timestamps with >=2 symbols present:", round(float(multi), 3))
             # Phase 1.1 hard gate: do not proceed to portfolio artifacts if overlap is too low
@@ -4393,7 +4523,57 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                 raise RuntimeError(
                     f"[GATE] multi-symbol share < {min_share:.2f} "
                     f"(got {float(multi):.3f}). Refusing to emit/accept portfolio artifacts."
-                )
+                )'''
+
+        # --- Portfolio acceptance: require true multi-symbol RUN + sufficient REAL-bar overlap ---
+
+        print("[Phase-4] decisions by symbol:",
+              dec["symbol"].value_counts().to_dict() if "symbol" in dec.columns else "NO SYMBOL COL")
+
+        # also check what per-symbol decision files exist on disk
+        root = Path(cfg["artifacts_root"]).expanduser().resolve()
+        for s in symbols:
+            p = root / s / "decisions.parquet"
+            print(f"[Phase-4] exists? {s}/decisions.parquet:", p.exists(), "size=",
+                  (p.stat().st_size if p.exists() else None))
+
+        # IMPORTANT: Do NOT gate on "decision timestamp overlap" because decisions are event-driven.
+        # Gate on the REAL-bar overlap computed after timegrid standardization and written to overlap_audit.json.
+        try:
+            # 1) Require that decisions actually contain >=2 symbols somewhere
+            if "symbol" in dec.columns:
+                n_dec_syms = int(dec["symbol"].nunique())
+                print("[Phase-4] decisions n_symbols:", n_dec_syms)
+                if n_dec_syms < 2:
+                    raise RuntimeError(
+                        "[GATE] decisions contain <2 symbols overall. "
+                        "This is not a multi-symbol portfolio run; refusing portfolio artifacts."
+                    )
+
+            # 2) Use REAL-bar overlap gate output (authoritative)
+            audit_fp = artifacts_root / "overlap_audit.json"
+
+            print("[DIAG][OVERLAP] writing audit to:", str(audit_fp))
+            #print("[DIAG][OVERLAP] audit payload:", audit_dict)  # whatever dict you build
+            #audit_fp.write_text(json.dumps(audit_dict, indent=2), encoding="utf-8")
+            #print("[DIAG][OVERLAP] wrote overlap_audit.json size=", audit_fp.stat().st_size)
+
+
+            if audit_fp.exists():
+                audit = json.loads(audit_fp.read_text(encoding="utf-8"))
+                overlap = float(audit.get("overlap_share_ge2", 0.0))
+                min_required = float(cfg.get("min_overlap_share_ge2", audit.get("min_required", 0.10)))
+                print(f"[Phase-4] overlap_share_ge2 (REAL bars)={overlap:.4f} (min_required={min_required:.2f})")
+
+                if overlap < min_required:
+                    raise RuntimeError(
+                        f"[GATE] REAL-bar multi-symbol overlap < {min_required:.2f} (got {overlap:.4f}). "
+                        "Refusing to emit/accept portfolio artifacts."
+                    )
+            else:
+                print("[WARN] overlap_audit.json not found; skipping REAL-bar overlap gate in Phase-4.")
+        except Exception as e:
+            raise
 
         # optional: decision→entry causality check (if you persist these)
         if {'decision_ts','entry_ts'}.issubset(dec.columns):
