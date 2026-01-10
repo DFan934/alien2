@@ -86,6 +86,25 @@ def _install_print_filter(enable_verbose: bool) -> None:
 
 
 
+def grid_audit_to_json(grid_audits):
+    """Convert grid audit records (dataclass or dict-like) to JSON-serializable objects."""
+    out = []
+    for a in (grid_audits or []):
+        # support dataclass-like objects and dicts
+        if isinstance(a, dict):
+            rec = dict(a)
+        else:
+            rec = {
+                "symbol": getattr(a, "symbol", None),
+                "n_rows_in": getattr(a, "n_rows_in", None),
+                "n_rows_out": getattr(a, "n_rows_out", None),
+                "n_missing": getattr(a, "n_missing", None),
+                "missing_frac": getattr(a, "missing_frac", None),
+                "dup_in": getattr(a, "dup_in", None),
+                "notes": getattr(a, "notes", None),
+            }
+        out.append(rec)
+    return out
 
 # --- Task3: run_context.json is the canonical root contract -------------------
 import json
@@ -351,7 +370,8 @@ def _timestamp_overlap_share(
     b = b.dropna(subset=[ts_col, symbol_col])
 
     if presence_col in b.columns:
-        b = b[b[presence_col].notna()]
+        #b = b[b[presence_col].notna()]
+        b = b[b[presence_col].astype(bool)]
 
     if b.empty:
         return 0.0
@@ -362,6 +382,24 @@ def _timestamp_overlap_share(
 
     good = (counts >= int(min_symbols)).sum()
     return float(good) / float(len(counts))
+
+
+def _overlap_share_from_decisions(decisions_df, ts_col="decision_ts", symbol_col="symbol", min_symbols=2):
+    if decisions_df is None or len(decisions_df) == 0:
+        return 0.0
+    if ts_col not in decisions_df.columns or symbol_col not in decisions_df.columns:
+        return 0.0
+
+    ts = pd.to_datetime(decisions_df[ts_col], utc=True, errors="coerce")
+    sym = decisions_df[symbol_col].astype(str)
+
+    good = ts.notna() & sym.notna()
+    if good.sum() == 0:
+        return 0.0
+
+    tmp = pd.DataFrame({ts_col: ts[good], symbol_col: sym[good]})
+    counts = tmp.groupby(ts_col)[symbol_col].nunique()
+    return float((counts >= int(min_symbols)).mean())
 
 
 from typing import Any, Dict, List
@@ -469,8 +507,8 @@ def run_batch(
         )
 
     # Unified output directory alias (kept for backward compatibility)
-    #out_dir = artifacts_root
-    out_dir = Path(cfg["artifacts_root"])
+    out_dir = artifacts_root
+    #out_dir = Path(cfg["artifacts_root"])
 
     # ------------------------------------------------------------------
     # EV artifacts directory
@@ -869,7 +907,7 @@ def run_batch(
         else:
             bars["bar_present"] = 1  # fallback (shouldn't happen)
 
-        requested_syms = list(symbols)
+        '''requested_syms = list(symbols)
         requested_n = len(requested_syms)
         is_fold_run = (cfg.get("is_fold_run") is True)
 
@@ -902,15 +940,93 @@ def run_batch(
         }
 
         try:
+            (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+            #(artifacts_root / "diagnostics" / "overlap_audit.json").write_text(...)
+
+            (artifacts_root / "overlap_audit.json").write_text(
+                json.dumps(overlap_audit, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+            (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+            (artifacts_root / "diagnostics" / "overlap_audit.json").write_text(...)
+
+
+        except Exception as e:
+            print(f"[WARN] failed to write overlap_audit.json: {e}")
+
+        print(f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} (min_required={min_required:.2f}) "
+              f"requested_n={requested_n} actual_n_symbols={n_syms_actual} enforced={enforce_overlap_gate}")'''
+
+        requested_syms = list(symbols)
+        requested_n = len(requested_syms)
+        is_fold_run = bool(cfg.get("is_fold_run", False))
+
+        # Task A: default enforcement is based on portfolio-vs-fold + universe size
+        default_enforce = (not is_fold_run) and (requested_n >= 2)
+
+        # Task A: only allow override if the key EXISTS (missing key must not change default behavior)
+        if "phase11_enforce_multisymbol_overlap_gate" in cfg:
+            enforce_overlap_gate = bool(cfg["phase11_enforce_multisymbol_overlap_gate"])
+        else:
+            enforce_overlap_gate = bool(default_enforce)
+
+        n_syms_actual = int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0
+
+        overlap = _timestamp_overlap_share(
+            bars,
+            min_symbols=2,
+            ts_col="timestamp",
+            symbol_col="symbol",
+            presence_col="bar_present",
+        )
+
+        min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+
+        overlap_audit = {
+            "basis": "bars_after_timegrid",
+            "requested_symbols": requested_syms,
+            "requested_n": int(requested_n),
+            "actual_n_symbols": int(n_syms_actual),
+            "overlap_share_ge2": float(overlap),
+            "min_required": float(min_required),
+            "is_fold_run": bool(is_fold_run),
+            "default_enforce": bool(default_enforce),
+            "enforced": bool(enforce_overlap_gate),
+            "override_present": ("phase11_enforce_multisymbol_overlap_gate" in cfg),
+            "override_value": (cfg.get("phase11_enforce_multisymbol_overlap_gate", None)),
+        }
+
+        try:
+            diag_dir = (artifacts_root / "diagnostics")
+            diag_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write ONE canonical location (diagnostics) + optional convenience copy at root
+            (diag_dir / "overlap_audit.json").write_text(
+                json.dumps(overlap_audit, indent=2, default=str),
+                encoding="utf-8",
+            )
             (artifacts_root / "overlap_audit.json").write_text(
                 json.dumps(overlap_audit, indent=2, default=str),
                 encoding="utf-8",
             )
         except Exception as e:
-            print(f"[WARN] failed to write overlap_audit.json: {e}")
+            print(f"[WARN] failed to write overlap_audit.json: {e!r}")
 
-        print(f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} (min_required={min_required:.2f}) "
-              f"requested_n={requested_n} actual_n_symbols={n_syms_actual} enforced={enforce_overlap_gate}")
+        print(
+            f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} "
+            f"(min_required={min_required:.2f}) "
+            f"requested_n={requested_n} actual_n_symbols={n_syms_actual} "
+            f"is_fold_run={is_fold_run} default_enforce={default_enforce} "
+            f"enforced={enforce_overlap_gate} override_present={'phase11_enforce_multisymbol_overlap_gate' in cfg}"
+        )
+
+        if enforce_overlap_gate and (overlap < min_required):
+            raise SystemExit(
+                f"[HARD FAIL] Multi-symbol overlap gate failed. "
+                f"overlap_share_ge2={overlap:.4f} < {min_required:.2f}. "
+                f"See diagnostics/overlap_audit.json"
+            )
 
         if enforce_overlap_gate and (overlap < min_required):
             raise RuntimeError(
@@ -1161,6 +1277,48 @@ def _stable_universe_hash(symbols: list[str]) -> str:
     """Stable SHA1 over sorted symbols; safe for logs & meta."""
     payload = json.dumps(sorted([str(s).upper() for s in symbols]), separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+def _requested_symbols_from_cfg(cfg: dict, fallback_symbols: list[str] | None = None) -> list[str]:
+    """
+    Robustly infer the 'requested' symbol universe for top-level integrity gates.
+    Handles:
+      - cfg["universe"] as list/tuple
+      - cfg["universe"] as provider objects (StaticUniverse/FileUniverse)
+      - cfg["universe"] as dict config (e.g., {"type":"sp500", ...}) if your resolver exists elsewhere
+      - cfg["csv"] as mapping {SYM: path} (common in your runner)
+    Falls back to fallback_symbols (e.g., the resolved symbols list used by the run loop).
+    """
+    try:
+        u = cfg.get("universe", None)
+
+        # 1) Provider objects (your file imports universes.providers as U)
+        try:
+            if hasattr(u, "resolve") and callable(getattr(u, "resolve")):
+                syms = u.resolve()
+                if isinstance(syms, (list, tuple)) and len(syms) > 0:
+                    return [str(s).upper() for s in syms]
+        except Exception:
+            pass
+
+        # 2) Raw list/tuple
+        if isinstance(u, (list, tuple)) and len(u) > 0:
+            return [str(s).upper() for s in u]
+
+        # 3) If user passed a csv mapping dict {SYM: path}
+        csv_cfg = cfg.get("csv")
+        if isinstance(csv_cfg, dict) and len(csv_cfg) > 0:
+            keys = [str(k).upper() for k in csv_cfg.keys()]
+            if len(keys) > 0:
+                return keys
+
+        # 4) Fallback from resolved symbols (what the run actually used)
+        if isinstance(fallback_symbols, (list, tuple)) and len(fallback_symbols) > 0:
+            return [str(s).upper() for s in fallback_symbols]
+    except Exception:
+        pass
+
+    return []
+
 
 def _universe_source_label(cfg: dict) -> str:
     u = cfg.get("universe")
@@ -1633,6 +1791,22 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
 
     else:
         trades_path = None
+
+    # --- Fallback: if consolidation didn't find outputs but root files exist, use them ---
+    try:
+        root = Path(artifacts_root).expanduser().resolve()
+        root_dec = root / "decisions.parquet"
+        root_trd = root / "trades.parquet"
+
+        if decisions_path is None and root_dec.exists():
+            decisions_path = root_dec
+
+        if trades_path is None and root_trd.exists():
+            trades_path = root_trd
+
+    except Exception as _e:
+        print("[Consolidate][WARN] fallback-to-root failed:", repr(_e))
+
 
     return decisions_path, trades_path
 
@@ -2193,6 +2367,40 @@ def _read_any(path: str) -> pd.DataFrame:
         raise ValueError(f"Unsupported file type: {p.suffix} for {path!s}")
 
 
+def _cfg_bool(v, default: bool = False) -> bool:
+    """
+    Robust bool parser for config values that might be bool/int/str.
+    Prevents bugs like bool("False") == True.
+    """
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "f", "no", "n", "off"):
+            return False
+    return default
+
+
+def _requested_symbols_from_cfg_portfolio(cfg: dict, fallback_symbols: list[str]) -> tuple[list[str], str]:
+    """
+    Portfolio-level requested universe resolver.
+    Primary: cfg["universe"]
+    Fallbacks: cfg["symbols"], cfg["tickers"]
+    Returns: (symbols_list, source_string)
+    """
+    for key in ("universe", "symbols", "tickers"):
+        v = cfg.get(key, None)
+        if isinstance(v, (list, tuple)) and len(v) > 0:
+            return [str(x) for x in v], f"cfg.{key}"
+    return [str(x) for x in fallback_symbols], "fallback_symbols"
+
+
 def _aggregate_universe_outputs(artifacts_root: Path, symbols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Collect per-symbol decisions & trades into two universe-wide DataFrames.
@@ -2224,6 +2432,8 @@ def _aggregate_universe_outputs(artifacts_root: Path, symbols: list[str]) -> tup
     print("[DIAG][AGG] FINAL trades rows=", len(trd), "cols=", list(trd.columns))
     if "symbol" in trd.columns:
         print("[DIAG][AGG] trades symbols:", trd["symbol"].value_counts().to_dict())
+
+
 
     return dec, trd
 
@@ -2545,6 +2755,307 @@ def _simulate_trades_from_decisions(
         })
 
     return _pd.DataFrame(rows)
+
+
+
+def _portfolio_execute_from_decisions(
+    decisions: pd.DataFrame,
+    bars: pd.DataFrame,
+    cfg: Dict[str, Any],
+) -> pd.DataFrame:
+    """
+    Portfolio-level execution layer (Option B MVP):
+
+    - groups candidate decisions by decision timestamp
+    - ranks candidates (EV if present, else |p-0.5| if present, else abs(target_qty))
+    - applies portfolio capital constraints at entry time
+    - emits trades rows with symbol/qty/entry_ts/exit_ts/entry_px/exit_px/pnl
+
+    This is intentionally minimal but correct structurally: it creates real multi-symbol trades
+    from consolidated decisions instead of relying on per-symbol trade artifacts.
+    """
+    if decisions is None or len(decisions) == 0:
+        return pd.DataFrame()
+
+    if bars is None or len(bars) == 0:
+        raise SystemExit("[HARD FAIL] _portfolio_execute_from_decisions: bars is empty; cannot execute portfolio.")
+
+    # --- normalize columns ---
+    d = decisions.copy()
+
+    # symbol
+    if "symbol" not in d.columns:
+        raise SystemExit("[HARD FAIL] decisions missing required 'symbol' column at portfolio execution stage.")
+
+    # decision timestamp column
+    ts_col = None
+    for c in ["decision_ts", "timestamp", "ts", "t", "dt"]:
+        if c in d.columns:
+            ts_col = c
+            break
+    if ts_col is None:
+        raise SystemExit("[HARD FAIL] decisions missing a recognizable timestamp column (expected decision_ts/timestamp/ts).")
+
+    d[ts_col] = pd.to_datetime(d[ts_col], utc=True, errors="coerce")
+    d = d.dropna(subset=[ts_col])
+    d = d.sort_values([ts_col, "symbol"]).reset_index(drop=True)
+
+    # qty intent column
+    qty_col = None
+    for c in ["target_qty", "qty", "size", "position_qty", "shares"]:
+        if c in d.columns:
+            qty_col = c
+            break
+    if qty_col is None:
+        # no sizing in decisions yet, default to 0 (no trade). But that's useless, so hard fail.
+        raise SystemExit("[HARD FAIL] decisions missing target size column (expected target_qty/qty/size).")
+
+    # horizon column (bars to hold)
+    h_col = None
+    for c in ["horizon_bars", "h", "hold_bars", "H"]:
+        if c in d.columns:
+            h_col = c
+            break
+    if h_col is None:
+        h_default = int(cfg.get("horizon_bars", 30))
+        d["__h__"] = h_default
+        h_col = "__h__"
+    d[h_col] = pd.to_numeric(d[h_col], errors="coerce").fillna(int(cfg.get("horizon_bars", 30))).astype(int)
+
+    # rank columns: prefer EV, else confidence proxy
+    rank_mode = str(cfg.get("portfolio_rank_mode", "auto")).lower()
+    if rank_mode == "auto":
+        if "ev" in d.columns:
+            rank_key = "ev"
+            rank_abs = True
+        elif "p_up" in d.columns:
+            # distance from 0.5
+            d["__rank__"] = (pd.to_numeric(d["p_up"], errors="coerce") - 0.5).abs()
+            rank_key = "__rank__"
+            rank_abs = False
+        else:
+            d["__rank__"] = pd.to_numeric(d[qty_col], errors="coerce").abs()
+            rank_key = "__rank__"
+            rank_abs = False
+    else:
+        # allow explicit
+        if rank_mode in d.columns:
+            rank_key = rank_mode
+            rank_abs = True
+        else:
+            d["__rank__"] = pd.to_numeric(d[qty_col], errors="coerce").abs()
+            rank_key = "__rank__"
+            rank_abs = False
+
+    # --- bars prep ---
+    b = bars.copy()
+    if "symbol" not in b.columns:
+        raise SystemExit("[HARD FAIL] bars missing required 'symbol' column at portfolio execution stage.")
+    if "timestamp" not in b.columns:
+        raise SystemExit("[HARD FAIL] bars missing required 'timestamp' column at portfolio execution stage.")
+    b["timestamp"] = pd.to_datetime(b["timestamp"], utc=True, errors="coerce")
+    b = b.dropna(subset=["timestamp"])
+    b = b.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+    # Build per-symbol bar frames for fast lookup
+    bars_by_sym: Dict[str, pd.DataFrame] = {}
+    for sym, grp in b.groupby("symbol", sort=False):
+        g = grp.sort_values("timestamp").reset_index(drop=True)
+        bars_by_sym[str(sym)] = g
+
+    # --- portfolio constraints ---
+    initial_cash = float(cfg.get("initial_cash", cfg.get("starting_cash", 100000.0)))
+    max_gross_leverage = float(cfg.get("max_gross_leverage", 1.0))  # 1.0 = no leverage
+    max_pos_frac = float(cfg.get("max_pos_frac", 0.10))            # max 10% equity per position notional
+    max_positions_per_ts = int(cfg.get("max_positions_per_ts", cfg.get("portfolio_top_k", 5)))
+
+    # state
+    cash = initial_cash
+    open_positions: Dict[str, Dict[str, Any]] = {}  # sym -> dict(qty, entry_px, entry_ts, exit_ts)
+    trades_out: list[dict] = []
+
+    # helper: mark-to-market equity at time t using last close available <= t
+    def _mtm_equity_at(t: pd.Timestamp) -> float:
+        eq = cash
+        for sym, pos in open_positions.items():
+            g = bars_by_sym.get(sym)
+            if g is None or len(g) == 0:
+                continue
+            # last row <= t
+            idx = g["timestamp"].searchsorted(t, side="right") - 1
+            if idx >= 0 and idx < len(g):
+                px = float(g.iloc[idx]["close"]) if "close" in g.columns else float(g.iloc[idx]["open"])
+                eq += float(pos["qty"]) * px
+        return float(eq)
+
+    # iterate decisions grouped by decision timestamp
+    for t, grp in d.groupby(ts_col, sort=True):
+        t = pd.Timestamp(t)
+
+        # 1) process exits that happen at or before this decision timestamp (conservative)
+        to_close = []
+        for sym, pos in open_positions.items():
+            if pos["exit_ts"] <= t:
+                to_close.append(sym)
+
+        for sym in to_close:
+            pos = open_positions.pop(sym)
+            # exit at first bar >= exit_ts
+            g = bars_by_sym.get(sym)
+            if g is None or len(g) == 0:
+                continue
+            exit_idx = g["timestamp"].searchsorted(pos["exit_ts"], side="left")
+            if exit_idx >= len(g):
+                exit_idx = len(g) - 1
+            exit_row = g.iloc[exit_idx]
+            exit_px = float(exit_row["open"]) if "open" in exit_row else float(exit_row["close"])
+            qty = float(pos["qty"])
+            pnl = qty * (exit_px - float(pos["entry_px"]))
+            cash += qty * exit_px  # close position (long consumes cash; short releases; simplified)
+
+            trades_out.append({
+                "symbol": sym,
+                "qty": qty,
+                "entry_ts": pos["entry_ts"],
+                "exit_ts": pos["exit_ts"],
+                "entry_px": float(pos["entry_px"]),
+                "exit_px": exit_px,
+                "pnl_gross": pnl,
+                "reason": "PORTFOLIO_EXEC",
+            })
+
+        # 2) build entry candidates at this timestamp
+        # drop symbols already in position
+        g2 = grp[~grp["symbol"].astype(str).isin(open_positions.keys())].copy()
+        if len(g2) == 0:
+            continue
+
+        # rank
+        if rank_abs:
+            g2["_rank"] = pd.to_numeric(g2[rank_key], errors="coerce").fillna(0.0).abs()
+        else:
+            g2["_rank"] = pd.to_numeric(g2[rank_key], errors="coerce").fillna(0.0)
+
+        g2 = g2.sort_values("_rank", ascending=False).head(max_positions_per_ts)
+
+        # compute equity and limits
+        equity = _mtm_equity_at(t)
+        max_gross = max_gross_leverage * equity
+
+        # current gross exposure
+        gross = 0.0
+        for sym, pos in open_positions.items():
+            gsym = bars_by_sym.get(sym)
+            if gsym is None or len(gsym) == 0:
+                continue
+            idx = gsym["timestamp"].searchsorted(t, side="right") - 1
+            if idx >= 0 and idx < len(gsym):
+                px = float(gsym.iloc[idx]["close"]) if "close" in gsym.columns else float(gsym.iloc[idx]["open"])
+                gross += abs(float(pos["qty"]) * px)
+
+        # 3) sequentially allocate within remaining gross capacity and per-position cap
+        remaining_gross = max(0.0, max_gross - gross)
+
+        for _, row in g2.iterrows():
+            sym = str(row["symbol"])
+            intent_qty = float(pd.to_numeric(row[qty_col], errors="coerce") or 0.0)
+            if intent_qty == 0.0:
+                continue
+
+            gsym = bars_by_sym.get(sym)
+            if gsym is None or len(gsym) == 0:
+                continue
+
+            # entry at next bar >= decision time
+            entry_idx = gsym["timestamp"].searchsorted(t, side="left")
+            if entry_idx >= len(gsym):
+                continue
+            entry_row = gsym.iloc[entry_idx]
+            entry_px = float(entry_row["open"]) if "open" in entry_row else float(entry_row["close"])
+
+            # determine exit timestamp based on horizon bars
+            h = int(row[h_col])
+            exit_idx = min(entry_idx + max(1, h), len(gsym) - 1)
+            exit_ts = pd.Timestamp(gsym.iloc[exit_idx]["timestamp"])
+
+            # cap per position
+            max_pos_notional = max_pos_frac * equity
+
+            # proposed notional
+            proposed_notional = abs(intent_qty) * entry_px
+
+            # scale by remaining gross and per-position cap
+            allowed_notional = min(max_pos_notional, remaining_gross)
+            if allowed_notional <= 0.0:
+                break
+
+            if proposed_notional > allowed_notional:
+                scaled_qty = (allowed_notional / max(entry_px, 1e-12)) * (1.0 if intent_qty > 0 else -1.0)
+            else:
+                scaled_qty = intent_qty
+
+            if abs(scaled_qty) * entry_px <= 0.0:
+                continue
+
+            # apply cash constraint for longs (simple, no margin model)
+            if scaled_qty > 0:
+                needed = scaled_qty * entry_px
+                if needed > cash:
+                    # scale down to available cash
+                    if cash <= 0:
+                        continue
+                    scaled_qty = (cash / max(entry_px, 1e-12))
+                    needed = scaled_qty * entry_px
+                    if needed <= 0:
+                        continue
+                cash -= needed
+            else:
+                # shorts: allow, do not block (MVP). If you want, add margin rule here.
+                pass
+
+            # open the position
+            open_positions[sym] = {
+                "qty": float(scaled_qty),
+                "entry_px": float(entry_px),
+                "entry_ts": pd.Timestamp(entry_row["timestamp"]),
+                "exit_ts": exit_ts,
+            }
+            remaining_gross = max(0.0, remaining_gross - abs(float(scaled_qty) * entry_px))
+
+    # close any remaining positions at end of data (optional)
+    # For MVP, we leave them; most systems close at end-of-run. We'll close at last bar.
+    if len(open_positions) > 0:
+        # choose a conservative close time: per symbol last timestamp
+        for sym, pos in list(open_positions.items()):
+            gsym = bars_by_sym.get(sym)
+            if gsym is None or len(gsym) == 0:
+                continue
+            last_row = gsym.iloc[-1]
+            exit_px = float(last_row["close"]) if "close" in last_row else float(last_row["open"])
+            qty = float(pos["qty"])
+            pnl = qty * (exit_px - float(pos["entry_px"]))
+            cash += qty * exit_px
+            trades_out.append({
+                "symbol": sym,
+                "qty": qty,
+                "entry_ts": pos["entry_ts"],
+                "exit_ts": pd.Timestamp(last_row["timestamp"]),
+                "entry_px": float(pos["entry_px"]),
+                "exit_px": exit_px,
+                "pnl_gross": pnl,
+                "reason": "PORTFOLIO_EXEC_EOR",
+            })
+        open_positions.clear()
+
+    tr = pd.DataFrame(trades_out)
+    if len(tr) == 0:
+        return tr
+
+    # normalize types
+    for c in ["entry_ts", "exit_ts"]:
+        if c in tr.columns:
+            tr[c] = pd.to_datetime(tr[c], utc=True, errors="coerce")
+    return tr.sort_values(["entry_ts", "symbol"]).reset_index(drop=True)
 
 
 
@@ -4095,6 +4606,10 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     dec_df, trd_df = _aggregate_universe_outputs(arte_root, symbols)
 
     print("[Agg] decisions rows=", len(dec_df), "trades rows=", len(trd_df))
+
+
+
+
     if not dec_df.empty and "symbol" in dec_df.columns:
         print("[Agg] decisions by symbol:", dec_df["symbol"].value_counts().to_dict())
     if not trd_df.empty and "symbol" in trd_df.columns:
@@ -4375,8 +4890,70 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         dec = pd.read_parquet(dec_path)
         dec.to_parquet(port_dir / "decisions.parquet", index=False)
 
+    # ------------------------------------------------------------------
+    # Phase 2.1/2.2 TOP-LEVEL overlap audit on CONSOLIDATED portfolio decisions
+    # (This is NOT the REAL-bar overlap; this is an additional "portfolio reality"
+    # check to prevent fold-level overlap from masquerading as multi-symbol reality.)
+    # ------------------------------------------------------------------
+    requested = cfg.get("universe") or []
+    requested_n = len(requested) if isinstance(requested, (list, tuple)) else 0
+
+    # Only enforce on top-level portfolio runs with >=2 requested symbols
+    is_fold_run = bool(cfg.get("is_fold_run", False))
+    enforce = (not is_fold_run) and (requested_n >= 2)
+
+    overlap_share = 0.0
+    if isinstance(dec, pd.DataFrame) and len(dec) and {"timestamp", "symbol"}.issubset(dec.columns):
+        _tmp = dec[["timestamp", "symbol"]].copy()
+        _tmp["timestamp"] = pd.to_datetime(_tmp["timestamp"], utc=True, errors="coerce")
+        _tmp = _tmp.dropna(subset=["timestamp"])
+        per_ts = _tmp.groupby("timestamp")["symbol"].nunique()
+        overlap_share = float((per_ts >= 2).mean()) if len(per_ts) else 0.0
+
+    min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+
+    overlap_audit = {
+        "basis": "portfolio_decisions",
+        "requested_symbols": list(requested) if isinstance(requested, (list, tuple)) else [],
+        "requested_n": requested_n,
+        "overlap_share_ge2": overlap_share,
+        "min_required": min_required,
+        "enforced": bool(enforce),
+    }
+
+    (port_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (port_dir / "diagnostics" / "overlap_audit_decisions.json").write_text(
+        json.dumps(overlap_audit, indent=2),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[Gate][TOP] overlap_share_ge2(decisions)={overlap_share:.4f} "
+        f"(min_required={min_required:.2f}) enforced={enforce}"
+    )
+
+    if enforce and overlap_share < min_required:
+        raise SystemExit(
+            f"[HARD FAIL] Multi-symbol overlap gate failed at TOP LEVEL (portfolio decisions). "
+            f"overlap_share_ge2={overlap_share:.4f} < {min_required:.2f}. "
+            f"See portfolio/diagnostics/overlap_audit_decisions.json"
+        )
+
     if trd_path is not None:
         trd = pd.read_parquet(trd_path)
+
+        # Phase 2.2 HARD GATE: multi-symbol portfolio must actually trade >=2 symbols
+        if (not bool(cfg.get("is_fold_run", False))) and isinstance(cfg.get("universe"), (list, tuple)) and len(
+                cfg["universe"]) >= 2:
+            if trd is None or len(trd) == 0:
+                raise SystemExit("[HARD FAIL] Universe>=2 but consolidated trades is EMPTY. Invalid portfolio run.")
+            traded_syms = sorted(
+                trd["symbol"].dropna().astype(str).unique().tolist()) if "symbol" in trd.columns else []
+            if len(traded_syms) < 2:
+                raise SystemExit(
+                    f"[HARD FAIL] Universe>=2 but consolidated trades has <2 symbols. traded_syms={traded_syms}"
+                )
+
         trd.to_parquet(port_dir / "trades.parquet", index=False)
 
     root = Path(cfg["artifacts_root"]).expanduser().resolve()
@@ -4549,9 +5126,146 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                         "[GATE] decisions contain <2 symbols overall. "
                         "This is not a multi-symbol portfolio run; refusing portfolio artifacts."
                     )
+            # 1.5) TOP-LEVEL overlap gate using consolidated decisions (shared-clock reality check)
+            '''requested = cfg.get("universe") or []
+            requested_n = len(requested) if isinstance(requested, (list, tuple)) else 0
+
+            is_fold_run = bool(cfg.get("is_fold_run", False))
+            enforce = (not is_fold_run) and (requested_n >= 2)
+            '''
+
+            '''requested = _requested_symbols_from_cfg(cfg, fallback_symbols=symbols)
+            requested_n = len(requested)
+
+            is_fold_run = bool(cfg.get("is_fold_run", False))
+            enforce = (not is_fold_run) and (requested_n >= 2)
+
+            # decisions are already on a shared clock in 'timestamp'
+            overlap_share = float((dec.groupby("timestamp")["symbol"].nunique() >= 2).mean()) if (
+                    {"timestamp", "symbol"}.issubset(dec.columns) and len(dec) > 0
+            ) else 0.0
+
+            min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+
+            overlap_audit_top = {
+                "basis": "portfolio_decisions",
+                "requested_symbols": list(requested) if isinstance(requested, (list, tuple)) else [],
+                "requested_n": requested_n,
+                "overlap_share_ge2": overlap_share,
+                "min_required": min_required,
+                "enforced": bool(enforce),
+            }
+
+            (port_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
+            (port_dir / "diagnostics" / "overlap_audit_top.json").write_text(
+                json.dumps(overlap_audit_top, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+            print(f"[Gate][TOP] overlap_share_ge2(decisions)={overlap_share:.4f} "
+                  f"(min_required={min_required:.2f}) enforced={enforce}")
+
+            if enforce and overlap_share < min_required:
+                raise SystemExit(
+                    f"[HARD FAIL] TOP-LEVEL multi-symbol overlap gate failed. "
+                    f"overlap_share_ge2={overlap_share:.4f} < {min_required:.2f}. "
+                    f"See portfolio/diagnostics/overlap_audit_top.json"
+                )'''
+
+            # 1.5) TOP-LEVEL overlap gate using consolidated decisions (shared-clock reality check)
+
+            # --- portfolio-level requested universe ---
+            requested, requested_src = _requested_symbols_from_cfg_portfolio(cfg, fallback_symbols=symbols)
+            requested_n = len(requested)
+
+            # IMPORTANT: this is the PORTFOLIO aggregation stage.
+            # Even if cfg["is_fold_run"] was accidentally left True somewhere, we must NOT treat this as a fold run.
+            cfg_is_fold_run = _cfg_bool(cfg.get("is_fold_run", False))
+            is_fold_run_effective = False  # <- portfolio aggregation truth
+
+            # Default enforcement rule (Task A): enforce if portfolio + requested universe >= 2
+            enforce_default = (not is_fold_run_effective) and (requested_n >= 2)
+
+            # Override rule (Task A): only override if key is explicitly present
+            override_key = "phase11_enforce_multisymbol_overlap_gate"
+            override_present = (override_key in cfg)
+            if override_present:
+                enforce = _cfg_bool(cfg.get(override_key))
+            else:
+                enforce = enforce_default
+
+            # overlap on consolidated decisions clock (your decisions are on shared 'timestamp')
+            if {"timestamp", "symbol"}.issubset(dec.columns) and len(dec) > 0:
+                overlap_share = float((dec.groupby("timestamp")["symbol"].nunique() >= 2).mean())
+            else:
+                overlap_share = 0.0
+
+            min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+
+            overlap_audit_top = {
+                "basis": "portfolio_decisions",
+                "requested_symbols": list(requested),
+                "requested_source": requested_src,
+                "requested_n": requested_n,
+                "overlap_share_ge2": overlap_share,
+                "min_required": min_required,
+
+                # critical debugging fields for Task A
+                "cfg_is_fold_run": bool(cfg_is_fold_run),
+                "is_fold_run_effective": bool(is_fold_run_effective),
+                "override_present": bool(override_present),
+                "override_value": (cfg.get(override_key) if override_present else None),
+                "enforced": bool(enforce),
+            }
+
+            (port_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
+            (port_dir / "diagnostics" / "overlap_audit_top.json").write_text(
+                json.dumps(overlap_audit_top, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+            print(
+                f"[Gate][TOP] overlap_share_ge2(decisions)={overlap_share:.4f} "
+                f"(min_required={min_required:.2f}) requested_n={requested_n} "
+                f"cfg_is_fold_run={cfg_is_fold_run} enforced={enforce}"
+            )
+
+            if enforce and overlap_share < min_required:
+                raise SystemExit(
+                    f"[HARD FAIL] TOP-LEVEL multi-symbol overlap gate failed. "
+                    f"overlap_share_ge2={overlap_share:.4f} < {min_required:.2f}. "
+                    f"See portfolio/diagnostics/overlap_audit_top.json"
+                )
+
+            # --- Task C: Universe>=2 must trade >=2 symbols (TOP-LEVEL, before reporting) ---
+            # Use the SAME portfolio-truth enforcement condition (not cfg_is_fold_run).
+            if enforce_default:
+                if trd is None or len(trd) == 0:
+                    raise SystemExit(
+                        "[HARD FAIL] Universe>=2 (portfolio) but consolidated trades is EMPTY. "
+                        "Invalid portfolio run."
+                    )
+
+                traded_syms = sorted(
+                    trd["symbol"].dropna().astype(str).unique().tolist()) if "symbol" in trd.columns else []
+                if len(traded_syms) < 2:
+                    raise SystemExit(
+                        f"[HARD FAIL] Universe>=2 (portfolio) but consolidated trades has <2 symbols. traded_syms={traded_syms}"
+                    )
 
             # 2) Use REAL-bar overlap gate output (authoritative)
             audit_fp = artifacts_root / "overlap_audit.json"
+            # Phase 2.2 HARD GATE: multi-symbol portfolio must actually trade >=2 symbols
+            if (not bool(cfg.get("is_fold_run", False))) and isinstance(cfg.get("universe"), (list, tuple)) and len(
+                    cfg["universe"]) >= 2:
+                if trd is None or len(trd) == 0:
+                    raise SystemExit("[HARD FAIL] Universe>=2 but consolidated trades is EMPTY. Invalid portfolio run.")
+                traded_syms = sorted(
+                    trd["symbol"].dropna().astype(str).unique().tolist()) if "symbol" in trd.columns else []
+                if len(traded_syms) < 2:
+                    raise SystemExit(
+                        f"[HARD FAIL] Universe>=2 but consolidated trades has <2 symbols. traded_syms={traded_syms}"
+                    )
 
             print("[DIAG][OVERLAP] writing audit to:", str(audit_fp))
             #print("[DIAG][OVERLAP] audit payload:", audit_dict)  # whatever dict you build
