@@ -63,6 +63,8 @@ from prediction_engine.run_context import RunContext
 
 import builtins
 
+from scripts.calibrate import out_dir
+
 _NOISE_PREFIXES = (
     "[Cal]",
     "[EV]",
@@ -84,6 +86,52 @@ def _install_print_filter(enable_verbose: bool) -> None:
 
     builtins.print = _quiet_print
 
+from pathlib import Path
+import json
+
+def _count_trade_files(run_dir: Path) -> dict:
+    """
+    Scan for any trades.parquet files beneath run_dir and count rows where possible.
+    This is purely diagnostic: it tells us whether trades exist anywhere on disk.
+    """
+    out = {
+        "run_dir": str(run_dir),
+        "trade_files": [],
+        "total_rows": 0,
+        "nonempty_files": 0,
+    }
+
+    trade_paths = sorted(run_dir.rglob("trades.parquet"))
+    # Avoid counting the consolidated portfolio file twice if it exists
+    # (still include it in the list for transparency)
+    for p in trade_paths:
+        rec = {"path": str(p), "rows": None, "bytes": None, "error": None}
+        try:
+            rec["bytes"] = p.stat().st_size
+            # Cheap row count: read parquet only if file is non-trivial
+            if rec["bytes"] and rec["bytes"] > 5000:
+                import pandas as pd
+                df = pd.read_parquet(p)
+                rec["rows"] = int(len(df))
+            else:
+                rec["rows"] = 0
+        except Exception as e:
+            rec["error"] = repr(e)
+        out["trade_files"].append(rec)
+
+    # Aggregate totals
+    for rec in out["trade_files"]:
+        if rec.get("rows") is not None:
+            out["total_rows"] += int(rec["rows"])
+            if int(rec["rows"]) > 0:
+                out["nonempty_files"] += 1
+
+    return out
+
+
+def _write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, default=str))
 
 
 def grid_audit_to_json(grid_audits):
@@ -1728,6 +1776,56 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
             except Exception:
                 pass
 
+
+    # --- NEW: accept root-level trades when runner already wrote them ---
+    # If the runner wrote trades.parquet directly under artifacts_root, the scan above
+    # intentionally finds nothing (it only looks for fold/symbol parts).
+    # In that case, treat the root file as authoritative.
+    if not trade_parts:
+        root_trd = artifacts_root / "trades.parquet"
+        if root_trd.exists() and root_trd.stat().st_size > 100:
+            try:
+                trades = pd.read_parquet(root_trd)
+
+
+
+                # Reject placeholder/stub trades files early
+                if len(trades) == 0:
+                    print(f"[Consolidate][Root trades] root trades exists but has 0 rows; ignoring: {root_trd}")
+                    # Do NOT set trades_path; allow downstream logic to keep searching / fail
+                    trades_path = None
+                    raise RuntimeError("Root trades.parquet is empty (0 rows)")
+
+                # Required timestamps for trades in your pipeline:
+                # - entry_ts / exit_ts are expected for equity & PnL
+                trades = _enforce_utc_ts_cols(
+                    trades,
+                    ("entry_ts", "exit_ts"),
+                    who="[Root trades REQUIRED]",
+                )
+
+                # timestamp is optional (some producers include it)
+                trades = _enforce_utc_ts_cols(
+                    trades,
+                    ("timestamp",),
+                    who="[Root trades OPTIONAL]",
+                )
+
+                if "symbol" in trades.columns:
+                    trades["symbol"] = trades["symbol"].astype("string")
+
+                # Write through the same writer for consistency (or you can just set trades_path=root_trd)
+                write_parquet_utc(
+                    trades,
+                    trades_out,
+                    timestamp_cols=("entry_ts", "exit_ts", "timestamp"),
+                )
+                trades_path = trades_out
+            except Exception as e:
+                print(f"[Consolidate] Failed reading root trades.parquet: {e}")
+
+
+
     if trade_parts:
         '''trades = pd.concat(trade_parts, ignore_index=True).drop_duplicates()
         trades = _coerce_ts_cols(trades, ("entry_ts", "exit_ts", "timestamp"))
@@ -1776,6 +1874,64 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
 
         # Enforce required timestamps if present/expected.
         # Typical trades artifact expects entry_ts and exit_ts; timestamp may or may not exist depending on producer.
+
+        # --- DIAG: inspect trade_parts BEFORE schema enforcement ---
+        try:
+            print(f"[DIAG][TRADES][PARTS] n_parts={len(trade_parts)}")
+            for i, part in enumerate(trade_parts[:10]):  # cap
+                cols = list(part.columns)
+                print(f"[DIAG][TRADES][PART {i}] rows={len(part)} cols={cols[:40]}{'...' if len(cols) > 40 else ''}")
+
+                # show a few key column existence flags
+                key_cols = ["timestamp", "entry_ts", "exit_ts", "symbol", "qty", "target_qty", "pnl", "price",
+                            "entry_price", "exit_price"]
+                flags = {c: (c in part.columns) for c in key_cols}
+                print(f"[DIAG][TRADES][PART {i}] has={flags}")
+
+                # show 3 sample rows (restricted columns)
+                sample_cols = [c for c in key_cols if c in part.columns]
+                if sample_cols:
+                    print(f"[DIAG][TRADES][PART {i}] sample:\n{part[sample_cols].head(3)}")
+        except Exception as e:
+            print(f"[DIAG][TRADES][PARTS] failed introspection: {e}")
+        # --- end DIAG ---
+
+        # --- SCHEMA COERCE: ensure entry_ts/exit_ts exist if we have any usable time column ---
+        # Try common alternates first
+        alt_entry = ["entry_time", "entry_timestamp", "t_entry", "open_ts", "open_time"]
+        alt_exit = ["exit_time", "exit_timestamp", "t_exit", "close_ts", "close_time"]
+
+        def _first_existing(df, names):
+            for n in names:
+                if n in df.columns:
+                    return n
+            return None
+
+        if "entry_ts" not in trades.columns:
+            c = _first_existing(trades, alt_entry)
+            if c:
+                trades["entry_ts"] = trades[c]
+                print(f"[TRADES][COERCE] entry_ts <- {c}")
+            elif "timestamp" in trades.columns:
+                trades["entry_ts"] = trades["timestamp"]
+                print("[TRADES][COERCE] entry_ts <- timestamp")
+            elif "decision_ts" in trades.columns:
+                trades["entry_ts"] = trades["decision_ts"]
+                print("[TRADES][COERCE] entry_ts <- decision_ts")
+
+        if "exit_ts" not in trades.columns:
+            c = _first_existing(trades, alt_exit)
+            if c:
+                trades["exit_ts"] = trades[c]
+                print(f"[TRADES][COERCE] exit_ts <- {c}")
+            else:
+                # last-resort: if we cannot infer exit, mirror entry_ts so enforcement won't drop
+                # (this is diagnostic/compatibility mode; later we should compute true exit)
+                if "entry_ts" in trades.columns:
+                    trades["exit_ts"] = trades["entry_ts"]
+                    print("[TRADES][COERCE][WARN] exit_ts missing; defaulting exit_ts = entry_ts (diagnostic mode)")
+        # --- end SCHEMA COERCE ---
+
         trades = _enforce_utc_ts_cols(trades, ("entry_ts", "exit_ts"), who="[Consolidate trades REQUIRED]")
         trades = _enforce_utc_ts_cols(trades, ("timestamp",), who="[Consolidate trades OPTIONAL]")
 
@@ -1789,8 +1945,12 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
         )
         trades_path = trades_out
 
+    #else:
+        #trades_path = None
+
     else:
-        trades_path = None
+        if "trades_path" not in locals():
+            trades_path = None
 
     # --- Fallback: if consolidation didn't find outputs but root files exist, use them ---
     try:
@@ -1801,11 +1961,27 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
         if decisions_path is None and root_dec.exists():
             decisions_path = root_dec
 
-        if trades_path is None and root_trd.exists():
-            trades_path = root_trd
+        '''if trades_path is None and root_trd.exists():
+            trades_path = root_trd'''
+        if trades_path is None and root_trd.exists() and root_trd.stat().st_size > 100:
+            try:
+                _tmp = pd.read_parquet(root_trd)
+                if len(_tmp) == 0:
+                    print(f"[Consolidate][WARN] root trades.parquet is empty; not using: {root_trd}")
+                else:
+                    trades_path = root_trd
+            except Exception as e:
+                print(f"[Consolidate][WARN] failed reading root trades.parquet during fallback: {e}")
+
 
     except Exception as _e:
         print("[Consolidate][WARN] fallback-to-root failed:", repr(_e))
+
+
+    print(
+        f"[Consolidate][FINAL] decisions_path={decisions_path} trades_path={trades_path} "
+        f"dec_parts={len(dec_parts)} trade_parts={len(trade_parts)}"
+    )
 
 
     return decisions_path, trades_path
@@ -3675,9 +3851,73 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
                 print("[SignCheck] p_cal flipped (AUC(1-p) > AUC(p)) in unit-test path.")
 
         # Sizer → target_qty on next-open
-        bars_min = df_full[["timestamp","symbol","open","volume"]].copy()
+        '''bars_min = df_full[["timestamp","symbol","open","volume"]].copy()
         sized = _apply_sizer_to_decisions(decisions=dec, bars=bars_min, cfg=cfg)
         sized = sized.loc[sized["target_qty"].abs() > 0].copy()
+        '''
+
+        # Sizer → target_qty on next-open
+        bars_min = df_full[["timestamp","symbol","open","volume"]].copy()
+        sized_all = _apply_sizer_to_decisions(decisions=dec, bars=bars_min, cfg=cfg)
+
+        # ---------------------------
+        # Attempted-actions spine (persist qty=0 too)
+        # ---------------------------
+        # "attempted actions" = rows where the engine produced a decision row that could have led to execution.
+        # We persist them even if target_qty==0 so "trades disappeared" can be diagnosed.
+
+        attempted = sized_all.copy()
+
+        # Best-effort attempt flag:
+        # Prefer your existing entry/take_trade columns if they exist; otherwise treat every decision row as an attempt.
+        attempt_flag_col = None
+        for c in ["entry", "take_trade", "entered", "gate_pass"]:
+            if c in attempted.columns:
+                attempt_flag_col = c
+                break
+
+        if attempt_flag_col is not None:
+            attempted = attempted[attempted[attempt_flag_col].astype(bool)].copy()
+
+        # Standardize qty field for attempted actions
+        if "qty" not in attempted.columns:
+            # Your pipeline uses target_qty for execution sizing; keep qty as an alias.
+            if "target_qty" in attempted.columns:
+                attempted["qty"] = attempted["target_qty"].astype(float)
+            else:
+                attempted["qty"] = 0.0
+
+        def _attempt_reason_row(r):
+            q = float(r.get("qty", 0.0) or 0.0)
+            if abs(q) > 0:
+                return "ATTEMPT_QTY_NONZERO"
+            # If you have gate columns, surface them; otherwise generic.
+            if "gate_pass" in r.index and (not bool(r.get("gate_pass", True))):
+                return "ATTEMPT_GATE_FAIL_QTY_ZERO"
+            return "ATTEMPT_QTY_ZERO"
+
+        attempted["attempt_reason"] = attempted.apply(_attempt_reason_row, axis=1)
+
+        # Persist alongside the symbol outputs (sym_dir is out_dir later)
+        # NOTE: sym_dir is assigned below as out_dir; we can write directly to out_dir here too.
+        attempted_out = out_dir / "attempted_actions.parquet"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        attempted.to_parquet(attempted_out, index=False)
+        print(f"[AttemptedActions] sym={sym} rows={len(attempted)} → {attempted_out}")
+
+        # Now filter ONLY for execution simulation (do NOT destroy the full sizing output)
+        sized = sized_all.loc[sized_all["target_qty"].abs() > 0].copy()
+
+        # Simulate fills (MOO/MOC with gap bands + partial fills)
+        rules = {
+            "max_participation": float(cfg.get("max_participation", 0.25)),
+            "moo_gap_band": True, "moc_gap_band": True,
+        }
+        trades = _simulate_trades_from_decisions(
+            decisions=sized, bars=bars_min, rules=rules,
+            horizon_col="horizon_bars", target_qty_col="target_qty",
+        )
+
 
         # Simulate fills (MOO/MOC with gap bands + partial fills)
         rules = {
@@ -3701,15 +3941,40 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
         '''
 
-        sym_dir = out_dir
+        '''sym_dir = out_dir
         sym_dir.mkdir(parents=True, exist_ok=True)
 
         if len(sized):
             sized.to_parquet(sym_dir / "decisions.parquet", index=False)
         if len(trades):
             trades.to_parquet(sym_dir / "trades.parquet", index=False)
+        '''
+
+        sym_dir = out_dir
+        sym_dir.mkdir(parents=True, exist_ok=True)
+
+        # ALWAYS write the full decision spine (including qty=0 rows),
+        # otherwise Phase-4 aggregation finds nothing when sizing is conservative.
+        dec_out = sym_dir / "decisions.parquet"
+        sized_all.to_parquet(dec_out, index=False)
+
+        # Optional: also write the "executable" subset for quick inspection
+        exec_dec_out = sym_dir / "decisions_executable.parquet"
+        sized.to_parquet(exec_dec_out, index=False)
+
+        # ALWAYS write trades.parquet too (even if empty) so discovery is deterministic
+        trd_out = sym_dir / "trades.parquet"
+        trades.to_parquet(trd_out, index=False)
+
+        print(
+            f"[PerSymWrite] sym={sym} decisions_all={len(sized_all)} exec_decisions={len(sized)} trades={len(trades)}")
+        print(f"[PerSymWrite] wrote {dec_out}")
+        print(f"[PerSymWrite] wrote {exec_dec_out}")
+        print(f"[PerSymWrite] wrote {trd_out}")
 
         return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
+
+        #return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
 
     # 2) Walk-forward runner (unchanged, but pass symbol)
     resolved_parquet_root = _resolve_path(cfg["parquet_root"])
@@ -4587,6 +4852,16 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         sym_root.mkdir(parents=True, exist_ok=True)
         sym_cfg["artifacts_root"] = str(sym_root)
 
+        # --- BEGIN: enforce per-symbol artifact roots (required for AggFind) ---
+        sym_dir = (run_ctx.run_dir / sym)
+        sym_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg_sym = dict(cfg)
+        cfg_sym["artifacts_root"] = str(sym_dir)
+
+        print(f"[PerSymbol] sym={sym} artifacts_root={cfg_sym['artifacts_root']}")
+        # --- END: enforce per-symbol artifact roots ---
+
         res = await _run_one_symbol(sym, sym_cfg)
 
         results.append(res)
@@ -4725,6 +5000,73 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         trd_df.to_parquet(trades_out, index=False)
         print(f"[Portfolio] trades → {trades_out}")
 
+
+
+
+        # ---------------------------
+        # Execution reconciliation diagnostics
+        # ---------------------------
+        diag_dir = port_dir / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        def _safe_int(x):
+            try:
+                return int(x)
+            except Exception:
+                return None
+
+        # Scan for any per-symbol/per-part trades/decisions that exist under out_dir
+        # (This answers: "are trades written somewhere else?")
+        root = Path(out_dir)
+
+        all_trade_files = sorted([p for p in root.rglob("trades.parquet") if "portfolio" not in str(p).lower()])
+        all_decision_files = sorted([p for p in root.rglob("decisions.parquet") if "portfolio" not in str(p).lower()])
+        all_attempt_files = sorted([p for p in root.rglob("attempted_actions.parquet") if "portfolio" not in str(p).lower()])
+
+        def _count_rows(parquet_paths):
+            total = 0
+            per_file = {}
+            for p in parquet_paths:
+                try:
+                    df = pd.read_parquet(p)
+                    n = len(df)
+                except Exception as e:
+                    n = None
+                per_file[str(p)] = n
+                if isinstance(n, int):
+                    total += n
+            return total, per_file
+
+        per_sym_trades_total, per_sym_trades_by_file = _count_rows(all_trade_files)
+        per_sym_dec_total, per_sym_dec_by_file = _count_rows(all_decision_files)
+        per_sym_attempt_total, per_sym_attempt_by_file = _count_rows(all_attempt_files)
+
+        recon = {
+            "portfolio_trades_rows": _safe_int(len(trd_df)) if "trd_df" in locals() and trd_df is not None else None,
+            "per_symbol_trade_files_found": len(all_trade_files),
+            "per_symbol_trades_rows_total": _safe_int(per_sym_trades_total),
+            "per_symbol_decision_files_found": len(all_decision_files),
+            "per_symbol_decisions_rows_total": _safe_int(per_sym_dec_total),
+            "attempted_actions_files_found": len(all_attempt_files),
+            "attempted_actions_rows_total": _safe_int(per_sym_attempt_total),
+            "example_trade_files": [str(p) for p in all_trade_files[:10]],
+            "example_attempt_files": [str(p) for p in all_attempt_files[:10]],
+        }
+
+        recon_out = diag_dir / "execution_reconciliation.json"
+        with open(recon_out, "w", encoding="utf-8") as f:
+            json.dump(recon, f, indent=2)
+
+        print(f"[Diag] execution reconciliation → {recon_out}")
+        print(f"[Diag] per-symbol trades files found={len(all_trade_files)} total_rows={per_sym_trades_total}")
+        print(f"[Diag] attempted_actions files found={len(all_attempt_files)} total_rows={per_sym_attempt_total}")
+
+        if recon["per_symbol_trades_rows_total"] and recon["portfolio_trades_rows_total"] == 0:
+            print("[Diag][WARN] Per-symbol trades exist but portfolio consolidation output is empty. Consolidation/discovery issue.")
+        if recon["attempted_actions_rows_total"] and (recon["per_symbol_trades_rows_total"] == 0):
+            print("[Diag][WARN] Attempts exist but no per-symbol trades. Execution sizing or fill simulation may be blocking.")
+
+
         # Build a simple realized-PnL equity curve (no open PnL)
         if "exit_ts" in trd_df.columns and "realized_pnl" in trd_df.columns:
             curve = equity_curve_from_trades(trd_df)
@@ -4746,6 +5088,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                     }
 
                 df = trades_df.copy()
+
+                print(f"[DIAG][LIVE TRADES] rows={len(trades_df)} cols={list(trades_df.columns)}")
+                if len(trades_df) == 0:
+                    print("[DIAG][LIVE TRADES][WARN] zero trades produced in-memory")
+
                 # Coerce types
                 for c in ("entry_ts", "exit_ts"):
                     if c in df.columns:
@@ -4879,7 +5226,87 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     if not rc.exists():
         raise RuntimeError(f"[Phase-4] Refusing to consolidate: missing {rc}")
 
+    # ------------------------------------------------------------------
+    # PRE-CONSOLIDATION: ensure per-symbol outputs exist on disk
+    # (Aggregation expects artifacts_root/<SYM>/decisions.parquet and trades.parquet)
+    # ------------------------------------------------------------------
+    requested = cfg.get("universe") or []
+    if isinstance(requested, (list, tuple)) and requested:
+        for sym in requested:
+            sym_dir = artifacts_root / sym
+            # If decisions/trades already exist, leave them alone.
+            # If they do not, write best-effort from in-memory objects if present.
+            need_dec = not (sym_dir / "decisions.parquet").exists()
+            need_trd = not (sym_dir / "trades.parquet").exists()
+
+            # These variable names might differ in your file; use what you actually have in scope.
+            # The key is: write whatever you have for THIS sym.
+            dec_sym = None
+            trd_sym = None
+
+            # Common pattern: a global "decisions" df that includes a symbol column
+            if need_dec and "decisions" in locals() and isinstance(locals()["decisions"], pd.DataFrame):
+                _d = locals()["decisions"]
+                if {"symbol"}.issubset(_d.columns):
+                    dec_sym = _d[_d["symbol"].astype(str) == str(sym)].copy()
+                else:
+                    # fallback: if decisions already correspond to one symbol run
+                    dec_sym = _d.copy()
+
+            if need_trd and "trades" in locals() and isinstance(locals()["trades"], pd.DataFrame):
+                _t = locals()["trades"]
+                if {"symbol"}.issubset(_t.columns):
+                    trd_sym = _t[_t["symbol"].astype(str) == str(sym)].copy()
+                else:
+                    trd_sym = _t.copy()
+
+            if need_dec or need_trd:
+                _write_symbol_outputs(artifacts_root, sym, dec_sym, trd_sym)
+                print(f"[PreAggWrite] sym={sym} wrote_dec={dec_sym is not None and not dec_sym.empty} "
+                      f"wrote_trades={trd_sym is not None and not trd_sym.empty} dir={sym_dir}")
+
     dec_path, trd_path = _consolidate_phase4_outputs(artifacts_root)
+
+    # ---------------------------
+    # Execution reconciliation diagnostics
+    # ---------------------------
+    diag_dir = artifacts_root / "diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    #entries_reported = int(total_entries) if "total_entries" in locals() else None
+
+    # Count attempted actions (engine wanted to trade, even if qty=0)
+    attempt_files = list(artifacts_root.rglob("attempted_actions.parquet"))
+    attempt_rows = 0
+    for p in attempt_files:
+        try:
+            attempt_rows += len(pd.read_parquet(p))
+        except Exception:
+            pass
+
+    trades_rows = 0
+    if trd_path is not None and Path(trd_path).exists():
+        try:
+            trades_rows = int(len(pd.read_parquet(trd_path)))
+        except Exception:
+            trades_rows = -1
+
+    recon = {
+        "attempted_actions_rows": attempt_rows,
+        "attempted_actions_files": len(attempt_files),
+        "consolidated_trades_rows": trades_rows,
+        "decisions_path": str(dec_path) if dec_path else None,
+        "trades_path": str(trd_path) if trd_path else None,
+    }
+
+    (diag_dir / "execution_reconciliation.json").write_text(json.dumps(recon, indent=2))
+    print(f"[Diag] execution reconciliation → {diag_dir / 'execution_reconciliation.json'} :: {recon}")
+
+    if attempt_rows > 0 and trades_rows == 0:
+        print(
+            "[Diag][WARN] attempted_actions>0 but consolidated trades==0. "
+            "Engine is generating attempts, but execution produced no trades."
+        )
 
     # Mirror consolidated outputs into portfolio/ under THIS SAME artifacts_root
     port_dir = artifacts_root / "portfolio"
@@ -4941,6 +5368,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     if trd_path is not None:
         trd = pd.read_parquet(trd_path)
+        # HARD FAIL: decisions exist but no trades exist
+        if len(dec) > 0 and len(trd) == 0 and not cfg.get("allow_no_trades", False):
+            raise SystemExit("[HARD FAIL] consolidated decisions exist but consolidated trades is empty (0 rows).")
 
         # Phase 2.2 HARD GATE: multi-symbol portfolio must actually trade >=2 symbols
         if (not bool(cfg.get("is_fold_run", False))) and isinstance(cfg.get("universe"), (list, tuple)) and len(
