@@ -401,53 +401,46 @@ def _timestamp_overlap_share(
     symbol_col: str = "symbol",
     min_symbols: int = 2,
     presence_col: str = "close",
-    # BACKWARD COMPAT ALIAS:
     present_col: str | None = None,
 ) -> float:
-    # If caller used the old kwarg name, map it to the new one.
     if present_col is not None:
         presence_col = present_col
 
     if bars is None or bars.empty:
+        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (bars empty)")
         return 0.0
     if ts_col not in bars.columns or symbol_col not in bars.columns:
+        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (missing cols)")
         return 0.0
 
     b = bars.copy()
     b[ts_col] = pd.to_datetime(b[ts_col], utc=True, errors="coerce")
     b = b.dropna(subset=[ts_col, symbol_col])
+    if b.empty:
+        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (after dropna empty)")
+        return 0.0
 
+    used_presence = False
     if presence_col in b.columns:
-        #b = b[b[presence_col].notna()]
+        used_presence = True
+        # IMPORTANT: this is the filtering that changes the denominator
         b = b[b[presence_col].astype(bool)]
 
     if b.empty:
+        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} used_presence={used_presence} (after presence filter empty)")
         return 0.0
 
     counts = b.groupby(ts_col)[symbol_col].nunique()
-    if len(counts) == 0:
-        return 0.0
+    total = int(len(counts))
+    good = int((counts >= int(min_symbols)).sum())
+    ratio = float(good) / float(total) if total else 0.0
 
-    good = (counts >= int(min_symbols)).sum()
-    return float(good) / float(len(counts))
-
-
-def _overlap_share_from_decisions(decisions_df, ts_col="decision_ts", symbol_col="symbol", min_symbols=2):
-    if decisions_df is None or len(decisions_df) == 0:
-        return 0.0
-    if ts_col not in decisions_df.columns or symbol_col not in decisions_df.columns:
-        return 0.0
-
-    ts = pd.to_datetime(decisions_df[ts_col], utc=True, errors="coerce")
-    sym = decisions_df[symbol_col].astype(str)
-
-    good = ts.notna() & sym.notna()
-    if good.sum() == 0:
-        return 0.0
-
-    tmp = pd.DataFrame({ts_col: ts[good], symbol_col: sym[good]})
-    counts = tmp.groupby(ts_col)[symbol_col].nunique()
-    return float((counts >= int(min_symbols)).mean())
+    print(
+        f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} "
+        f"min_symbols={min_symbols} used_presence={used_presence} "
+        f"n_unique_ts_total={total} n_ts_meeting_min_symbols={good} overlap_ratio={ratio:.6f}"
+    )
+    return ratio
 
 
 from typing import Any, Dict, List
@@ -1021,6 +1014,45 @@ def run_batch(
 
         n_syms_actual = int(bars["symbol"].nunique()) if "symbol" in bars.columns else 0
 
+        # -------------------- [OVERLAP-AUDIT] inputs + presence distribution --------------------
+        # Minimal “column existence proof”
+        has_cols = {k: (k in bars.columns) for k in
+                    ["timestamp", "symbol", "open", "high", "low", "close", "bar_present"]}
+        print(f"[OVERLAP-AUDIT] has_cols={has_cols}")
+
+        # unified clock size (the “true” minute universe)
+        clock_len = int(len(unified_clock)) if "unified_clock" in locals() and unified_clock is not None else None
+
+        # Per-symbol bar_present coverage and counts (post-timegrid)
+        per_symbol_counts = {}
+        per_symbol_coverage = {}
+        if ("symbol" in bars.columns) and ("bar_present" in bars.columns):
+            g = bars.groupby("symbol", sort=False)["bar_present"]
+            per_symbol_coverage = g.mean().astype(float).to_dict()  # coverage over the FULL grid
+            # value_counts for 0/1
+            for sym, s in g:
+                vc = s.value_counts(dropna=False).to_dict()
+                # normalize keys to strings "0"/"1" to be JSON-safe
+                #per_symbol_counts[str(sym)] = {str(int(k)): int(v) for k, v in vc.items()}
+                norm_counts = {}
+                for k, v in vc.items():
+                    if k is None or (isinstance(k, float) and pd.isna(k)):
+                        key = "NaN"
+                    else:
+                        try:
+                            key = str(int(k))
+                        except Exception:
+                            key = str(k)
+                    norm_counts[key] = int(v)
+                per_symbol_counts[str(sym)] = norm_counts
+
+            print(f"[OVERLAP-AUDIT] clock_len={clock_len} per_symbol_coverage={per_symbol_coverage}")
+            # Optional: smaller, more readable per-symbol counts
+            for sym in sorted(per_symbol_counts.keys()):
+                print(f"[OVERLAP-AUDIT] sym={sym} bar_present_counts={per_symbol_counts[sym]}")
+
+        # ---------------------------------------------------------------------------------------
+
         overlap = _timestamp_overlap_share(
             bars,
             min_symbols=2,
@@ -1029,7 +1061,80 @@ def run_batch(
             presence_col="bar_present",
         )
 
-        min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+        # Compute “overlap on clock” view (not changing behavior—just auditing)
+        # Rebuild the counts used by overlap so we can compute good_ts and also compare to clock_len
+        good_ts = None
+        total_ts = None
+        overlap_on_clock = None
+
+        try:
+            # replicate overlap basis: presence-filtered bars
+            b = bars.copy()
+            b["timestamp"] = pd.to_datetime(b["timestamp"], utc=True, errors="coerce")
+            b = b.dropna(subset=["timestamp", "symbol"])
+            '''if "bar_present" in b.columns:
+                b = b[b["bar_present"].astype(bool)]
+            '''
+            if "bar_present" in b.columns:
+                bp = pd.to_numeric(b["bar_present"], errors="coerce").fillna(0)
+                b = b[bp > 0]
+
+            counts = b.groupby("timestamp")["symbol"].nunique()
+            total_ts = int(len(counts))
+            good_ts = int((counts >= 2).sum())
+
+            if clock_len and clock_len > 0:
+                overlap_on_clock = float(good_ts) / float(clock_len)
+        except Exception as e:
+            print(f"[OVERLAP-AUDIT] failed to compute overlap_on_clock view: {e!r}")
+
+        # Contradiction log (NOT a fail in Task 1)
+        contradiction = None
+        if overlap >= 0.95 and per_symbol_coverage:
+            low = {sym: float(cov) for sym, cov in per_symbol_coverage.items() if float(cov) < 0.50}
+            if low:
+                contradiction = {"overlap_ratio": float(overlap), "low_coverage": low, "clock_len": clock_len,
+                                 "good_ts": good_ts, "total_ts": total_ts}
+                print(f"[OVERLAP-CONTRADICTION] overlap_high but symbol_low_coverage: {contradiction}")
+
+        # Build JSON payload (Task 1 required fields + extra context)
+        overlap_audit = {
+            "basis": "bars_after_timegrid",
+            "ts_col": "timestamp",
+            "symbol_col": "symbol",
+            "presence_col": "bar_present",
+            "min_symbols": 2,
+
+            # Required integers + ratio
+            "n_unique_ts_total": total_ts,
+            "n_ts_meeting_min_symbols": good_ts,
+            "overlap_ratio": float(overlap),
+
+            # “What you thought overlap meant”
+            "clock_len": clock_len,
+            "overlap_on_clock_view": overlap_on_clock,
+
+            # Required per-symbol outputs
+            "per_symbol_coverage": per_symbol_coverage,
+            "per_symbol_counts": per_symbol_counts,
+
+            # Optional contradiction payload
+            "contradiction": contradiction,
+
+
+        }
+
+        try:
+            diag_dir = (artifacts_root / "diagnostics")
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            (diag_dir / "overlap_audit.json").write_text(json.dumps(overlap_audit, indent=2, default=str),
+                                                         encoding="utf-8")
+        except Exception as e:
+            print(f"[WARN] failed to write diagnostics/overlap_audit.json: {e!r}")
+
+        #print("[OVERLAP-AUDIT] wrote diagnostics/overlap_audit.json")
+
+        '''min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
 
         overlap_audit = {
             "basis": "bars_after_timegrid",
@@ -1059,7 +1164,44 @@ def run_batch(
                 encoding="utf-8",
             )
         except Exception as e:
-            print(f"[WARN] failed to write overlap_audit.json: {e!r}")
+            print(f"[WARN] failed to write overlap_audit.json: {e!r}")'''
+
+        # ----------------------------------------------------------------------
+        # Gate summary (DO NOT overwrite overlap_audit.json)
+        # ----------------------------------------------------------------------
+        min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
+
+        overlap_gate_summary = {
+            "basis": "bars_after_timegrid",
+            "requested_symbols": requested_syms,
+            "requested_n": int(requested_n),
+            "actual_n_symbols": int(n_syms_actual),
+            "overlap_share_ge2": float(overlap),
+            "min_required": float(min_required),
+            "is_fold_run": bool(is_fold_run),
+            "default_enforce": bool(default_enforce),
+            "enforced": bool(enforce_overlap_gate),
+            "override_present": ("phase11_enforce_multisymbol_overlap_gate" in cfg),
+            "override_value": (cfg.get("phase11_enforce_multisymbol_overlap_gate", None)),
+        }
+
+        try:
+            diag_dir = (artifacts_root / "diagnostics")
+            diag_dir.mkdir(parents=True, exist_ok=True)
+
+            # IMPORTANT: different filename so we never overwrite overlap_audit.json
+            (diag_dir / "overlap_gate_summary.json").write_text(
+                json.dumps(overlap_gate_summary, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+            # optional convenience copy at root (OK to keep if you like)
+            (artifacts_root / "overlap_gate_summary.json").write_text(
+                json.dumps(overlap_gate_summary, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[WARN] failed to write overlap_gate_summary.json: {e!r}")
 
         print(
             f"[Gate] overlap_share(min_symbols>=2)={overlap:.4f} "
@@ -4819,15 +4961,31 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(f"shape={bars_std.shape}")
     print(f"symbol unique={sorted(bars_std['symbol'].unique().tolist())[:10]}")
 
-    overlap = _timestamp_overlap_share(
+    '''overlap = _timestamp_overlap_share(
         bars_std,
         ts_col="timestamp",
         symbol_col="symbol",
         min_symbols=2,
         presence_col="close",  # or 'bar_present' if you have it
-    )
+    )'''
 
+    # Ensure bar_present exists on the DF used for overlap
+    if "bar_present" not in bars_std.columns:
+        if "close" in bars_std.columns:
+            bars_std["bar_present"] = bars_std["close"].notna().astype("int8")
+        else:
+            bars_std["bar_present"] = 1
+
+    overlap = _timestamp_overlap_share(
+        bars_std,
+        min_symbols=2,
+        ts_col="timestamp",
+        symbol_col="symbol",
+        presence_col="bar_present",
+    )
     print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
+
+    #print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
     if overlap < float(cfg.get("min_multisymbol_share", 0.10)):
         raise RuntimeError(
             f"[GATE] multi-symbol share < {cfg.get('min_multisymbol_share', 0.10):.2f} "

@@ -56,12 +56,13 @@ def standardize_bars_to_grid(
     ts_col: str = "timestamp",
     freq: str = "60s",
     expected_freq_s: int = 60,
-    # Fill policy (explicit and deterministic):
+    global_index: pd.DatetimeIndex | None = None,
     fill_volume_zero: bool = True,
     keep_ohlc_nan: bool = True,
-    # Duplicates policy:
     hard_fail_on_duplicates: bool = False,
 ) -> tuple[pd.DataFrame, list[GridAuditRow]]:
+
+
     """
     Force every symbol onto one canonical UTC grid (default 60s).
     Invariant after this:
@@ -97,7 +98,7 @@ def standardize_bars_to_grid(
             df = df.loc[~dup_mask].copy()
 
         # Construct full UTC index from min..max on canonical grid
-        min_ts = pd.Timestamp(df[ts_col].min())
+        '''min_ts = pd.Timestamp(df[ts_col].min())
         max_ts = pd.Timestamp(df[ts_col].max())
 
         # Ensure tz-aware UTC stamps in index
@@ -111,6 +112,62 @@ def standardize_bars_to_grid(
             max_ts = max_ts.tz_convert("UTC")
 
         full_idx = pd.date_range(min_ts, max_ts, freq=freq, tz="UTC")
+        '''
+
+        # Construct the canonical UTC index.
+        # IMPORTANT: if a global_index is provided, we use it (prevents 24h min..max expansion).
+        if global_index is not None:
+            full_idx = pd.DatetimeIndex(global_index)
+            # ensure tz-aware UTC
+            if getattr(full_idx, "tz", None) is None:
+                full_idx = full_idx.tz_localize("UTC")
+            else:
+                full_idx = full_idx.tz_convert("UTC")
+            # Define min/max for auditing when global_index is used
+            min_ts = pd.Timestamp(full_idx.min())
+            max_ts = pd.Timestamp(full_idx.max())
+
+        else:
+            # fallback: per-symbol min..max (can be very large if your data spans many days)
+            '''min_ts = pd.Timestamp(df[ts_col].min())
+            max_ts = pd.Timestamp(df[ts_col].max())
+
+            if min_ts.tz is None:
+                min_ts = min_ts.tz_localize("UTC")
+            else:
+                min_ts = min_ts.tz_convert("UTC")
+            if max_ts.tz is None:
+                max_ts = max_ts.tz_localize("UTC")
+            else:
+                max_ts = max_ts.tz_convert("UTC")
+
+            full_idx = pd.date_range(min_ts, max_ts, freq=freq, tz="UTC")
+            '''
+
+            # IMPORTANT: DO NOT expand min→max with pd.date_range().
+            # That creates a 24h clock and explodes missingness (fake gaps).
+            # Instead, build the clock from OBSERVED timestamps (floored to the grid).
+            ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce").dropna()
+            if len(ts) == 0:
+                full_idx = pd.DatetimeIndex([], tz="UTC")
+                min_ts = pd.Timestamp("1970-01-01", tz="UTC")
+                max_ts = pd.Timestamp("1970-01-01", tz="UTC")
+            else:
+                ts = ts.dt.floor(freq)
+                full_idx = pd.DatetimeIndex(ts.unique()).sort_values()
+                # debug: prove we didn't min→max expand
+                print(
+                    f"[Grid] fallback clock (observed) symbol={sym} n={len(full_idx)} min={full_idx.min() if len(full_idx) else '∅'} max={full_idx.max() if len(full_idx) else '∅'}")
+
+                # ensure tz-aware UTC
+                if getattr(full_idx, "tz", None) is None:
+                    full_idx = full_idx.tz_localize("UTC")
+                else:
+                    full_idx = full_idx.tz_convert("UTC")
+
+                # define min/max for auditing consistency
+                min_ts = pd.Timestamp(full_idx.min())
+                max_ts = pd.Timestamp(full_idx.max())
 
         # Reindex onto the grid
         df = df.set_index(ts_col).reindex(full_idx)
