@@ -1,6 +1,7 @@
 # run_gates/consistency_gate.py
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
@@ -100,3 +101,115 @@ def run_consistency_gate(inp: ConsistencyGateInputs) -> None:
             debug.append(f"- {c}")
 
         raise RuntimeError("\n".join(debug))
+
+
+
+# ---------------------------------------------------------------------------
+# Portfolio coverage gate (Task 2)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CoverageGateResult:
+    """Outcome of enforcing minimum bar presence on the unified clock."""
+
+    threshold: float
+    mode: str  # "abort" | "drop"
+    presence_col: str
+    symbol_col: str
+
+    per_symbol_coverage: dict
+    failing_symbols: list
+    kept_symbols: list
+
+    clock_len: int
+    artifact_coverage_gate_path: Path
+    artifact_dropped_symbols_path: Optional[Path] = None
+
+
+def enforce_portfolio_bar_coverage_gate(
+    bars_std: "pd.DataFrame",
+    *,
+    artifacts_root: Path,
+    threshold: float = 0.75,
+    mode: str = "abort",
+    symbol_col: str = "symbol",
+    presence_col: str = "bar_present",
+    clock_len: Optional[int] = None,
+) -> CoverageGateResult:
+    """Enforce per-symbol coverage on the unified clock.
+
+    The input is expected to already be standardized to the *unified clock*.
+    Coverage is defined as mean(presence_col) per symbol.
+
+    Artifacts written:
+      - diagnostics/coverage_gate.json (always)
+      - diagnostics/dropped_symbols.json (only in drop-mode when failing symbols exist)
+    """
+    artifacts_root = Path(artifacts_root)
+    diag_dir = artifacts_root / "diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    if mode not in {"abort", "drop"}:
+        raise ValueError(f"coverage_gate_mode must be 'abort' or 'drop' (got {mode!r})")
+
+    if bars_std is None or len(bars_std) == 0:
+        raise RuntimeError("[COVERAGE-GATE] bars_std is empty; cannot compute coverage")
+
+    if symbol_col not in bars_std.columns:
+        raise RuntimeError(f"[COVERAGE-GATE] missing symbol_col={symbol_col!r} in bars_std")
+    if presence_col not in bars_std.columns:
+        raise RuntimeError(f"[COVERAGE-GATE] missing presence_col={presence_col!r} in bars_std")
+
+    # Normalize presence into numeric 0/1.
+    s = bars_std[presence_col]
+    if s.dtype == "bool":
+        pres = s.astype("int8")
+    else:
+        # tolerate float/int with NaN
+        pres = s.fillna(0).astype("float32")
+
+    cov_series = pres.groupby(bars_std[symbol_col].astype(str)).mean()
+    per_symbol_coverage = {str(k): float(v) for k, v in cov_series.to_dict().items()}
+
+    failing_symbols = sorted([sym for sym, c in per_symbol_coverage.items() if float(c) < float(threshold)])
+    kept_symbols = sorted([sym for sym in per_symbol_coverage.keys() if sym not in set(failing_symbols)])
+
+    # Attempt to infer clock length if caller didn't pass it.
+    if clock_len is None:
+        # If fully standardized, each symbol has exactly clock_len rows.
+        # We choose the max group size as a robust proxy.
+        clock_len = int(bars_std.groupby(symbol_col).size().max())
+
+    cov_path = diag_dir / "coverage_gate.json"
+    payload = {
+        "threshold": float(threshold),
+        "mode": str(mode),
+        "symbol_col": str(symbol_col),
+        "presence_col": str(presence_col),
+        "clock_len": int(clock_len),
+        "per_symbol_coverage": per_symbol_coverage,
+        "failing_symbols": failing_symbols,
+        "kept_symbols": kept_symbols,
+    }
+    cov_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    dropped_path: Optional[Path] = None
+    if failing_symbols and mode == "drop":
+        dropped_path = diag_dir / "dropped_symbols.json"
+        dropped_path.write_text(
+            json.dumps({"dropped": failing_symbols, "kept": kept_symbols}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    return CoverageGateResult(
+        threshold=float(threshold),
+        mode=str(mode),
+        presence_col=str(presence_col),
+        symbol_col=str(symbol_col),
+        per_symbol_coverage=per_symbol_coverage,
+        failing_symbols=failing_symbols,
+        kept_symbols=kept_symbols,
+        clock_len=int(clock_len),
+        artifact_coverage_gate_path=cov_path,
+        artifact_dropped_symbols_path=dropped_path,
+    )

@@ -4976,6 +4976,55 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         else:
             bars_std["bar_present"] = 1
 
+
+    # ------------------------------------------------------------------
+    # Task 2: coverage gate on the unified clock (abort or drop)
+    # ------------------------------------------------------------------
+    from feature_engineering.utils.consistency_gate import enforce_portfolio_bar_coverage_gate
+
+    coverage_threshold = float(cfg.get("min_bar_coverage_portfolio", 0.75))
+    coverage_mode = str(cfg.get("coverage_gate_mode", "abort")).strip().lower()
+
+    cov_res = enforce_portfolio_bar_coverage_gate(
+        bars_std,
+        artifacts_root=Path(cfg["artifacts_root"]),
+        threshold=coverage_threshold,
+        mode=coverage_mode,
+        symbol_col="symbol",
+        presence_col="bar_present",
+        clock_len=int(len(unified_clock)) if unified_clock is not None else None,
+    )
+
+    print(
+        "[COVERAGE-GATE] "
+        f"mode={cov_res.mode} threshold={cov_res.threshold:.3f} "
+        f"failing={cov_res.failing_symbols} kept={cov_res.kept_symbols} "
+        f"artifact={cov_res.artifact_coverage_gate_path}"
+    )
+
+    if cov_res.failing_symbols and cov_res.mode == "abort":
+        raise RuntimeError(
+            "[COVERAGE-GATE] abort: one or more symbols have insufficient bar coverage on the unified clock. "
+            f"threshold={cov_res.threshold:.3f} failing={cov_res.failing_symbols}. "
+            f"See {cov_res.artifact_coverage_gate_path}"
+        )
+
+    if cov_res.failing_symbols and cov_res.mode == "drop":
+        dropped = set(map(str, cov_res.failing_symbols))
+
+        # Update the canonical symbol lists used downstream.
+        symbols_requested = [s for s in map(str, symbols_requested) if s not in dropped]
+        symbols = [s for s in map(str, symbols) if s not in dropped]
+
+        # Filter the standardized bars used for overlap + later diagnostics.
+        bars_std = bars_std[bars_std["symbol"].astype(str).isin(set(symbols_requested))].copy()
+
+        print(
+            f"[COVERAGE-GATE] dropped={sorted(dropped)} continuing_with={symbols_requested} "
+            f"dropped_artifact={cov_res.artifact_dropped_symbols_path}"
+        )
+
+
     overlap = _timestamp_overlap_share(
         bars_std,
         min_symbols=2,
