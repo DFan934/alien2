@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import asyncio
 # after: from prediction_engine.calibration import load_calibrator, calibrate_isotonic
-#from ledger import PortfolioLedger, equity_curve_from_trades
+# from ledger import PortfolioLedger, equity_curve_from_trades
 import glob
 
 from feature_engineering.utils.artifacts_root import resolve_artifacts_root
 from pathlib import Path
-
+from feature_engineering.utils.timegrid import (
+    build_unified_clock,
+    compute_clock_hash,
+    assert_df_on_clock,
+    ClockMismatchError,
+)
 
 import pyarrow.dataset as ds
 from prediction_engine.prediction_engine.artifacts.manager import ArtifactManager
@@ -41,25 +46,18 @@ from prediction_engine.portfolio.risk import RiskLimits, RiskEngine
 
 from feature_engineering.utils.parquet_utc import write_parquet_utc
 
-
 import logging
 import sys
 from pathlib import Path
 
 from feature_engineering.utils.artifacts_root import resolve_artifacts_root
 
-
 # at top of scripts/run_backtest.py
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.types as pat
 
-
-
-
 from prediction_engine.run_context import RunContext
-
-
 
 import builtins
 
@@ -71,6 +69,7 @@ _NOISE_PREFIXES = (
     "[Cost]",
     "--- EXECUTING CORRECT BATCH_TOP_K METHOD ---",
 )
+
 
 def _install_print_filter(enable_verbose: bool) -> None:
     if enable_verbose:
@@ -86,8 +85,10 @@ def _install_print_filter(enable_verbose: bool) -> None:
 
     builtins.print = _quiet_print
 
+
 from pathlib import Path
 import json
+
 
 def _count_trade_files(run_dir: Path) -> dict:
     """
@@ -154,10 +155,12 @@ def grid_audit_to_json(grid_audits):
         out.append(rec)
     return out
 
+
 # --- Task3: run_context.json is the canonical root contract -------------------
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+
 
 def _write_run_context_json(artifacts_root: Path, payload: dict) -> None:
     artifacts_root = Path(artifacts_root)
@@ -173,6 +176,7 @@ def _write_run_context_json(artifacts_root: Path, payload: dict) -> None:
 
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     tmp_path.replace(out_path)  # atomic on Windows if same volume
+
 
 def _preflight_symbol_loads(cfg: dict, symbols: list[str], artifacts_root: "Path") -> None:
     import json
@@ -244,6 +248,7 @@ def _dbg_symbols(df, tag: str, *, max_syms: int = 10, ts_col: str = "timestamp")
     except Exception as e:
         print(f"[{tag}] dbg failed: {e!r}")
 
+
 def _hard_fail_if_fake_multisymbol(portfolio_decisions_path, *, min_share: float = 0.10):
     import pandas as pd
 
@@ -284,7 +289,6 @@ def _hard_fail_if_fake_multisymbol(portfolio_decisions_path, *, min_share: float
     return float(share)
 
 
-
 def _arrow_ts_between_filter(dataset: ds.Dataset, col: str, start: str, end: str):
     """
     Build an Arrow filter `(col >= start) & (col <= end)` where the Python datetime
@@ -296,7 +300,7 @@ def _arrow_ts_between_filter(dataset: ds.Dataset, col: str, start: str, end: str
         raise TypeError(f"Column {col!r} is not a timestamp: {tfield}")
 
     unit = tfield.unit  # 's'|'ms'|'us'|'ns'
-    tz = tfield.tz      # None or 'UTC' (or other tz)
+    tz = tfield.tz  # None or 'UTC' (or other tz)
 
     # Build Python datetimes with matching tz-awareness
     if tz is None:
@@ -304,7 +308,7 @@ def _arrow_ts_between_filter(dataset: ds.Dataset, col: str, start: str, end: str
         e_py = pd.to_datetime(end).to_pydatetime()
     else:
         s_py = pd.to_datetime(start, utc=True).to_pydatetime()
-        e_py = pd.to_datetime(end,   utc=True).to_pydatetime()
+        e_py = pd.to_datetime(end, utc=True).to_pydatetime()
 
     s_scalar = pa.scalar(s_py, type=pa.timestamp(unit, tz))
     e_scalar = pa.scalar(e_py, type=pa.timestamp(unit, tz))
@@ -313,10 +317,8 @@ def _arrow_ts_between_filter(dataset: ds.Dataset, col: str, start: str, end: str
     return (col_expr >= s_scalar) & (col_expr <= e_scalar)
 
 
-
-
 # --- Phase 4.1: unified minute clock over the universe (fast, no joins) ---
-def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols: list[str]) -> pd.DatetimeIndex:
+def build_audit_continuous_clock(parquet_root: Path | str, start: str, end: str, symbols: list[str]) -> pd.DatetimeIndex:
     root = Path(parquet_root)
     parts: list[pd.Series] = []
 
@@ -339,11 +341,11 @@ def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols:
     if not parts:
         return pd.DatetimeIndex([], tz="UTC")
 
-    '''uni = pd.Index(pd.concat(parts, ignore_index=True).unique())
+    #uni = pd.Index(pd.concat(parts, ignore_index=True).unique())
     #uni = pd.to_datetime(uni, utc=True).floor("T").sort_values().unique()
-    uni = pd.to_datetime(uni, utc=True).floor("min").sort_values().unique()
+    #uni = pd.to_datetime(uni, utc=True).floor("min").sort_values().unique()
 
-    return pd.DatetimeIndex(uni, tz="UTC")'''
+    #return pd.DatetimeIndex(uni, tz="UTC")
 
     if not parts:
         return pd.DatetimeIndex([], tz="UTC")
@@ -357,7 +359,6 @@ def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols:
 
     # CRITICAL: continuous 60s grid, even if the symbol is sparse
     return pd.date_range(start=mn, end=mx, freq="60s", tz="UTC")
-
 
 
 '''def _timestamp_overlap_share(
@@ -395,29 +396,32 @@ def build_unified_clock(parquet_root: Path | str, start: str, end: str, symbols:
 
 
 def _timestamp_overlap_share(
-    bars: pd.DataFrame,
-    *,
-    ts_col: str = "timestamp",
-    symbol_col: str = "symbol",
-    min_symbols: int = 2,
-    presence_col: str = "close",
-    present_col: str | None = None,
+        bars: pd.DataFrame,
+        *,
+        ts_col: str = "timestamp",
+        symbol_col: str = "symbol",
+        min_symbols: int = 2,
+        presence_col: str = "close",
+        present_col: str | None = None,
 ) -> float:
     if present_col is not None:
         presence_col = present_col
 
     if bars is None or bars.empty:
-        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (bars empty)")
+        print(
+            f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (bars empty)")
         return 0.0
     if ts_col not in bars.columns or symbol_col not in bars.columns:
-        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (missing cols)")
+        print(
+            f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (missing cols)")
         return 0.0
 
     b = bars.copy()
     b[ts_col] = pd.to_datetime(b[ts_col], utc=True, errors="coerce")
     b = b.dropna(subset=[ts_col, symbol_col])
     if b.empty:
-        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (after dropna empty)")
+        print(
+            f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} (after dropna empty)")
         return 0.0
 
     used_presence = False
@@ -427,7 +431,8 @@ def _timestamp_overlap_share(
         b = b[b[presence_col].astype(bool)]
 
     if b.empty:
-        print(f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} used_presence={used_presence} (after presence filter empty)")
+        print(
+            f"[OVERLAP] using presence_col={presence_col} ts_col={ts_col} symbol_col={symbol_col} min_symbols={min_symbols} used_presence={used_presence} (after presence filter empty)")
         return 0.0
 
     counts = b.groupby(ts_col)[symbol_col].nunique()
@@ -446,15 +451,15 @@ def _timestamp_overlap_share(
 from typing import Any, Dict, List
 from prediction_engine.testing_validation.walkforward import WalkForwardRunner
 
-
 # ---- 5.3: callable backtest entrypoint (fold TEST runner) --------------------
 from typing import Any, Dict
 
+
 def run_batch(
-    cfg: dict,
-    *,
-    artifacts_dir: str | Path | None = None,
-    ev_artifacts_dir: str | Path | None = None,
+        cfg: dict,
+        *,
+        artifacts_dir: str | Path | None = None,
+        ev_artifacts_dir: str | Path | None = None,
 ) -> dict:
     """
     Canonical, fold-safe batch backtest runner.
@@ -477,6 +482,13 @@ def run_batch(
     from feature_engineering.utils.artifacts_root import resolve_artifacts_root
     from prediction_engine.run_context import RunContext
 
+    import os
+    from pathlib import Path
+
+    print(f"[RUNFILE] __file__={Path(__file__).resolve()}")
+    print(f"[RUNFILE] cwd={Path.cwd().resolve()}")
+    print(f"[RUNFILE] pid={os.getpid()}")
+
     # ------------------------------------------------------------------
     # Phase 1.1 — Resolve ONE artifacts root
     # ------------------------------------------------------------------
@@ -486,7 +498,7 @@ def run_batch(
         artifacts_root = Path(artifacts_dir).expanduser().resolve()
         artifacts_root.mkdir(parents=True, exist_ok=True)
         cfg["artifacts_root"] = str(artifacts_root)
-        #print(f"[RunContext] (fold) artifacts_root={artifacts_root}")
+        # print(f"[RunContext] (fold) artifacts_root={artifacts_root}")
 
     else:
         # Top-level mode: create run directory under canonical base
@@ -510,7 +522,6 @@ def run_batch(
         '''artifacts_root = run_ctx.run_dir
         cfg["artifacts_root"] = str(artifacts_root)'''
 
-
         run_dir = run_ctx.run_dir
 
         # IMPORTANT: do NOT overwrite cfg["artifacts_root"] with run_dir.
@@ -521,9 +532,8 @@ def run_batch(
         # Keep a local name for downstream code that needs the per-run directory
         artifacts_root = run_dir
 
-
-        #print(f"[RunContext] artifacts_root(base)={base_root}")
-        #print(f"[RunContext] run_dir={artifacts_root}")
+        # print(f"[RunContext] artifacts_root(base)={base_root}")
+        # print(f"[RunContext] run_dir={artifacts_root}")
 
         print(f"[RunContext] artifacts_root(base)={base_root}")
         print(f"[RunContext] run_dir={artifacts_root}")
@@ -549,7 +559,7 @@ def run_batch(
 
     # Unified output directory alias (kept for backward compatibility)
     out_dir = artifacts_root
-    #out_dir = Path(cfg["artifacts_root"])
+    # out_dir = Path(cfg["artifacts_root"])
 
     # ------------------------------------------------------------------
     # EV artifacts directory
@@ -621,7 +631,7 @@ def run_batch(
     # Phase 2.1 — Build ONE canonical universe clock (minute grid) and
     #            reuse it everywhere (prevents per-symbol min..max expansion)
     # ------------------------------------------------------------------
-    unified_clock = build_unified_clock(
+    '''unified_clock = build_audit_continuous_clock(
         pq_root,
         start,
         end,
@@ -645,7 +655,61 @@ def run_batch(
         f"[Clock] unified minutes={len(unified_clock)} "
         f"min={unified_clock.min() if len(unified_clock) else None} "
         f"max={unified_clock.max() if len(unified_clock) else None}"
+    )'''
+
+
+    # ------------------------------------------------------------------
+    # Phase 4.1 (AUDIT-ONLY) — continuous 60s grid over min..max
+    # NOT the canonical unified_clock for Task 3.
+    # ------------------------------------------------------------------
+    '''audit_clock = build_audit_continuous_clock(
+        pq_root,
+        start,
+        end,
+        symbols,
     )
+    cfg["_audit_continuous_clock"] = audit_clock
+
+    (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (artifacts_root / "diagnostics" / "audit_continuous_clock.json").write_text(
+        json.dumps(
+            {
+                "n": int(len(audit_clock)),
+                "min_ts": str(audit_clock.min()) if len(audit_clock) else None,
+                "max_ts": str(audit_clock.max()) if len(audit_clock) else None,
+                "note": "continuous 60s grid (AUDIT ONLY) — not Task3 unified clock",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[AUDIT-CLOCK] continuous minutes={len(audit_clock)} "
+        f"min={audit_clock.min() if len(audit_clock) else None} "
+        f"max={audit_clock.max() if len(audit_clock) else None}"
+    )'''
+
+    # ------------------------------------------------------------------
+    # Phase 4.1 (AUDIT-ONLY) — continuous 60s grid over min.max
+    # NOT the canonical unified_clock for Task 3.
+    #
+    # IMPORTANT: this must NEVER run by default. Turn it on explicitly via:
+    #   cfg["enable_audit_clock"] = True
+    # ------------------------------------------------------------------
+    # --- Task 3: audit/continuous clock must NOT run by default (only opt-in debugging) ---
+    if bool(cfg.get("enable_audit_clock", False)):
+        #audit_clock = build_audit_continuous_clock(parquet_root, cfg["start"], cfg["end"], symbols)
+        audit_clock = build_audit_continuous_clock(pq_root, start, end, symbols)
+
+        cfg["_audit_continuous_clock"] = audit_clock  # debugging only
+        print(
+            f"[AUDIT-CLOCK] continuous minutes={len(audit_clock)} "
+            f"min={audit_clock.min() if len(audit_clock) else None} "
+            f"max={audit_clock.max() if len(audit_clock) else None}"
+        )
+    else:
+        cfg.pop("_audit_continuous_clock", None)
 
     '''bars = []
     for s in symbols:
@@ -669,7 +733,6 @@ def run_batch(
     # --- Phase 1.0: universe load audit + integrity ---
     loaded_symbols: list[str] = []
     missing_symbols: list[str] = []
-
 
     for s in symbols:
         try:
@@ -709,8 +772,6 @@ def run_batch(
                 "error": repr(e),
             }
 
-
-
     # AFTER the loop, once `bars` is built (concat of loaded dfs), BEFORE overlap/FE:
     is_portfolio_run = (cfg.get("is_fold_run") is not True)
 
@@ -741,6 +802,55 @@ def run_batch(
         if bars_list
         else pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
     )
+
+    # ------------------------------------------------------------------
+    # Task 3 — Canonical unified_clock (OBSERVED minutes only) + hash
+    # Build ONCE from REAL observed bars (pre-timegrid), then enforce everywhere.
+    # ------------------------------------------------------------------
+    clock_policy = str(cfg.get("clock_policy") or "min_symbols_observed").strip()
+    min_clock_symbols = int(cfg.get("clock_min_symbols") or 2)
+
+
+
+    # Build observed-minutes clock from bars that actually exist (close-notna).
+    # IMPORTANT: this is pre-timegrid, so close.notna() reflects REAL bars.
+    clock_index, clock_meta = build_unified_clock(
+        bars,
+        policy=clock_policy,
+        min_symbols=min_clock_symbols,
+        ts_col="timestamp",
+        symbol_col="symbol",
+        presence_col="close",
+    )
+    clock_hash = compute_clock_hash(clock_index)
+
+    cfg["_unified_clock"] = clock_index
+    cfg["_unified_clock_hash"] = clock_hash
+
+    # Persist canonical clock contract
+    (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (artifacts_root / "diagnostics" / "unified_clock.json").write_text(
+        json.dumps(
+            {
+                "policy": clock_policy,
+                "min_symbols": min_clock_symbols,
+                "n_minutes": int(len(clock_index)),
+                "ts_min": str(clock_index.min()) if len(clock_index) else None,
+                "ts_max": str(clock_index.max()) if len(clock_index) else None,
+                "clock_hash": clock_hash,
+                **(clock_meta or {}),
+            },
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[UNIFIED-CLOCK] policy={clock_policy} min_symbols={min_clock_symbols} "
+        f"n_minutes={len(clock_index)} hash={clock_hash}"
+    )
+
 
     _dbg_symbols(bars, "A_AFTER_CONCAT")
 
@@ -774,7 +884,6 @@ def run_batch(
                 f"Requested={symbols} Present={present} MissingOrEmpty={missing_symbols}. "
                 "See symbol_load_audit.json and universe_audit.json."
             )
-
 
     # Grid audit artifact (Task2)
     if hasattr(bars, "attrs") and "grid_audit" in bars.attrs:
@@ -885,7 +994,8 @@ def run_batch(
             ts_col="timestamp",
             freq="60s",
             expected_freq_s=60,
-            global_index=unified_clock,
+            #global_index=unified_clock,
+            global_index=cfg["_unified_clock"],
             fill_volume_zero=True,
             keep_ohlc_nan=True,
         )
@@ -902,11 +1012,23 @@ def run_batch(
 
         _dbg_symbols(bars, "D_AFTER_TIMEGRID")
 
+        # ------------------------------------------------------------------
+        # Task 3 enforcement: bars MUST be aligned to the canonical unified_clock
+        # ------------------------------------------------------------------
+        assert_df_on_clock(
+            bars,
+            clock_index=cfg["_unified_clock"],
+            expected_clock_hash=cfg["_unified_clock_hash"],
+            ts_col="timestamp",
+            who="bars(post-timegrid)",
+        )
+
+
         if not bool(cfg.get("is_fold_run", False)):
             requested = cfg.get("universe") or []
             if isinstance(requested, (list, tuple)) and len(requested) >= 2:
                 present = sorted(bars["symbol"].unique().tolist()) if (
-                            "symbol" in bars.columns and len(bars) > 0) else []
+                        "symbol" in bars.columns and len(bars) > 0) else []
                 if len(present) < 2:
                     raise RuntimeError(
                         "[HARD FAIL] Universe collapsed after timegrid standardization. "
@@ -926,7 +1048,7 @@ def run_batch(
         # Only enforce when this run is a multi-symbol portfolio run.
         # Walkforward fold runs are often single-symbol and must not trip this.
         # ------------------------------------------------------------------
-        #enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", False))
+        # enforce_overlap_gate = bool(cfg.get("phase11_enforce_multisymbol_overlap_gate", False))
 
         # ------------------------------------------------------------------
         # Phase 1.1 HARD GATE: multi-symbol timestamp overlap
@@ -1021,7 +1143,7 @@ def run_batch(
         print(f"[OVERLAP-AUDIT] has_cols={has_cols}")
 
         # unified clock size (the “true” minute universe)
-        clock_len = int(len(unified_clock)) if "unified_clock" in locals() and unified_clock is not None else None
+        clock_len = int(len(cfg["_unified_clock"])) if "unified_clock" in locals() and cfg["_unified_clock"] is not None else None
 
         # Per-symbol bar_present coverage and counts (post-timegrid)
         per_symbol_counts = {}
@@ -1033,7 +1155,7 @@ def run_batch(
             for sym, s in g:
                 vc = s.value_counts(dropna=False).to_dict()
                 # normalize keys to strings "0"/"1" to be JSON-safe
-                #per_symbol_counts[str(sym)] = {str(int(k)): int(v) for k, v in vc.items()}
+                # per_symbol_counts[str(sym)] = {str(int(k)): int(v) for k, v in vc.items()}
                 norm_counts = {}
                 for k, v in vc.items():
                     if k is None or (isinstance(k, float) and pd.isna(k)):
@@ -1121,7 +1243,6 @@ def run_batch(
             # Optional contradiction payload
             "contradiction": contradiction,
 
-
         }
 
         try:
@@ -1132,7 +1253,7 @@ def run_batch(
         except Exception as e:
             print(f"[WARN] failed to write diagnostics/overlap_audit.json: {e!r}")
 
-        #print("[OVERLAP-AUDIT] wrote diagnostics/overlap_audit.json")
+        # print("[OVERLAP-AUDIT] wrote diagnostics/overlap_audit.json")
 
         '''min_required = float(cfg.get("min_overlap_share_ge2", 0.10))
 
@@ -1230,7 +1351,6 @@ def run_batch(
         )
         feats_df = pipe.transform_mem(bars)
 
-
         # --- Phase 2 HARD ASSERT: multi-symbol must survive FE ---
         if len(symbols) >= 2:
             if "symbol" not in feats_df.columns:
@@ -1245,7 +1365,6 @@ def run_batch(
                     f"[Phase2][HARD FAIL] Multi-symbol run collapsed after FE: feats_df has n_symbols={feats_nsyms}. "
                     f"Requested symbols={symbols}. Investigate ingestion filters or FE merge logic."
                 )
-
 
         # --- HARD ASSERT: multi-symbol must survive FE ---
         if len(symbols) >= 2:
@@ -1314,7 +1433,6 @@ def run_batch(
     # Attach bar_present to decisions so downstream gates can enforce "real overlap".
     if {"timestamp", "symbol"}.issubset(decisions.columns) and {"timestamp", "symbol", "bar_present"}.issubset(
             bars.columns):
-
         # --- CRASH FIX: make merge keys unambiguous (timestamp cannot be both index+column) ---
         decisions = _merge_safe_frame(decisions, keys=["timestamp", "symbol"])
         bars = _merge_safe_frame(bars, keys=["timestamp", "symbol"])
@@ -1334,7 +1452,7 @@ def run_batch(
         decisions, bars, cfg, target_qty_col="target_qty"
     )
 
-    #trades = _simulate_trades_from_decisions(decisions, bars)
+    # trades = _simulate_trades_from_decisions(decisions, bars)
     # --- Execution rules (required) ---
     rules = cfg.get("execution_rules")
 
@@ -1362,7 +1480,6 @@ def run_batch(
                 f"[Phase2][HARD FAIL] trades contain only {n_trade_syms} symbol(s) "
                 f"with universe={symbols}. Fake multi-symbol portfolio."
             )
-
 
     # ------------------------------------------------------------------
     # Persist outputs
@@ -1406,15 +1523,16 @@ def run_batch(
     return metrics
 
 
-
-
 from prediction_engine.calibration import load_calibrator, map_mu_to_prob
+
 # Optional: only needed when building a portfolio equity curve in Phase-4.
 # Keep import lazy-safe so tests can import this module without the ledger package.
 try:
     from ledger import PortfolioLedger, equity_curve_from_trades  # type: ignore
 except Exception:  # ModuleNotFoundError or anything else
     PortfolioLedger = None  # not used in this file; stub to avoid NameError
+
+
     def equity_curve_from_trades(trades_df):
         """
         Minimal fallback: build an equity curve from realized PnL if present.
@@ -1436,37 +1554,32 @@ from prediction_engine.tx_cost import BasicCostModel  # NEW
 from execution.risk_manager import RiskManager
 from prediction_engine.testing_validation.async_backtester import BrokerStub  # NEW
 from scripts.rebuild_artefacts import rebuild_if_needed, _dbg  # NEW
-from scanner.detectors import build_detectors        # ‹— add scanner import
+from scanner.detectors import build_detectors  # ‹— add scanner import
 from backtester import Backtester
 from execution.manager import ExecutionManager
 from execution.metrics.report import load_blotter, pnl_curve, latency_summary
 from execution.manager import ExecutionManager
-from execution.risk_manager import RiskManager            # NEW
+from execution.risk_manager import RiskManager  # NEW
 from prediction_engine.tx_cost import BasicCostModel
 from prediction_engine.calibration import load_calibrator, calibrate_isotonic  # NEW – iso µ‑cal
-
 
 # ─── global run metadata ─────────────────────────────────────────────
 import uuid, subprocess, datetime as dt
 
-
-
-
-
-
-#from universes import StaticUniverse, FileUniverse
-#from universes import resolve_universe, UniverseError
+# from universes import StaticUniverse, FileUniverse
+# from universes import resolve_universe, UniverseError
 
 from universes.providers import StaticUniverse, FileUniverse
 import universes.providers as U
 
-
 import hashlib, json
+
 
 def _stable_universe_hash(symbols: list[str]) -> str:
     """Stable SHA1 over sorted symbols; safe for logs & meta."""
     payload = json.dumps(sorted([str(s).upper() for s in symbols]), separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
 
 def _requested_symbols_from_cfg(cfg: dict, fallback_symbols: list[str] | None = None) -> list[str]:
     """
@@ -1524,14 +1637,13 @@ def _universe_source_label(cfg: dict) -> str:
         if isinstance(u, str):
             return f"file:{u}"
         if isinstance(u, dict) and u.get("type", "").lower() == "sp500":
-            return f"sp500:{u.get('as_of','')}"
+            return f"sp500:{u.get('as_of', '')}"
     except Exception:
         pass
     return "unknown"
 
 
-
-RUN_ID = uuid.uuid4().hex[:8]          # short random id
+RUN_ID = uuid.uuid4().hex[:8]  # short random id
 try:
     '''GIT_SHA = subprocess.check_output(
         ["git", "rev-parse", "--short", "HEAD"],
@@ -1551,8 +1663,6 @@ RUN_META = {
     "started": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
 }
 
-
-
 # AFTER: RUN_META = {...}
 # ---- Step-3: mode toggle for backtest runner ----
 BACKTEST_MODE: str = "CLI"  # or "NOCLI" to auto-run all symbols across entire time range
@@ -1561,16 +1671,12 @@ from feature_engineering.pipelines.dataset_loader import load_parquet_dataset  #
 import pyarrow.dataset as ds
 
 
-
-
 # ─────────────────────────────────────────────────────────────────────
-
 
 
 # Keep only PCA feature columns (produced by CoreFeaturePipeline)
 def _pca_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c.startswith("pca_")]
-
 
 
 from pathlib import Path
@@ -1600,12 +1706,14 @@ def _discover_time_bounds_all(input_root: Path) -> tuple[pd.Timestamp, pd.Timest
 from dataclasses import dataclass
 from typing import List, Tuple, Literal
 
+
 @dataclass(frozen=True)
 class ResolvedUniverseWindow:
     symbols: List[str]
     start: str
     end: str
     partitions: str  # e.g., "BBY:2, RRC:1"
+
 
 def _partition_counts_str(input_root: Path, symbols: List[str]) -> str:
     parts = []
@@ -1616,10 +1724,11 @@ def _partition_counts_str(input_root: Path, symbols: List[str]) -> str:
     parts.sort(key=lambda x: x[0])
     return ", ".join([f"{s}:{n}" for s, n in parts])
 
+
 def resolve_universe_window_for_tests(
-    parquet_root: str | Path,
-    cfg: dict,
-    mode: Literal["CLI","NOCLI"] = "CLI",
+        parquet_root: str | Path,
+        cfg: dict,
+        mode: Literal["CLI", "NOCLI"] = "CLI",
 ) -> ResolvedUniverseWindow:
     """
     Pure, side-effect-free resolver used by tests to check Step-3 wiring.
@@ -1631,14 +1740,14 @@ def resolve_universe_window_for_tests(
         syms = discover_parquet_symbols(root)
         start_ts, end_ts = _discover_time_bounds_all(root)
         start_str = start_ts.strftime("%Y-%m-%d")
-        end_str   = end_ts.strftime("%Y-%m-%d")
+        end_str = end_ts.strftime("%Y-%m-%d")
     else:
         # CLI mode: take what's in cfg if provided, else discover symbols; keep dates if provided
         syms = cfg.get("universe").symbols if hasattr(cfg.get("universe"), "symbols") else cfg.get("symbols")
         if not syms:
             syms = discover_parquet_symbols(root)
         start_str = cfg.get("start") or "1900-01-01"
-        end_str   = cfg.get("end")   or "2100-01-01"
+        end_str = cfg.get("end") or "2100-01-01"
 
     return ResolvedUniverseWindow(
         symbols=list(syms),
@@ -1648,10 +1757,8 @@ def resolve_universe_window_for_tests(
     )
 
 
-
 from typing import Tuple
 import glob
-
 
 # --- timestamp normalization helper (tz-naive in UTC on disk) ---
 '''def _coerce_ts_cols(df: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFrame:
@@ -1681,8 +1788,10 @@ import glob
 
 from feature_engineering.utils.time import ensure_utc_timestamp_col
 
+
 class TimestampDtypeError(RuntimeError):
     pass
+
 
 def _enforce_utc_ts_cols(df: pd.DataFrame, cols: tuple[str, ...], who: str) -> pd.DataFrame:
     """
@@ -1697,6 +1806,7 @@ def _enforce_utc_ts_cols(df: pd.DataFrame, cols: tuple[str, ...], who: str) -> p
             except Exception as e:
                 raise TimestampDtypeError(f"{who} failed UTC enforcement for col={c}: {e}") from e
     return out
+
 
 def _drop_if_all_nat(df: pd.DataFrame, col: str, who: str) -> pd.DataFrame:
     """
@@ -1713,8 +1823,6 @@ def _drop_if_all_nat(df: pd.DataFrame, col: str, who: str) -> pd.DataFrame:
     return df
 
 
-
-
 def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path | None]:
     """
     Gather per-fold/per-symbol outputs and write:
@@ -1724,10 +1832,7 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
     """
     artifacts_root = artifacts_root.resolve()
     decisions_out = artifacts_root / "decisions.parquet"
-    trades_out    = artifacts_root / "trades.parquet"
-
-
-
+    trades_out = artifacts_root / "trades.parquet"
 
     # --- decisions: accept parquet or csv from folds ---
     dec_parts: list[pd.DataFrame] = []
@@ -1768,7 +1873,6 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
                 # tolerate partial/corrupt fold outputs
                 pass
 
-
     # --- NEW: accept root-level decisions/trades when runner already wrote them ---
     # If run_batch wrote decisions.parquet directly under artifacts_root, the
     # "parts" scan intentionally finds nothing (it only looks for fold/symbol parts).
@@ -1788,7 +1892,6 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
                 decisions_path = decisions_out
             except Exception as e:
                 print(f"[Consolidate] Failed reading root decisions.parquet: {e}")
-
 
     if dec_parts:
         '''dec = pd.concat(dec_parts, ignore_index=True).drop_duplicates()
@@ -1842,7 +1945,7 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
             raise RuntimeError("[UTC] decisions missing required 'timestamp' column at consolidation")
 
         dec = _enforce_utc_ts_cols(dec, ("timestamp",), who="[Consolidate decisions REQUIRED]")
-        #dec = _enforce_utc_ts_cols(dec, ("decision_ts",), who="[Consolidate decisions OPTIONAL]")
+        # dec = _enforce_utc_ts_cols(dec, ("decision_ts",), who="[Consolidate decisions OPTIONAL]")
         print(f"[UTC][DEBUG] decisions columns={list(dec.columns)} rows={len(dec)}")
         if "decision_ts" in dec.columns:
             print(f"[UTC][DEBUG] decision_ts dtype before={dec['decision_ts'].dtype}")
@@ -1872,12 +1975,11 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
             decisions_out,
             timestamp_cols=("timestamp", "decision_ts"),
         )
-        #decisions_path = decisions_out
+        # decisions_path = decisions_out
 
         decisions_path = decisions_out
     else:
         decisions_path = None
-
 
     # --- trades/fills/blotter: pick whatever exists and unify ---
     trade_parts: list[pd.DataFrame] = []
@@ -1918,7 +2020,6 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
             except Exception:
                 pass
 
-
     # --- NEW: accept root-level trades when runner already wrote them ---
     # If the runner wrote trades.parquet directly under artifacts_root, the scan above
     # intentionally finds nothing (it only looks for fold/symbol parts).
@@ -1928,8 +2029,6 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
         if root_trd.exists() and root_trd.stat().st_size > 100:
             try:
                 trades = pd.read_parquet(root_trd)
-
-
 
                 # Reject placeholder/stub trades files early
                 if len(trades) == 0:
@@ -1965,8 +2064,6 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
                 trades_path = trades_out
             except Exception as e:
                 print(f"[Consolidate] Failed reading root trades.parquet: {e}")
-
-
 
     if trade_parts:
         '''trades = pd.concat(trade_parts, ignore_index=True).drop_duplicates()
@@ -2087,8 +2184,8 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
         )
         trades_path = trades_out
 
-    #else:
-        #trades_path = None
+    # else:
+    # trades_path = None
 
     else:
         if "trades_path" not in locals():
@@ -2119,12 +2216,10 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
     except Exception as _e:
         print("[Consolidate][WARN] fallback-to-root failed:", repr(_e))
 
-
     print(
         f"[Consolidate][FINAL] decisions_path={decisions_path} trades_path={trades_path} "
         f"dec_parts={len(dec_parts)} trade_parts={len(trade_parts)}"
     )
-
 
     return decisions_path, trades_path
 
@@ -2141,18 +2236,17 @@ def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path
 '''
 
 
-
 def _phase4_consistency_gate(
-    *,
-    run_id: str | None,
-    artifacts_root: Path,
-    searched_dirs: list[Path],
-    decisions_paths_found: int,
-    trades_paths_found: int,
-    consolidated_decisions_written: bool,
-    consolidated_trades_written: bool,
-    report_phase_decisions_count: int,
-    report_phase_trades_count: int,
+        *,
+        run_id: str | None,
+        artifacts_root: Path,
+        searched_dirs: list[Path],
+        decisions_paths_found: int,
+        trades_paths_found: int,
+        consolidated_decisions_written: bool,
+        consolidated_trades_written: bool,
+        report_phase_decisions_count: int,
+        report_phase_trades_count: int,
 ) -> None:
     """
     Phase 4: hard-fail if consolidation/reporting contradicts itself.
@@ -2197,8 +2291,6 @@ def _phase4_consistency_gate(
             f"report_phase_trades_count={report_phase_trades_count}\n"
             "contradictions:\n  - " + "\n  - ".join(contradictions)
         )
-
-
 
 
 def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
@@ -2252,7 +2344,7 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
 
         if p.exists():
             df = pd.read_csv(p)
-            #ts = pd.to_datetime(df["Date"] + " " + df["Time"])
+            # ts = pd.to_datetime(df["Date"] + " " + df["Time"])
 
             ts = pd.to_datetime(df["Date"] + " " + df["Time"], utc=True, errors="coerce")
 
@@ -2261,7 +2353,8 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
             })
             df["timestamp"] = ts
             df["symbol"] = symbol
-            df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].sort_values("timestamp").reset_index(drop=True)
+            df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].sort_values("timestamp").reset_index(
+                drop=True)
             if not df.empty:
                 return df
     elif isinstance(csv_cfg, str) and csv_cfg:
@@ -2283,9 +2376,6 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
             f"[DATA] cfg['csv'] was provided but is not symbol-specific for {symbol}. "
             f"Use dict mapping, a '{{symbol}}' template, or per-symbol filenames."
         )
-
-
-
 
     # Fallback: hive-partitioned parquet
     '''parquet_root = _resolve_path(cfg.get("parquet_root", "parquet"))
@@ -2326,25 +2416,25 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
 
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
-    #filt = (
+    # filt = (
     #        (ds.field("timestamp") >= start_ts) &
     #        (ds.field("timestamp") <= end_ts)
-    #)
-    #table = dataset.to_table(filter=filt)
-    #if table.num_rows == 0:
+    # )
+    # table = dataset.to_table(filter=filt)
+    # if table.num_rows == 0:
     #    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol"])
     '''df = table.to_pandas()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df["symbol"] = str(symbol)'''
 
-    #df = table.to_pandas()
-    #df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    # df = table.to_pandas()
+    # df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
     # ▼ NEW: enforce unique timestamps after IO and any tz fiddling
-    #df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+    # df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
 
-    #df["symbol"] = str(symbol)
-    #return df.reset_index(drop=True)
+    # df["symbol"] = str(symbol)
+    # return df.reset_index(drop=True)
     filt = _arrow_ts_between_filter(dataset, "timestamp", cfg["start"], cfg["end"])
     table = dataset.to_table(filter=filt)
     if table.num_rows == 0:
@@ -2362,7 +2452,7 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
     if sym_dir.exists():
         parts = list(sym_dir.glob("year=*/month=*/*.parquet"))
         print(f"[LOAD] {symbol} parquet parts={len(parts)} (sample={parts[:2]})")
-    
+
     print(f"[LOAD] {symbol} source=PARQUET sym_dir={str(sym_dir)}")
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -2380,7 +2470,7 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
 
     # ensure unique, ordered minutes
     n_before = len(df)
-    #df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+    # df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
 
     # Convert to UTC-aware
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -2411,8 +2501,7 @@ def _load_bars_for_symbol(cfg: Dict[str, Any], symbol: str) -> pd.DataFrame:
 
     df["symbol"] = str(symbol)
     return df.reset_index(drop=True)
-    #return df.sort_values("timestamp").reset_index(drop=True)
-
+    # return df.sort_values("timestamp").reset_index(drop=True)
 
 
 # --- Phase 4.1 helper: get the feature row for (symbol, t) without labels ---
@@ -2423,7 +2512,7 @@ def _slice_features_at(df_features: pd.DataFrame, t: pd.Timestamp) -> pd.DataFra
     """
     t = pd.to_datetime(t, utc=True)
     # Exact match on minute; if your FE emits seconds, floor to minute first
-    #view = df_features.loc[df_features["timestamp"].dt.floor("T") == t]
+    # view = df_features.loc[df_features["timestamp"].dt.floor("T") == t]
     view = df_features.loc[df_features["timestamp"].dt.floor("min") == t]
 
     # We intentionally do not compute or touch any H-ahead targets here.
@@ -2435,15 +2524,15 @@ def _slice_features_at(df_features: pd.DataFrame, t: pd.Timestamp) -> pd.DataFra
 # ────────────────────────────────────────────────────────────────────────
 CONFIG: Dict[str, Any] = {
     # raw minute-bar CSV (Date, Time, Open, High, Low, Close, Volume)
-    #"csv": "raw_data/RRC.csv",
-    #"csv": "raw_data/{symbol}.csv",
-"csv": {
-  "RRC": "raw_data/RRC.csv",
-  "BBY": "raw_data/BBY.csv",
-},
+    # "csv": "raw_data/RRC.csv",
+    # "csv": "raw_data/{symbol}.csv",
+    "csv": {
+        "RRC": "raw_data/RRC.csv",
+        "BBY": "raw_data/BBY.csv",
+    },
 
     "parquet_root": "parquet",
-    #"symbol": "RRC",
+    # "symbol": "RRC",
     "universe": StaticUniverse(["RRC", "BBY"]),
     "start": "1998-08-26",
     "end": "1999-01-01",
@@ -2454,7 +2543,7 @@ CONFIG: Dict[str, Any] = {
     "longest_lookback_bars": 60,
     "p_gate_quantile": 0.55,
     "full_p_quantile": 0.65,
-    "artifacts_root": "artifacts/a2",   # where per-fold outputs go
+    "artifacts_root": "artifacts/a2",  # where per-fold outputs go
 
     # artefacts created by PathClusterEngine.build()
     "artefacts": "../weights",
@@ -2467,25 +2556,23 @@ CONFIG: Dict[str, Any] = {
     # "slippage_bp": 0.0,        # BrokerStub additional bp slippage
     "max_kelly": 0.5,
     "adv_cap_pct": 0.20,
-    #"spread_bp": 0.0,  # half-spread in basis points
-    #"commission": 0.0,  # $/share
-    #"slippage_bp": 0.0,  # BrokerStub additional bp slippage
+    # "spread_bp": 0.0,  # half-spread in basis points
+    # "commission": 0.0,  # $/share
+    # "slippage_bp": 0.0,  # BrokerStub additional bp slippage
     # debug/test toggle
-    #"debug_no_costs": True,  # ← set True for the tiny RRC slice
-    #"unit_test_force_constant_p": 0.60,
+    # "debug_no_costs": True,  # ← set True for the tiny RRC slice
+    # "unit_test_force_constant_p": 0.60,
     "vectorized_scoring": True,  # Step 4.6: enable batch scoring by minute across symbols
 
-
     # Costs ON by default — disable only for micro unit tests
-    "commission": 0.005,      # $/share (e.g., $0.005)
+    "commission": 0.005,  # $/share (e.g., $0.005)
     "debug_no_costs": False,  # True only for tiny synthetic tests
     # optional: if you later record half-spread per trade, we'll use that directly
 
-
-# dev gating options
-    "dev_scanner_loose": True,    # ← NEW
-    "dev_detector_mode": "OR",    # ← NEW; force OR even without YAML
-    "sign_check": True,           # ← NEW; report will compute AUC(1−p)
+    # dev gating options
+    "dev_scanner_loose": True,  # ← NEW
+    "dev_detector_mode": "OR",  # ← NEW; force OR even without YAML
+    "sign_check": True,  # ← NEW; report will compute AUC(1−p)
     "min_entries_per_fold": 100,  # ← NEW; fail fast if < 100 entries
     # misc
     "out": "backtest_signals.csv",
@@ -2494,9 +2581,9 @@ CONFIG: Dict[str, Any] = {
 
 CONFIG.update({
     # Sizer/ramping gates
-    "p_gate_quantile": 0.60,      # was 0.55
-    "full_p_quantile": 0.72,      # was 0.65
-    #"sizer_cost_lambda": 1.8,     # was 1.2 (penalize marginal p more)
+    "p_gate_quantile": 0.60,  # was 0.55
+    "full_p_quantile": 0.72,  # was 0.65
+    # "sizer_cost_lambda": 1.8,     # was 1.2 (penalize marginal p more)
 
     "sizer_strategy": "score",
     "max_gross_frac": 0.10,  # already defaulted in RiskCaps
@@ -2508,15 +2595,13 @@ CONFIG.update({
 
 })
 
-
-
-
-#import datetime as dt
-#CONFIG["artifacts_root"] = f"artifacts/a2_{dt.datetime.utcnow():%Y%m%d_%H%M%S}"
+# import datetime as dt
+# CONFIG["artifacts_root"] = f"artifacts/a2_{dt.datetime.utcnow():%Y%m%d_%H%M%S}"
 
 # Phase 1.1: Do NOT set artifacts_root here.
 # RunContext will choose a single canonical root once per run.
 CONFIG.pop("artifacts_root", None)
+
 
 # ────────────────────────────────────────────────────────────────────────
 
@@ -2587,9 +2672,9 @@ def _find_symbol_outputs(artifacts_root: Path, sym: str) -> dict:
     return out
 
 
-
 from pathlib import Path
 import pandas as pd
+
 
 def _ensure_utc_ts(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
     if df is None or df.empty or col not in df.columns:
@@ -2597,6 +2682,7 @@ def _ensure_utc_ts(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
     out = df.copy()
     out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
     return out
+
 
 def _write_symbol_outputs(artifacts_root: Path, sym: str,
                           decisions: pd.DataFrame | None,
@@ -2646,9 +2732,9 @@ def _overlap_metrics(bars: pd.DataFrame, *, ts_col="timestamp", symbol_col="symb
     # unique minutes per symbol
     per_symbol = (
         df.drop_duplicates([symbol_col, ts_col])
-          .groupby(symbol_col)[ts_col]
-          .size()
-          .to_dict()
+        .groupby(symbol_col)[ts_col]
+        .size()
+        .to_dict()
     )
 
     # global share with >=2 symbols present
@@ -2663,7 +2749,7 @@ def _overlap_metrics(bars: pd.DataFrame, *, ts_col="timestamp", symbol_col="symb
         dense_sym = max(per_symbol, key=per_symbol.get)
 
         sparse_ts = set(df.loc[df[symbol_col] == sparse_sym, ts_col].unique())
-        dense_ts  = set(df.loc[df[symbol_col] == dense_sym, ts_col].unique())
+        dense_ts = set(df.loc[df[symbol_col] == dense_sym, ts_col].unique())
 
         conditional = float(len(sparse_ts & dense_ts) / len(sparse_ts)) if sparse_ts else 0.0
 
@@ -2672,7 +2758,6 @@ def _overlap_metrics(bars: pd.DataFrame, *, ts_col="timestamp", symbol_col="symb
         "conditional_share_sparse_in_dense": conditional,
         "per_symbol_minutes": {str(k): int(v) for k, v in per_symbol.items()},
     }
-
 
 
 def _read_any(path: str) -> pd.DataFrame:
@@ -2751,22 +2836,20 @@ def _aggregate_universe_outputs(artifacts_root: Path, symbols: list[str]) -> tup
     if "symbol" in trd.columns:
         print("[DIAG][AGG] trades symbols:", trd["symbol"].value_counts().to_dict())
 
-
-
     return dec, trd
 
 
 # --- Phase 4.2: attach modeled costs to trades (commission + spread + impact)
 # --- Phase 4.2: attach modeled costs to trades (commission + spread + impact)
 def _apply_modeled_costs_to_trades(
-    trades: pd.DataFrame,
-    cfg: dict,
-    *,
-    price_col: str = "entry_price",
-    exit_price_col: str = "exit_price",
-    qty_col: str = "qty",
-    half_spread_col: str | None = "half_spread_usd",
-    adv_pct_col: str | None = "adv_frac",
+        trades: pd.DataFrame,
+        cfg: dict,
+        *,
+        price_col: str = "entry_price",
+        exit_price_col: str = "exit_price",
+        qty_col: str = "qty",
+        half_spread_col: str | None = "half_spread_usd",
+        adv_pct_col: str | None = "adv_frac",
 ) -> pd.DataFrame:
     """
     Add modeled costs and net PnL using flexible column names.
@@ -2803,9 +2886,9 @@ def _apply_modeled_costs_to_trades(
         return df
 
     # Knobs
-    spread_bp = float(cfg.get("spread_bp", 1.0))                      # half-spread (bps of price)
-    commission_per_share = float(cfg.get("commission", 0.0))          # $/share
-    slippage_bp = float(cfg.get("slippage_bp", 0.0))                  # bps
+    spread_bp = float(cfg.get("spread_bp", 1.0))  # half-spread (bps of price)
+    commission_per_share = float(cfg.get("commission", 0.0))  # $/share
+    slippage_bp = float(cfg.get("slippage_bp", 0.0))  # bps
     impact_bps_per_frac = float(cfg.get("impact_bps_per_adv_frac", 25.0))  # bps per 1.0 ADV frac
 
     # Core columns (always Series)
@@ -2845,7 +2928,7 @@ def _apply_modeled_costs_to_trades(
     else:
         # side derived from qty sign (if your qty stores signed direction)
         side = np.sign(qty_raw).replace(0.0, 1.0)  # treat 0 as +1 to avoid NaNs
-        base = (exit_ - entry) * (side * qty)      # crude
+        base = (exit_ - entry) * (side * qty)  # crude
 
     df["realized_pnl_after_costs"] = base - total
     return df
@@ -2854,7 +2937,6 @@ def _apply_modeled_costs_to_trades(
 # Phase 4.3 – simulator & quotes
 from prediction_engine.portfolio.order_sim import simulate_entry, simulate_exit, QuoteStats
 from prediction_engine.portfolio.quotes import estimate_quote_stats_from_rolling
-
 
 
 # put this with your other small helpers (e.g., above _simulate_trades_from_decisions)
@@ -2909,14 +2991,14 @@ def _ledger_snapshot_row(ledger):
         open_positions = 0
 
     snap = {
-        "cash":          _maybe("cash", 0.0),
-        "equity":        _maybe("equity", 0.0),
-        "gross":         _maybe("gross", 0.0),
-        "net":           _maybe("net", 0.0),
-        "day_pnl":       _maybe("day_pnl", 0.0),
-        "open_pnl":      _maybe("open_pnl", 0.0),
-        "closed_pnl":    _maybe("closed_pnl", 0.0),
-        "buying_power":  _maybe("buying_power", 0.0),
+        "cash": _maybe("cash", 0.0),
+        "equity": _maybe("equity", 0.0),
+        "gross": _maybe("gross", 0.0),
+        "net": _maybe("net", 0.0),
+        "day_pnl": _maybe("day_pnl", 0.0),
+        "open_pnl": _maybe("open_pnl", 0.0),
+        "closed_pnl": _maybe("closed_pnl", 0.0),
+        "buying_power": _maybe("buying_power", 0.0),
         "open_positions": open_positions,
     }
     return snap
@@ -2937,12 +3019,12 @@ def _ledger_fill(ledger, fill):
 
     # 2) Arg-style API: apply_fill(symbol, ts, qty, price, side=?, fees=?)
     if hasattr(ledger, "apply_fill"):
-        sym   = getattr(fill, "symbol", None)
-        ts    = getattr(fill, "ts", None)
-        qty   = float(getattr(fill, "qty", 0.0))
+        sym = getattr(fill, "symbol", None)
+        ts = getattr(fill, "ts", None)
+        qty = float(getattr(fill, "qty", 0.0))
         price = float(getattr(fill, "price", 0.0))
-        side  = int(getattr(fill, "side", 1))     # +1 long, -1 short
-        fees  = float(getattr(fill, "fees", 0.0))
+        side = int(getattr(fill, "side", 1))  # +1 long, -1 short
+        fees = float(getattr(fill, "fees", 0.0))
 
         # Try kwargs first (most descriptive)
         try:
@@ -2965,12 +3047,12 @@ def _ledger_fill(ledger, fill):
         try:
             return ledger.record(fill)
         except TypeError:
-            sym   = getattr(fill, "symbol", None)
-            ts    = getattr(fill, "ts", None)
-            qty   = float(getattr(fill, "qty", 0.0))
+            sym = getattr(fill, "symbol", None)
+            ts = getattr(fill, "ts", None)
+            qty = float(getattr(fill, "qty", 0.0))
             price = float(getattr(fill, "price", 0.0))
-            side  = int(getattr(fill, "side", 1))
-            fees  = float(getattr(fill, "fees", 0.0))
+            side = int(getattr(fill, "side", 1))
+            fees = float(getattr(fill, "fees", 0.0))
             return ledger.record(symbol=sym, ts=ts, qty=qty, price=price, side=side, fees=fees)
 
     raise AttributeError(
@@ -2978,15 +3060,14 @@ def _ledger_fill(ledger, fill):
     )
 
 
-
 # --- Phase 4.3: decisions → simulated trades (deterministic MOO/MOC, partial fills)
 def _simulate_trades_from_decisions(
-    decisions: pd.DataFrame,
-    bars: pd.DataFrame,
-    *,
-    rules: dict,
-    horizon_col: str = "horizon_bars",
-    target_qty_col: str = "target_qty",
+        decisions: pd.DataFrame,
+        bars: pd.DataFrame,
+        *,
+        rules: dict,
+        horizon_col: str = "horizon_bars",
+        target_qty_col: str = "target_qty",
 ) -> pd.DataFrame:
     """
     Turn per-bar 'decisions' into trades with entry/exit at next opens.
@@ -3007,6 +3088,7 @@ def _simulate_trades_from_decisions(
 
     # Build next-open lookup per symbol
     bars_by_sym = {s: g.sort_values("timestamp").reset_index(drop=True) for s, g in bars.groupby("symbol")}
+
     def _next_open(sym: str, t):
         g = bars_by_sym.get(sym)
         if g is None: return None, None, None
@@ -3018,7 +3100,7 @@ def _simulate_trades_from_decisions(
     for i, r in dec.iterrows():
         sym = str(r["symbol"])
         tgt = float(r.get(target_qty_col, 0.0))
-        H   = int(r.get(horizon_col, 1))
+        H = int(r.get(horizon_col, 1))
         if tgt == 0:
             continue
 
@@ -3029,7 +3111,8 @@ def _simulate_trades_from_decisions(
 
         # crude quote stats from bars (spread & ADV)
         q = estimate_quote_stats_from_rolling(
-            {"open": px_e, "adv_shares": bars_by_sym[sym]["volume"].rolling(20, min_periods=1).mean().iloc[max(0, bars_by_sym[sym]["timestamp"].searchsorted(ts_e)-1)]}
+            {"open": px_e, "adv_shares": bars_by_sym[sym]["volume"].rolling(20, min_periods=1).mean().iloc[
+                max(0, bars_by_sym[sym]["timestamp"].searchsorted(ts_e) - 1)]}
         )
 
         ent = simulate_entry(
@@ -3047,7 +3130,8 @@ def _simulate_trades_from_decisions(
         idx_x = idx_e + H
         if idx_x >= len(g):
             continue
-        px_x = float(g.loc[idx_x, "open"]); ts_x = _pd.Timestamp(g.loc[idx_x, "timestamp"])
+        px_x = float(g.loc[idx_x, "open"]);
+        ts_x = _pd.Timestamp(g.loc[idx_x, "timestamp"])
         ex = simulate_exit(
             position_row=_pd.Series({"filled_qty": ent.filled_qty, "entry_price": ent.entry_price}),
             exit_open_price=px_x,
@@ -3075,11 +3159,10 @@ def _simulate_trades_from_decisions(
     return _pd.DataFrame(rows)
 
 
-
 def _portfolio_execute_from_decisions(
-    decisions: pd.DataFrame,
-    bars: pd.DataFrame,
-    cfg: Dict[str, Any],
+        decisions: pd.DataFrame,
+        bars: pd.DataFrame,
+        cfg: Dict[str, Any],
 ) -> pd.DataFrame:
     """
     Portfolio-level execution layer (Option B MVP):
@@ -3112,7 +3195,8 @@ def _portfolio_execute_from_decisions(
             ts_col = c
             break
     if ts_col is None:
-        raise SystemExit("[HARD FAIL] decisions missing a recognizable timestamp column (expected decision_ts/timestamp/ts).")
+        raise SystemExit(
+            "[HARD FAIL] decisions missing a recognizable timestamp column (expected decision_ts/timestamp/ts).")
 
     d[ts_col] = pd.to_datetime(d[ts_col], utc=True, errors="coerce")
     d = d.dropna(subset=[ts_col])
@@ -3184,7 +3268,7 @@ def _portfolio_execute_from_decisions(
     # --- portfolio constraints ---
     initial_cash = float(cfg.get("initial_cash", cfg.get("starting_cash", 100000.0)))
     max_gross_leverage = float(cfg.get("max_gross_leverage", 1.0))  # 1.0 = no leverage
-    max_pos_frac = float(cfg.get("max_pos_frac", 0.10))            # max 10% equity per position notional
+    max_pos_frac = float(cfg.get("max_pos_frac", 0.10))  # max 10% equity per position notional
     max_positions_per_ts = int(cfg.get("max_positions_per_ts", cfg.get("portfolio_top_k", 5)))
 
     # state
@@ -3376,15 +3460,14 @@ def _portfolio_execute_from_decisions(
     return tr.sort_values(["entry_ts", "symbol"]).reset_index(drop=True)
 
 
-
 # --- Phase 4.4: compute target_qty from calibrated p with a dose–response ramp + cost hurdle
 # --- Phase 4.4: compute target_qty from calibrated p with a dose–response ramp + cost hurdle
 def _apply_sizer_to_decisions(
-    decisions: pd.DataFrame,
-    bars: pd.DataFrame,
-    cfg: dict,
-    *,
-    target_qty_col: str = "target_qty",   # <- define it here
+        decisions: pd.DataFrame,
+        bars: pd.DataFrame,
+        cfg: dict,
+        *,
+        target_qty_col: str = "target_qty",  # <- define it here
 ) -> pd.DataFrame:
     """
     Fills `target_qty_col` in decisions using size_from_p on the next-open price and simple vol proxy.
@@ -3484,7 +3567,6 @@ def _apply_sizer_to_decisions(
 
     dec[target_qty_col] = target_qty
     return dec
-
 
 
 # --- Phase 4.5: risk gating before turning decisions into trades -------------
@@ -3607,7 +3689,8 @@ def _csv_path_for_symbol(cfg: dict, symbol: str) -> str:
     if isinstance(csv_cfg, dict):
         p = csv_cfg.get(symbol)
         if not p:
-            raise RuntimeError(f"[REPORT] cfg['csv'] dict missing entry for symbol={symbol}. keys={list(csv_cfg.keys())}")
+            raise RuntimeError(
+                f"[REPORT] cfg['csv'] dict missing entry for symbol={symbol}. keys={list(csv_cfg.keys())}")
         return p
 
     if isinstance(csv_cfg, str) and csv_cfg:
@@ -3633,6 +3716,7 @@ def _csv_path_for_symbol(cfg: dict, symbol: str) -> str:
 
 
 from pathlib import Path
+
 
 def _resolve_csv_root_for_reporting(cfg: dict) -> Path:
     """
@@ -3667,7 +3751,6 @@ def _resolve_csv_root_for_reporting(cfg: dict) -> Path:
     return _resolve_path("raw_data", create=False, is_dir=True)
 
 
-
 async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
     log = logging.getLogger("backtest")
@@ -3687,7 +3770,6 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     sym_dir = out_dir  # single source of truth
 
     print(f"[OneSym-START] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
-
 
     # 1) Load bars for this symbol
     df_raw = _load_bars_for_symbol(cfg, sym)
@@ -3721,7 +3803,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     if cfg.get("dev_detector_mode", "").upper() in {"OR", "AND"}:
         detector.mode = cfg["dev_detector_mode"].upper()
 
-    #mask = await detector(df_raw)
+    # mask = await detector(df_raw)
 
     # --- Scanner diagnostics (INPUT) ---
     # Place this immediately before: mask = detector(df_raw)
@@ -3925,7 +4007,8 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     unified_clock = cfg.get("_unified_clock")
     grid_seconds = int(cfg.get("_bar_grid_seconds", 60))
     if unified_clock is None or len(unified_clock) == 0:
-        raise SystemExit("[ABORT] unified_clock missing/empty in cfg. Build it in run() and store cfg['_unified_clock'].")
+        raise SystemExit(
+            "[ABORT] unified_clock missing/empty in cfg. Build it in run() and store cfg['_unified_clock'].")
 
     df_full_std, grid_audits = standardize_bars_to_grid(
         df_full,
@@ -3936,7 +4019,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         fill_volume_zero=True,
         keep_ohlc_nan=True,
         hard_fail_on_duplicates=False,
-        global_index=unified_clock,   # <<< CRITICAL: ensures we use the same canonical clock
+        global_index=unified_clock,  # <<< CRITICAL: ensures we use the same canonical clock
     )
 
     # Optional audit prints
@@ -3965,7 +4048,6 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     #   - pass df_full (standardized 60s) into WalkForwardRunner as df_full
     #   - pass df_scanned into WalkForwardRunner as df_scanned
     df_raw = df_scanned  # keep your existing variable name usage below
-
 
     # --- Test-only override: force constant p to exercise the full Phase-4 pipeline on bare OHLCV hives ---
     unit_p = float(cfg.get("unit_test_force_constant_p", float("nan")))
@@ -3999,7 +4081,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         '''
 
         # Sizer → target_qty on next-open
-        bars_min = df_full[["timestamp","symbol","open","volume"]].copy()
+        bars_min = df_full[["timestamp", "symbol", "open", "volume"]].copy()
         sized_all = _apply_sizer_to_decisions(decisions=dec, bars=bars_min, cfg=cfg)
 
         # ---------------------------
@@ -4060,7 +4142,6 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
             horizon_col="horizon_bars", target_qty_col="target_qty",
         )
 
-
         # Simulate fills (MOO/MOC with gap bands + partial fills)
         rules = {
             "max_participation": float(cfg.get("max_participation", 0.25)),
@@ -4116,7 +4197,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
         return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
 
-        #return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
+        # return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
 
     # 2) Walk-forward runner (unchanged, but pass symbol)
     resolved_parquet_root = _resolve_path(cfg["parquet_root"])
@@ -4124,7 +4205,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     # --- Phase 3: ensure fresh artifacts for this symbol ---
     am = ArtifactManager(
         parquet_root=_resolve_path(cfg.get("parquet_root", "parquet")),
-        #artifacts_root=_resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True),
+        # artifacts_root=_resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True),
         artifacts_root=resolve_artifacts_root(cfg, create=True),
     )
 
@@ -4208,15 +4289,14 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         config_hash_parts=cfg_hash_parts,
         schema_hash_parts=schema_hash_parts,
 
+        # pooled_builder=lambda syms, out_dir, s, e: build_pooled_core(syms, out_dir, s, e, am.parquet_root,
 
-        #pooled_builder=lambda syms, out_dir, s, e: build_pooled_core(syms, out_dir, s, e, am.parquet_root,
+        # unified_clock=cfg.get("_unified_clock", None),
+        # grid_seconds = int(cfg.get("_bar_grid_seconds", cfg.get("bar_grid_seconds", 60))),
 
-        #unified_clock=cfg.get("_unified_clock", None),
-        #grid_seconds = int(cfg.get("_bar_grid_seconds", cfg.get("bar_grid_seconds", 60))),
+        # from scripts.rebuild_artefacts import build_pooled_core
 
-        #from scripts.rebuild_artefacts import build_pooled_core
-
-        pooled_builder = lambda syms, out_dir, s, e: build_pooled_core(
+        pooled_builder=lambda syms, out_dir, s, e: build_pooled_core(
             syms,
             out_dir,
             s,
@@ -4227,7 +4307,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
             grid_seconds=grid_seconds,
         ),
 
-        #n_clusters=int(cfg.get("k_max", 64)),
+        # n_clusters=int(cfg.get("k_max", 64)),
         calibrator_builder=lambda sym, pooled_dir, s, e: fit_symbol_calibrator(sym, pooled_dir, s, e, am.parquet_root)
     )
 
@@ -4249,17 +4329,15 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         debug_no_costs=bool(cfg.get("debug_no_costs", False)),
     )'''
 
-    #from feature_engineering.utils.artifacts_root import resolve_artifacts_root
+    # from feature_engineering.utils.artifacts_root import resolve_artifacts_root
 
-    #base_artifacts_root = resolve_artifacts_root(cfg, create=True) / "a2"
+    # base_artifacts_root = resolve_artifacts_root(cfg, create=True) / "a2"
 
     # Canonical Phase 1.1 run directory: <repo_root>/artifacts/a2_<RUN_ID>
     base_artifacts_root = resolve_artifacts_root(cfg, run_id=RUN_ID, create=True)
-    #cfg["artifacts_root"] = str(base_artifacts_root)
+    # cfg["artifacts_root"] = str(base_artifacts_root)
 
-
-
-    #_preflight_symbol_loads(cfg, symbols, base_artifacts_root)
+    # _preflight_symbol_loads(cfg, symbols, base_artifacts_root)
 
     '''runner = WalkForwardRunner(
         artifacts_root=base_artifacts_root,
@@ -4274,7 +4352,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     )'''
 
     runner = WalkForwardRunner(
-        #artifacts_root=base_artifacts_root,
+        # artifacts_root=base_artifacts_root,
         artifacts_root=sym_dir,
         parquet_root=resolved_parquet_root,
         ev_artifacts_root=_resolve_path(cfg["artefacts"]),
@@ -4291,8 +4369,8 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     )
 
     # metadata
-    #meta_path = _resolve_path(cfg.get("artifacts_root", "artifacts/a2")) / "meta.json"
-    #meta_path.parent.mkdir(parents=True, exist_ok=True)
+    # meta_path = _resolve_path(cfg.get("artifacts_root", "artifacts/a2")) / "meta.json"
+    # meta_path.parent.mkdir(parents=True, exist_ok=True)
 
     # metadata (STRICT: always write under the canonical per-run artifacts root)
     meta_path = base_artifacts_root / "meta.json"
@@ -4330,7 +4408,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     _ = runner.run(
         df_full=df_full,
-        #df_scanned=df_raw,
+        # df_scanned=df_raw,
         df_scanned=df_scanned,
         start=cfg["start"],
         end=cfg["end"],
@@ -4380,7 +4458,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     generate_report(artifacts_root=str(sym_dir), csv_path=csv_path_for_report)
 
-    #return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(cfg.get("artifacts_root", "artifacts/a2"))}])
+    # return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(cfg.get("artifacts_root", "artifacts/a2"))}])
 
     return pd.DataFrame([{
         "run_id": RUN_ID,
@@ -4399,7 +4477,7 @@ def _score_minute_batch_shim(ev_engine, minute_df: pd.DataFrame) -> pd.DataFrame
         return minute_df
     pca_cols = [c for c in minute_df.columns if c.startswith("pca_")]
     if not pca_cols:
-        return pd.DataFrame(columns=["timestamp","symbol","p_raw","p_cal"])
+        return pd.DataFrame(columns=["timestamp", "symbol", "p_raw", "p_cal"])
     res = vectorize_minute_batch(ev_engine, minute_df, pca_cols)
     return res.frame
 
@@ -4411,6 +4489,7 @@ def _share_multisymbol(decisions: pd.DataFrame) -> float:
         return 0.0
     g = decisions.groupby('timestamp')['symbol'].nunique()
     return float((g >= 2).mean())
+
 
 def _median_slippage_error_bps(trades: pd.DataFrame) -> float:
     """
@@ -4430,16 +4509,17 @@ def _median_slippage_error_bps(trades: pd.DataFrame) -> float:
         side = (df["qty"] > 0).astype(float).where(df["qty"].notna(), 1.0) * 2.0 - 1.0
 
     ideal_entry = df["entry_price"] - (side * df["half_spread_usd"] * -1.0)
-    ideal_exit  = df["exit_price"]  + (side * df["half_spread_usd"] * -1.0)
+    ideal_exit = df["exit_price"] + (side * df["half_spread_usd"] * -1.0)
 
     def _bps(err, base):
         base = base.where(base.abs() > 1e-12, 1.0)
         return (err.abs() / base) * 1e4
 
     entry_bps = _bps((df["entry_price"] - ideal_entry), df["entry_price"])
-    exit_bps  = _bps((df["exit_price"]  - ideal_exit),  df["exit_price"])
+    exit_bps = _bps((df["exit_price"] - ideal_exit), df["exit_price"])
     both = pd.concat([entry_bps, exit_bps], ignore_index=True)
     return float(both.median(skipna=True))
+
 
 def _sizing_sanity(decisions: pd.DataFrame, *, p_threshold: float = 0.60, p_gate: float | None = None) -> dict:
     """
@@ -4457,7 +4537,7 @@ def _sizing_sanity(decisions: pd.DataFrame, *, p_threshold: float = 0.60, p_gate
         out["median_pos_gt_zero"] = float(hi["target_qty"].fillna(0).abs().median()) > 0.0
 
     gate = float(p_gate) if p_gate is not None else p_threshold
-    #v = decisions.loc[(decisions["p_cal"] >= gate) & (decisions["target_qty"].fillna(0) == 0)]
+    # v = decisions.loc[(decisions["p_cal"] >= gate) & (decisions["target_qty"].fillna(0) == 0)]
     # Strictly above the gate is a violation if size is still zero.
     eps = 1e-12
     v = decisions.loc[(decisions["p_cal"] > gate + eps) & (decisions["target_qty"].fillna(0) == 0)]
@@ -4465,9 +4545,12 @@ def _sizing_sanity(decisions: pd.DataFrame, *, p_threshold: float = 0.60, p_gate
     out["cost_hurdle_violations"] = int(len(v))
     return out
 
+
 from sklearn.metrics import roc_auc_score
 
-def _maybe_flip_probs(df: pd.DataFrame, p_col: str = "p_cal", y_col: str = "y", *, mark_col: str = "_p_flipped") -> tuple[pd.DataFrame, bool]:
+
+def _maybe_flip_probs(df: pd.DataFrame, p_col: str = "p_cal", y_col: str = "y", *, mark_col: str = "_p_flipped") -> \
+tuple[pd.DataFrame, bool]:
     """
     If AUC(1-p) > AUC(p), flip probabilities in-place.
     Returns (df, flipped_bool). No-op if y missing or degenerate.
@@ -4490,7 +4573,6 @@ def _maybe_flip_probs(df: pd.DataFrame, p_col: str = "p_cal", y_col: str = "y", 
     except Exception:
         df[mark_col] = False
         return df, False
-
 
 
 def _promotion_checks_step4_8(*, port_dir: Path, cfg: dict | None = None) -> dict:
@@ -4556,14 +4638,12 @@ def _promotion_checks_step4_8(*, port_dir: Path, cfg: dict | None = None) -> dic
     return results
 
 
-
-
 # ────────────────────────────────────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────────────────────────────────────
 async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
-    #logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
-    #log = logging.getLogger("backtest")
+    # logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
+    # log = logging.getLogger("backtest")
 
     DIAG = bool(cfg.get("diag", True))  # default True while debugging
 
@@ -4590,7 +4670,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print(f"[Phase-3] NOCLI mode: {len(all_syms)} symbols, {cfg['start']} → {cfg['end']}")
 
     # Resolve universe → list[str]
-    #symbols_requested = _resolve_universe(cfg.get("universe", []))
+    # symbols_requested = _resolve_universe(cfg.get("universe", []))
 
     # Resolve universe → list[str] (Step-2.2 single entry point)
     '''try:
@@ -4618,7 +4698,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     usrc = _universe_source_label(cfg)
     win_s, win_e = str(cfg["start"]), str(cfg["end"])
     arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
-
 
     # --- Task3: lock canonical artifacts_root for the entire run ---
     cfg["artifacts_root"] = str(arte_root)  # canonical absolute (repo-root based)
@@ -4694,13 +4773,12 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                     "Fix by using a dict mapping, a '{symbol}' template, or remove cfg['csv']."
                 )
 
-
-
-    missing  = [s for s in symbols_requested if s not in available]
+    missing = [s for s in symbols_requested if s not in available]
 
     # Phase-2 acceptance summary
     print("=" * 72)
-    print(f"[Universe] Requested: {len(symbols_requested)} {symbols_requested[:12]}{' ...' if len(symbols_requested) > 12 else ''}")
+    print(
+        f"[Universe] Requested: {len(symbols_requested)} {symbols_requested[:12]}{' ...' if len(symbols_requested) > 12 else ''}")
     print(f"[Universe] Available in parquet: {len(available)}")
     if missing:
         print(f"[Universe] WARNING: missing (not under parquet/): {missing[:12]}{' ...' if len(missing) > 12 else ''}")
@@ -4714,19 +4792,30 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(f"[Parquet] Partitions (symbol:count) {sample}{' ...' if len(part_counts) > 12 else ''}")
     print("=" * 72)
 
-
     # Phase 4.1: build the unified clock (audit only; scoring loop refactor comes later)
-    uni_clock = build_unified_clock(parquet_root, cfg["start"], cfg["end"], symbols)
+    # ------------------------------------------------------------------
+    # Phase 4.1 (AUDIT-ONLY) — continuous 60s grid over min..max
+    # NOT the canonical unified_clock for Task 3.
+    #
+    # IMPORTANT: must NEVER run by default. Turn on explicitly via:
+    #   cfg["enable_audit_clock"] = True
+    # ------------------------------------------------------------------
+    if bool(cfg.get("enable_audit_clock", False)):
+        audit_clock = build_audit_continuous_clock(
+            parquet_root, cfg["start"], cfg["end"], symbols
+        )
+        cfg["_audit_continuous_clock"] = audit_clock  # debugging only
 
-    # --- Make unified clock available to all downstream builders (pooled core, per-symbol, etc.)
-    cfg["_unified_clock"] = uni_clock
-    cfg["_bar_grid_seconds"] = int(cfg.get("bar_grid_seconds", 60))  # canonical bar grid
+        print(
+            f"[AUDIT-CLOCK] continuous minutes={len(audit_clock)} "
+            f"min={audit_clock.min() if len(audit_clock) else None} "
+            f"max={audit_clock.max() if len(audit_clock) else None}"
+        )
+    else:
+        cfg.pop("_audit_continuous_clock", None)
 
-    print(f"[Clock] unified minutes = {len(uni_clock)} from {uni_clock.min() if len(uni_clock) else '∅'} "
-          f"to {uni_clock.max() if len(uni_clock) else '∅'}")
-
-    #cfg["_unified_clock"] = uni_clock
-    #cfg["_bar_grid_seconds"] = grid_seconds
+    # cfg["_unified_clock"] = uni_clock
+    # cfg["_bar_grid_seconds"] = grid_seconds
 
     # after uni_clock built
     cover = {}
@@ -4736,7 +4825,10 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             cover[s] = 0
         else:
             cover[s] = int(df_s["timestamp"].dt.floor("min").nunique())
-    print("[Clock] per-symbol minute coverage:", cover)
+    #print("[Clock] per-symbol minute coverage:", cover)
+
+    print("[ClockCoverage] per-symbol minute coverage:", cover)
+
 
     # Optional: persist for debugging/inspection alongside portfolio outputs
     '''arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
@@ -4748,7 +4840,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     else:
         print("[Clock] WARNING: unified clock is empty for the requested window/universe.")
     '''
-
 
     if not symbols:
         raise RuntimeError("No requested symbols were found under parquet/. Abort.")
@@ -4835,13 +4926,13 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(f"[Scanner-END] symbols_current={symbols}")
 
     print(f"[Scanner-END] seen_symbols={sorted(scanner_seen_symbols)}")
-    #missing = set(map(str, symbols)) - set(scanner_seen_symbols)
+    # missing = set(map(str, symbols)) - set(scanner_seen_symbols)
 
     # ------------------------------
     # AFTER scanner loop: combine bars across symbols
     # ------------------------------
     print(f"[Scanner-END] seen_symbols={sorted(scanner_seen_symbols)}")
-    #missing = set(symbols) - set(scanner_seen_symbols)
+    # missing = set(symbols) - set(scanner_seen_symbols)
     missing = set(map(str, symbols_requested)) - set(scanner_seen_symbols)
 
     if missing:
@@ -4892,10 +4983,15 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # ------------------------------------------------------------------
     # Build unified_clock from observed timestamps (prevents 24h expansion)
     # ------------------------------------------------------------------
-    ts = pd.to_datetime(bars_all["timestamp"], utc=True, errors="coerce")
+    '''ts = pd.to_datetime(bars_all["timestamp"], utc=True, errors="coerce")
     ts = ts.dropna().dt.floor(f"{grid_seconds}s")
 
     unified_clock = pd.DatetimeIndex(ts.unique()).sort_values()
+
+    # Phase 3: deterministic clock identity
+    clock_hash = compute_clock_hash(unified_clock)
+    cfg["_unified_clock"] = unified_clock
+    cfg["_unified_clock_hash"] = clock_hash
 
     if len(unified_clock) == 0:
         raise SystemExit("[ABORT] unified_clock is empty (no valid timestamps).")
@@ -4903,6 +4999,83 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(
         f"[Clock] unified minutes={len(unified_clock)} "
         f"min={unified_clock.min()} max={unified_clock.max()}"
+    )'''
+
+    # ------------------------------------------------------------------
+    # Phase 3: Build ONE canonical unified clock (minute grid) and reuse it everywhere
+    #   Required Task-3 log line:
+    #     [UNIFIED-CLOCK] policy=... n_minutes=... hash=...
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Task 3 (CANONICAL): Build unified_clock from OBSERVED minutes only
+    # ------------------------------------------------------------------
+    '''clock_policy = str(cfg.get("clock_policy") or "min_symbols_observed").strip()
+    min_clock_symbols = int(cfg.get("min_clock_symbols", 2))
+    '''
+
+    # ------------------------------------------------------------------
+    # Phase 3: Build ONE canonical unified clock = observed minutes only
+    # ------------------------------------------------------------------
+
+    # IMPORTANT:
+    # - Default must be 60s "observed minutes" clock, NOT intersection clock.
+    # - If you default to min_symbols_observed=2 on a sparse symbol (e.g., RRC),
+    #   the clock cadence becomes non-60s (e.g., 240s) and FE hard-fails.
+    clock_policy = str(cfg.get("clock_policy", "union_observed")).strip()
+
+    # Default min_symbols depends on policy:
+    # - union_observed: keep 1 so the clock stays 60s and includes all observed minutes
+    # - min_symbols_observed: portfolio default 2 (intersection-ish) if explicitly chosen
+    if clock_policy == "min_symbols_observed":
+        default_min_symbols = 2 if len(symbols) >= 2 else 1
+    else:
+        default_min_symbols = 1
+
+    min_symbols_observed = int(cfg.get("clock_min_symbols", default_min_symbols))
+
+    min_clock_symbols = min_symbols_observed
+
+
+    unified_clock, clock_meta = build_unified_clock(
+        bars_all,
+        policy=clock_policy,
+        min_symbols=min_clock_symbols,
+        ts_col="timestamp",
+        symbol_col="symbol",
+        presence_col="bar_present",  # ok if missing at this stage; helper will treat as observed=True
+        freq=f"{grid_seconds}s",
+    )
+
+    if len(unified_clock) == 0:
+        raise SystemExit("[ABORT] unified_clock is empty (no observed timestamps).")
+
+    clock_hash = compute_clock_hash(unified_clock)
+
+    # Single source of truth for downstream stages
+    cfg["_unified_clock"] = unified_clock
+    cfg["_unified_clock_hash"] = clock_hash
+    cfg["_unified_clock_policy"] = clock_policy
+    cfg["_unified_clock_min_symbols"] = min_clock_symbols
+    cfg["_bar_grid_seconds"] = grid_seconds
+
+    # Persist canonical clock metadata
+    (out_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
+    (out_dir / "diagnostics" / "unified_clock.json").write_text(
+        json.dumps(
+            {
+                **clock_meta,
+                "clock_hash": clock_hash,
+                "bar_grid_seconds": grid_seconds,
+            },
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[UNIFIED-CLOCK] policy={clock_policy} min_symbols={min_clock_symbols} "
+        f"n_minutes={len(unified_clock)} min={unified_clock.min()} max={unified_clock.max()} hash={clock_hash}"
     )
 
     bars_std, grid_audits = standardize_bars_to_grid(
@@ -4915,6 +5088,15 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         fill_volume_zero=True,
         keep_ohlc_nan=True,
         hard_fail_on_duplicates=False,
+    )
+
+    # Phase 3 enforcement: bars_std timestamps must be on unified_clock and hash must match
+    assert_df_on_clock(
+        bars_std,
+        clock_index=unified_clock,
+        expected_clock_hash=clock_hash,
+        ts_col="timestamp",
+        who="bars_std(post-timegrid)",
     )
 
     # --- HARD ASSERT: we must be using the unified trading-minutes clock ---
@@ -4976,7 +5158,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         else:
             bars_std["bar_present"] = 1
 
-
     # ------------------------------------------------------------------
     # Task 2: coverage gate on the unified clock (abort or drop)
     # ------------------------------------------------------------------
@@ -5024,7 +5205,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             f"dropped_artifact={cov_res.artifact_dropped_symbols_path}"
         )
 
-
     overlap = _timestamp_overlap_share(
         bars_std,
         min_symbols=2,
@@ -5034,7 +5214,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     )
     print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
 
-    #print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
+    # print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
     if overlap < float(cfg.get("min_multisymbol_share", 0.10)):
         raise RuntimeError(
             f"[GATE] multi-symbol share < {cfg.get('min_multisymbol_share', 0.10):.2f} "
@@ -5082,15 +5262,12 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         )'''
 
     # ─── Phase 4: Universe portfolio aggregation ────────────────────────
-    #arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    # arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
     arte_root = Path(cfg["artifacts_root"])
 
     dec_df, trd_df = _aggregate_universe_outputs(arte_root, symbols)
 
     print("[Agg] decisions rows=", len(dec_df), "trades rows=", len(trd_df))
-
-
-
 
     if not dec_df.empty and "symbol" in dec_df.columns:
         print("[Agg] decisions by symbol:", dec_df["symbol"].value_counts().to_dict())
@@ -5098,8 +5275,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print("[Agg] trades by symbol:", trd_df["symbol"].value_counts().to_dict())
 
     # Make a portfolio folder
-    #port_dir = arte_root / "portfolio"
-    #port_dir.mkdir(parents=True, exist_ok=True)
+    # port_dir = arte_root / "portfolio"
+    # port_dir.mkdir(parents=True, exist_ok=True)
 
     port_dir = arte_root / "portfolio"
     port_dir.mkdir(parents=True, exist_ok=True)
@@ -5123,8 +5300,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             colmap["exit_time"] = "exit_ts"
         if colmap:
             trd_df = trd_df.rename(columns=colmap)
-
-
 
         # Phase 4.2: attach modeled costs (commission + half-spread + impact)
         # If your per-trade schema already contains 'half_spread_usd' or 'adv_frac',
@@ -5153,8 +5328,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         equity0 = float(cfg.get("equity", 100_000.0))
         ledger = PortfolioLedger(cash=equity0)
 
-
-
         limits = RiskLimits(
             max_gross=equity0 * float(cfg.get("max_gross_frac", 0.5)),
             max_net=equity0 * float(cfg.get("max_net_frac", 0.2)),
@@ -5177,7 +5350,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                 price=float(row["entry_price"]),
                 fees=float(row.get("modeled_cost_total", 0.0)) * 0.5,  # half on entry
             )
-            #ledger.on_fill(entry)
+            # ledger.on_fill(entry)
 
             _ledger_fill(ledger, entry)
 
@@ -5190,12 +5363,12 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                 price=float(row["exit_price"]),
                 fees=float(row.get("modeled_cost_total", 0.0)) * 0.5,  # half on exit
             )
-            #ledger.on_fill(exitf)
+            # ledger.on_fill(exitf)
 
             _ledger_fill(ledger, exitf)
 
-            #snap = ledger.snapshot_row()
-            #port_rows.append({**row.to_dict(), **snap})
+            # snap = ledger.snapshot_row()
+            # port_rows.append({**row.to_dict(), **snap})
             snap = _ledger_snapshot_row(ledger)
             port_rows.append({**row.to_dict(), **snap})
 
@@ -5206,9 +5379,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         trades_out = port_dir / "trades.parquet"
         trd_df.to_parquet(trades_out, index=False)
         print(f"[Portfolio] trades → {trades_out}")
-
-
-
 
         # ---------------------------
         # Execution reconciliation diagnostics
@@ -5228,7 +5398,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
         all_trade_files = sorted([p for p in root.rglob("trades.parquet") if "portfolio" not in str(p).lower()])
         all_decision_files = sorted([p for p in root.rglob("decisions.parquet") if "portfolio" not in str(p).lower()])
-        all_attempt_files = sorted([p for p in root.rglob("attempted_actions.parquet") if "portfolio" not in str(p).lower()])
+        all_attempt_files = sorted(
+            [p for p in root.rglob("attempted_actions.parquet") if "portfolio" not in str(p).lower()])
 
         def _count_rows(parquet_paths):
             total = 0
@@ -5269,10 +5440,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print(f"[Diag] attempted_actions files found={len(all_attempt_files)} total_rows={per_sym_attempt_total}")
 
         if recon["per_symbol_trades_rows_total"] and recon["portfolio_trades_rows_total"] == 0:
-            print("[Diag][WARN] Per-symbol trades exist but portfolio consolidation output is empty. Consolidation/discovery issue.")
+            print(
+                "[Diag][WARN] Per-symbol trades exist but portfolio consolidation output is empty. Consolidation/discovery issue.")
         if recon["attempted_actions_rows_total"] and (recon["per_symbol_trades_rows_total"] == 0):
-            print("[Diag][WARN] Attempts exist but no per-symbol trades. Execution sizing or fill simulation may be blocking.")
-
+            print(
+                "[Diag][WARN] Attempts exist but no per-symbol trades. Execution sizing or fill simulation may be blocking.")
 
         # Build a simple realized-PnL equity curve (no open PnL)
         if "exit_ts" in trd_df.columns and "realized_pnl" in trd_df.columns:
@@ -5323,15 +5495,15 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                 if df[["entry_ts", "exit_ts"]].notna().all().all():
                     # 1-minute grid between min(entry) and max(exit)
                     t0, t1 = df["entry_ts"].min(), df["exit_ts"].max()
-                    #grid = _pd.date_range(t0.floor("T"), t1.ceil("T"), freq="T", tz="UTC")
+                    # grid = _pd.date_range(t0.floor("T"), t1.ceil("T"), freq="T", tz="UTC")
                     grid = _pd.date_range(t0.floor("min"), t1.ceil("min"), freq="min", tz="UTC")
 
                     # fast interval counting
                     starts = _pd.Series(0, index=grid, dtype="int64")
                     ends = _pd.Series(0, index=grid, dtype="int64")
                     for _, r in df.iterrows():
-                        #es = r["entry_ts"].floor("T")
-                        #xs = r["exit_ts"].floor("T")
+                        # es = r["entry_ts"].floor("T")
+                        # xs = r["exit_ts"].floor("T")
                         es = r["entry_ts"].floor("min")
                         xs = r["exit_ts"].floor("min")
                         if es in starts.index: starts[es] += 1
@@ -5357,9 +5529,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                     "avg_concurrent_positions": float(avg_conc),
                     "max_drawdown": float(max_dd),
                 }
-
-
-
 
             # Compute & write portfolio_metrics.json alongside equity curve
             metrics = _compute_portfolio_metrics(trd_df, curve if 'curve' in locals() else None, equity0)
@@ -5406,9 +5575,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
         else:
             print("[Portfolio] skipped equity curve (missing exit_ts or realized_pnl)")
-
-
-
 
     # --- Phase-4: consolidate per-fold/per-symbol outputs into single files ---
     '''artifacts_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
@@ -5480,7 +5646,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     diag_dir = artifacts_root / "diagnostics"
     diag_dir.mkdir(parents=True, exist_ok=True)
 
-    #entries_reported = int(total_entries) if "total_entries" in locals() else None
+    # entries_reported = int(total_entries) if "total_entries" in locals() else None
 
     # Count attempted actions (engine wanted to trade, even if qty=0)
     attempt_files = list(artifacts_root.rglob("attempted_actions.parquet"))
@@ -5597,16 +5763,16 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     root_dec = root / "decisions.parquet"
     root_trd = root / "trades.parquet"
     print("[DIAG][FILES] root decisions.parquet exists?", root_dec.exists(),
-           "size=", (root_dec.stat().st_size if root_dec.exists() else None))
+          "size=", (root_dec.stat().st_size if root_dec.exists() else None))
     print("[DIAG][FILES] root trades.parquet exists?", root_trd.exists(),
-           "size=", (root_trd.stat().st_size if root_trd.exists() else None))
+          "size=", (root_trd.stat().st_size if root_trd.exists() else None))
 
     print(f"[Portfolio] mirrored consolidated → {port_dir}")
 
     if {"timestamp", "symbol"}.issubset(dec.columns) and len(dec):
         per_ts = dec.groupby("timestamp")["symbol"].nunique()
         print("[DIAG][DEC] per-timestamp nunique(symbol) summary:",
-               per_ts.describe().to_dict())
+              per_ts.describe().to_dict())
         print("[DIAG][DEC] worst 10 timestamps (lowest symbol count):")
         print(per_ts.sort_values().head(10))
         print("[DIAG][DEC] best 10 timestamps (highest symbol count):")
@@ -5635,8 +5801,10 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         trd = pd.read_parquet(trd_path)
 
         print("decisions rows:", len(dec), "trades rows:", len(trd))
-        print("symbols in decisions:", sorted(dec['symbol'].dropna().astype(str).unique().tolist()) if 'symbol' in dec.columns else "(no symbol column)")
-        print("symbols in trades:",    sorted(trd['symbol'].dropna().astype(str).unique().tolist()) if 'symbol' in trd.columns else "(no symbol column)")
+        print("symbols in decisions:", sorted(
+            dec['symbol'].dropna().astype(str).unique().tolist()) if 'symbol' in dec.columns else "(no symbol column)")
+        print("symbols in trades:", sorted(
+            trd['symbol'].dropna().astype(str).unique().tolist()) if 'symbol' in trd.columns else "(no symbol column)")
 
         # --- Diagnostics: per-symbol contribution
         if 'symbol' in dec.columns:
@@ -5676,7 +5844,6 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             dec["y"] = (dec["logret_oo"] > 0.0).astype(float)
             return dec
 
-
         # collect bars covering [start,end] for all symbols (cheap: only timestamp+open)
         bars_list = []
         for s in symbols:
@@ -5685,6 +5852,62 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             if not df_s.empty:
                 bars_list.append(df_s[["timestamp", "symbol", "open"]])
         bars_all = pd.concat(bars_list, ignore_index=True) if bars_list else pd.DataFrame()
+
+        # ------------------------------------------------------------------
+        # Phase 3: Build ONE canonical unified clock = observed minutes only
+        # ------------------------------------------------------------------
+        #clock_policy = str(cfg.get("clock_policy", "union_observed"))
+        clock_policy = str(cfg.get("clock_policy", "min_symbols_observed"))
+
+        #min_symbols_observed = int(cfg.get("clock_min_symbols", 1))
+
+        # Default: portfolio runs require >=2 symbols observed; single-symbol runs allow 1.
+        default_min_symbols = 2 if len(symbols) >= 2 else 1
+        min_symbols_observed = int(cfg.get("clock_min_symbols", default_min_symbols))
+
+        unified_clock, clock_meta = build_unified_clock(
+            bars_all,
+            policy=clock_policy,  # "union_observed" | "min_symbols_observed"
+            min_symbols=min_symbols_observed,  # only used if policy == "min_symbols_observed"
+            ts_col="timestamp",
+            symbol_col="symbol",
+            #presence_col="bar_present",  # preferred; falls back to close.notna
+            presence_col="open",  # "real bar exists" for bars_all (it only has timestamp/symbol/open)
+
+            freq=f"{int(cfg.get('bar_grid_seconds', 60))}s",
+        )
+
+        clock_hash = compute_clock_hash(unified_clock)
+
+        # Make unified clock available to all downstream builders (pooled core, per-symbol, etc.)
+        cfg["_unified_clock"] = unified_clock
+        cfg["_unified_clock_hash"] = clock_hash
+        cfg["_unified_clock_policy"] = clock_policy
+        cfg["_unified_clock_min_symbols"] = min_symbols_observed
+        cfg["_bar_grid_seconds"] = int(cfg.get("bar_grid_seconds", 60))  # canonical bar grid
+
+        (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+        (artifacts_root / "diagnostics" / "unified_clock.json").write_text(
+            json.dumps(
+                {
+                    **clock_meta,
+                    "clock_hash": clock_hash,
+                    "bar_grid_seconds": int(cfg.get("bar_grid_seconds", 60)),
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+
+        print(
+            f"[UNIFIED-CLOCK] policy={clock_policy} min_symbols={min_symbols_observed} "
+            f"n_minutes={len(unified_clock)} min={unified_clock.min() if len(unified_clock) else None} "
+            f"max={unified_clock.max() if len(unified_clock) else None} hash={clock_hash}"
+        )
+
+        if unified_clock is None or len(unified_clock) == 0:
+            raise SystemExit("[ABORT] unified_clock is empty (observed-minutes policy produced no minutes).")
 
         if 'y' not in dec.columns and not bars_all.empty:
             dec = _attach_y_open_to_open(decisions=dec, bars=bars_all, H=int(cfg.get("horizon_bars", 20)))
@@ -5831,7 +6054,17 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             else:
                 enforce = enforce_default
 
+            # Phase 3 enforcement: portfolio decisions must be on unified_clock
+            assert_df_on_clock(
+                dec,
+                clock_index=cfg["_unified_clock"],
+                expected_clock_hash=cfg["_unified_clock_hash"],
+                ts_col="timestamp",
+                who="portfolio_decisions",
+            )
+
             # overlap on consolidated decisions clock (your decisions are on shared 'timestamp')
+
             if {"timestamp", "symbol"}.issubset(dec.columns) and len(dec) > 0:
                 overlap_share = float((dec.groupby("timestamp")["symbol"].nunique() >= 2).mean())
             else:
@@ -5905,10 +6138,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                     )
 
             print("[DIAG][OVERLAP] writing audit to:", str(audit_fp))
-            #print("[DIAG][OVERLAP] audit payload:", audit_dict)  # whatever dict you build
-            #audit_fp.write_text(json.dumps(audit_dict, indent=2), encoding="utf-8")
-            #print("[DIAG][OVERLAP] wrote overlap_audit.json size=", audit_fp.stat().st_size)
-
+            # print("[DIAG][OVERLAP] audit payload:", audit_dict)  # whatever dict you build
+            # audit_fp.write_text(json.dumps(audit_dict, indent=2), encoding="utf-8")
+            # print("[DIAG][OVERLAP] wrote overlap_audit.json size=", audit_fp.stat().st_size)
 
             if audit_fp.exists():
                 audit = json.loads(audit_fp.read_text(encoding="utf-8"))
@@ -5927,14 +6159,14 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             raise
 
         # optional: decision→entry causality check (if you persist these)
-        if {'decision_ts','entry_ts'}.issubset(dec.columns):
+        if {'decision_ts', 'entry_ts'}.issubset(dec.columns):
             lag_ok = (pd.to_datetime(dec['entry_ts']) > pd.to_datetime(dec['decision_ts'])).mean()
             print("entry strictly after decision:", round(float(lag_ok), 3))
             # Phase 4.7 extra soft checks
             port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
             metrics_json = port_dir / "portfolio_metrics.json"
             print("has portfolio_metrics.json:", metrics_json.exists())
-            #if (port_dir / "equity_curve.csv").exists():
+            # if (port_dir / "equity_curve.csv").exists():
             #    ec = pd.read_csv(port_dir / "equity_curve.csv", parse_dates=["exit_ts"])
             #    print("equity curve rows:", len(ec))
             if (port_dir / "equity_curve.csv").exists():
@@ -5947,10 +6179,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         print("[Phase-4] Note: could not find per-fold outputs to consolidate into decisions/trades. "
               "Backtest completed, but portfolio acceptance checks were skipped.")
 
-
     # ─── Step 4.8: evaluate readiness (requires portfolio/ files & costs ON) ───
     try:
-        #port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
+        # port_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / "portfolio"
 
         port_dir = Path(cfg["artifacts_root"]).expanduser().resolve() / "portfolio"
         port_dir.mkdir(parents=True, exist_ok=True)
@@ -5962,9 +6193,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     except Exception as e:
         print(f"[4.8] Promotion checks skipped due to error: {e!r}")
 
-
     # decisions must exist and contain both symbols on a shared timeline
-    #import pandas as pd
+    # import pandas as pd
     '''dec = pd.read_parquet("artifacts/a2/decisions.parquet")
     trd = pd.read_parquet("artifacts/a2/trades.parquet")
 
@@ -5989,10 +6219,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
 
-
 __all__ = ["run", "run_batch", "CONFIG"]
 
-#if __name__ == "__main__":
+# if __name__ == "__main__":
 #    asyncio.run(run(CONFIG))
 
 
@@ -6115,7 +6344,6 @@ __all__ = ["run", "run_batch", "CONFIG"]
         )
     )'''
 
-
 if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Phase 1.1 (MUST RUN FIRST): lock a single canonical run_dir
@@ -6154,6 +6382,7 @@ if __name__ == "__main__":
     # Now run the actual backtest (safe: artifacts_root already locked)
     # ------------------------------------------------------------------
     import asyncio
+
     asyncio.run(run(CONFIG))
 
     # ------------------------------------------------------------------

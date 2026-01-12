@@ -24,9 +24,9 @@ from scipy.spatial.distance import pdist
 
 from prediction_engine.ev_engine import EVEngine
 from prediction_engine.path_cluster_engine import PathClusterEngine
-from prediction_engine.execution.manager import ExecutionManager
-from prediction_engine.execution.risk_manager import RiskManager
-from prediction_engine.testing_validation.backtester import (
+from execution.manager import ExecutionManager
+from execution.risk_manager import RiskManager
+from prediction_engine.testing_validation.async_backtester import (
     AsyncBacktester,
     BrokerStub,
 )
