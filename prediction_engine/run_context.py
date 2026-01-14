@@ -1,10 +1,12 @@
 # prediction_engine/run_context.py
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 import json
+from feature_engineering.utils.artifacts_root import write_run_manifest
 
 
 class ArtifactRootMismatchError(RuntimeError):
@@ -68,6 +70,37 @@ class RunContext:
     universe_hash: Optional[str] = None
     window: Optional[str] = None  # (optional) human-readable window, not a source of truth
 '''
+
+def _stable_config_hash(cfg: Mapping[str, Any]) -> str:
+    """
+    Minimal-stable hash: only uses fields that are deterministic and meaningful.
+    Avoids hashing object reprs (which can include memory addresses).
+    """
+    u = cfg.get("universe")
+    if hasattr(u, "symbols"):
+        universe = list(u.symbols)
+    elif isinstance(u, (list, tuple)):
+        universe = [str(x) for x in u]
+    else:
+        universe = [str(u)]
+
+    payload = {
+        "start": str(cfg.get("start", "")),
+        "end": str(cfg.get("end", "")),
+        "universe": universe,
+        # include a few key knobs if present (safe + deterministic)
+        "execution_rules": cfg.get("execution_rules", None),
+        "scanner": cfg.get("scanner", None),
+        "fe": cfg.get("fe", None),
+        "strategy": cfg.get("strategy", None),
+        "costs": cfg.get("costs", None),
+        "gates": cfg.get("gates", None),
+        "unified_clock_policy": cfg.get("unified_clock_policy", None),
+        "min_clock_symbols": cfg.get("min_clock_symbols", None),
+    }
+    s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha1(s).hexdigest()
+
 
 @dataclass(frozen=True)
 class RunContext:
@@ -156,6 +189,44 @@ class RunContext:
 
         # Collision must explode loudly
         run_dir.mkdir(parents=True, exist_ok=False)
+
+        # ---------------- Task 4: run-level manifest (single truth) ----------------
+        # Manifest must live in the run_dir, and artifacts_root in the manifest must
+        # point to the same run_dir to prevent cross-run contamination.
+
+        config_hash = str(cfg.get("config_hash") or cfg.get("_config_hash") or "")
+        clock_hash = str(cfg.get("unified_clock_hash") or cfg.get("_unified_clock_hash") or "")
+
+        cfg_config_hash = str(cfg.get("config_hash") or "").strip()
+        if not cfg_config_hash:
+            cfg_config_hash = _stable_config_hash(cfg)
+
+        # Ensure downstream stages can read it (Task 4 requires config_hash always known at run start)
+        if isinstance(cfg, dict):
+            cfg["_config_hash"] = cfg_config_hash
+            cfg["config_hash"] = cfg_config_hash  # optional, but makes intent unmissable
+
+
+
+        manifest_path = write_run_manifest(
+            run_dir=run_dir,
+            run_id=str(run_id),
+            artifacts_root=run_dir,   # single truth: for this run, root == run_dir
+            #config_hash=config_hash,
+            config_hash=cfg_config_hash,
+            clock_hash=clock_hash,
+            cwd=str(Path.cwd()),
+        )
+
+        print(
+            f"[RunManifest] path={str(manifest_path.resolve())} "
+            f"config_hash={cfg_config_hash} clock_hash={clock_hash}"
+        )
+
+        print(f"[RunManifest] path={manifest_path} config_hash={config_hash} clock_hash={clock_hash}")
+        # ---------------- end Task 4 ------------------------------------------------
+
+
 
         ctx = cls(
             run_id=str(run_id),

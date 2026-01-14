@@ -6,11 +6,16 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 import pyarrow as pa
+from feature_engineering.utils.artifacts_root import require_manifest_for_path
 
 _PARTITION_COLS = ["symbol", "year", "month"]
 
 def write_feature_dataset(df: pd.DataFrame, out_root: Path) -> None:
     """Write *df* to hive-style Parquet dataset under *out_root*."""
+
+    # Task 4: refuse to write feature datasets into a run tree without a manifest
+    require_manifest_for_path(out_root)
+
     out_root.mkdir(parents=True, exist_ok=True)
     df = df.copy()
     ts = pd.to_datetime(df["timestamp"], utc=True)

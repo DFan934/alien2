@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 import json
 import joblib
+from feature_engineering.utils.artifacts_root import resolve_run_dir_from_artifacts_root
 
 def _posix(p) -> str:
     # Robust: works for str or Path; converts backslashes to forward slashes
@@ -28,6 +29,10 @@ def resolve_artifact_paths(
     """
     root = Path(artifacts_root)
     out: Dict[str, str] = {}
+
+    # Task 4: enforce run-level manifest (single truth)
+    # This hard-fails if artifacts_root is "bare" or from the wrong run.
+    _, _m = resolve_run_dir_from_artifacts_root(root)
 
     # Core EV bundle location
     if strategy == "per_symbol":

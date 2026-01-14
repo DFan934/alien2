@@ -11,6 +11,7 @@ import datetime as dt
 import pyarrow as pa
 import pyarrow.dataset as ds
 
+from feature_engineering.utils.artifacts_root import resolve_run_dir_from_artifacts_root
 
 Strategy = Literal["per_symbol", "pooled"]
 
@@ -330,7 +331,16 @@ class ArtifactManager:
         (e.g., pca_variance, k_max, residual_threshold, scanner flags, etc.).
         """
         self.parquet_root = Path(self.parquet_root).expanduser().resolve()
+        #self.artifacts_root = Path(self.artifacts_root).expanduser().resolve()
+        #self.artifacts_root.mkdir(parents=True, exist_ok=True)
+
         self.artifacts_root = Path(self.artifacts_root).expanduser().resolve()
+
+        # Task 4: refuse to write unless artifacts_root is a run_dir with a valid manifest
+        run_dir, m = resolve_run_dir_from_artifacts_root(self.artifacts_root)
+
+        # Enforce single truth: all artifacts must land under the manifest run_dir
+        self.artifacts_root = run_dir
         self.artifacts_root.mkdir(parents=True, exist_ok=True)
 
         cfg_hash = _hash_obj(config_hash_parts or {})
@@ -661,6 +671,11 @@ class ArtifactManager:
         self.parquet_root = Path(self.parquet_root).expanduser().resolve()
         fold_dir = Path(fold_dir).expanduser().resolve()
         fold_dir.mkdir(parents=True, exist_ok=True)
+
+        # Task 4: fold artifacts must live under a run_dir that has a manifest
+        # (fold_dir is typically <run_dir>/fold_XX/..., so this will find the run manifest above it)
+        from feature_engineering.utils.artifacts_root import require_manifest_for_path
+        require_manifest_for_path(fold_dir)
 
         cfg_hash = _hash_obj(config_hash_parts or {})
         sch_hash = _hash_schema(schema_hash_parts)

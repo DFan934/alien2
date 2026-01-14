@@ -29,6 +29,7 @@ import pyarrow.dataset as ds
 from prediction_engine.prediction_engine.artifacts.manager import ArtifactManager
 import json
 from feature_engineering.utils.timegrid import grid_audit_to_json, standardize_bars_to_grid
+from feature_engineering.utils.artifacts_root import update_run_manifest_fields, assert_manifest_has_hashes
 
 import numpy as np
 import pandas as pd
@@ -512,9 +513,42 @@ def run_batch(
         if not run_id:
             raise RuntimeError("[Phase1.1] Missing run_id in cfg")
 
-        run_ctx = RunContext.create(
+        '''run_ctx = RunContext.create(
             run_id=run_id,
             cfg={"artifacts_root": str(base_root)},
+            universe_hash=str(cfg.get("universe_hash") or ""),
+            window=f"{cfg.get('start')}→{cfg.get('end')}",
+        )'''
+
+        # Ensure cfg includes the base root before creating run_dir
+        cfg["artifacts_root"] = str(base_root)
+
+        # ---------------------------
+        # Task 4: config_hash must exist at run start
+        # ---------------------------
+        import hashlib, json
+
+        def _stable_config_hash(cfg: dict) -> str:
+            # Hash only stable, provenance-relevant keys (avoid huge/unserializable objects)
+            allow = [
+                "start", "end", "parquet_root",
+                "horizon_bars", "longest_lookback_bars",
+                "metric", "k_max",
+                "regime_settings",
+                "p_gate_quantile", "full_p_quantile", "sign_check",
+                "execution_rules",
+                "universe_hash",
+                "run_id",
+            ]
+            slim = {k: cfg.get(k) for k in allow if k in cfg}
+            blob = json.dumps(slim, sort_keys=True, default=str).encode("utf-8")
+            return hashlib.sha256(blob).hexdigest()[:16]
+
+        cfg["config_hash"] = cfg.get("config_hash") or _stable_config_hash(cfg)
+
+        run_ctx = RunContext.create(
+            run_id=run_id,
+            cfg=cfg,  # <-- DO NOT pass a tiny dict; Task 4 needs hashes from cfg
             universe_hash=str(cfg.get("universe_hash") or ""),
             window=f"{cfg.get('start')}→{cfg.get('end')}",
         )
@@ -5078,6 +5112,24 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         f"n_minutes={len(unified_clock)} min={unified_clock.min()} max={unified_clock.max()} hash={clock_hash}"
     )
 
+    # ---------------- Task 4: finalize RUN_MANIFEST hashes ----------------
+    cfg["_unified_clock_hash"] = str(clock_hash)  # ensure present for other stages
+
+    # IMPORTANT: run_dir must be the artifacts run directory: .../artifacts/a2_<id>
+    run_dir = Path(cfg["artifacts_root"]).resolve()
+
+    update_run_manifest_fields(
+        run_dir,
+        config_hash=str(cfg.get("config_hash") or cfg.get("_config_hash") or ""),
+        clock_hash=str(clock_hash),
+    )
+
+    m_final = assert_manifest_has_hashes(run_dir)
+    print(
+        f"[RunManifest] path={str((run_dir / 'RUN_MANIFEST.json').resolve())} "
+        f"config_hash={m_final.config_hash} clock_hash={m_final.clock_hash}"
+    )
+
     bars_std, grid_audits = standardize_bars_to_grid(
         bars_all,
         symbol_col="symbol",
@@ -5904,6 +5956,28 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             f"[UNIFIED-CLOCK] policy={clock_policy} min_symbols={min_symbols_observed} "
             f"n_minutes={len(unified_clock)} min={unified_clock.min() if len(unified_clock) else None} "
             f"max={unified_clock.max() if len(unified_clock) else None} hash={clock_hash}"
+        )
+
+        # ---------------- Task 4: finalize RUN_MANIFEST hashes ----------------
+        cfg["_unified_clock_hash"] = str(clock_hash)  # ensure present for other stages
+
+        '''update_run_manifest_fields(
+            out_dir,  # this must be the run_dir (e.g., .../artifacts/a2_<id>)
+            #config_hash=str(cfg.get("config_hash") or ""),
+            
+            clock_hash=str(clock_hash),
+        )'''
+
+        update_run_manifest_fields(
+            out_dir,  # this must be the run_dir (e.g. ./artifacts/a2_<id>)
+            config_hash=str(cfg.get("config_hash") or cfg.get("_config_hash") or ""),
+            clock_hash=str(clock_hash),
+        )
+
+        m_final = assert_manifest_has_hashes(out_dir)
+        print(
+            f"[RunManifest] path={str((Path(out_dir) / 'RUN_MANIFEST.json').resolve())} "
+            f"config_hash={m_final.config_hash} clock_hash={m_final.clock_hash}"
         )
 
         if unified_clock is None or len(unified_clock) == 0:

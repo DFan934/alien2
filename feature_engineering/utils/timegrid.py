@@ -29,6 +29,177 @@ class GridAuditError(RuntimeError):
     pass
 
 
+# -----------------------------
+# Phase 3: Unified clock (observed minutes only) + enforcement
+# -----------------------------
+
+import hashlib
+from dataclasses import asdict
+from typing import Dict, Literal, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+ClockPolicy = Literal["union_observed", "min_symbols_observed"]
+
+
+class ClockMismatchError(RuntimeError):
+    """Raised when a downstream stage uses timestamps not on the run's unified clock."""
+
+
+def compute_clock_hash(clock_index: pd.DatetimeIndex) -> str:
+    """
+    Deterministic hash of the unified clock.
+    Uses int64 ns timestamps (UTC) to avoid timezone string differences.
+    """
+    if clock_index is None or len(clock_index) == 0:
+        return "empty"
+
+    idx = pd.DatetimeIndex(clock_index)
+    if idx.tz is None:
+        # normalize to UTC
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+
+    payload = idx.view("int64").tobytes()
+    return hashlib.sha1(payload).hexdigest()
+
+
+def build_unified_clock(
+    bars: pd.DataFrame,
+    *,
+    policy: ClockPolicy = "union_observed",
+    min_symbols: int = 1,
+    ts_col: str = "timestamp",
+    symbol_col: str = "symbol",
+    presence_col: str = "bar_present",
+    freq: str = "60s",
+) -> Tuple[pd.DatetimeIndex, Dict[str, object]]:
+    """
+    Build the *observed minutes only* unified clock.
+
+    policy:
+      - union_observed: include any minute with >=1 symbol present
+      - min_symbols_observed: include minutes with >=min_symbols present
+
+    presence definition:
+      - if presence_col exists: present := numeric(presence_col) > 0
+      - else if 'close' exists: present := close.notna()
+      - else: present := True (last resort; discouraged)
+    """
+    if bars is None or len(bars) == 0:
+        return pd.DatetimeIndex([], tz="UTC"), {
+            "policy": policy,
+            "min_symbols": int(min_symbols),
+            "n_minutes": 0,
+            "ts_min": None,
+            "ts_max": None,
+            "presence_basis": "empty",
+        }
+
+    b = bars.copy()
+
+    # timestamps -> UTC, floored to grid
+    b[ts_col] = pd.to_datetime(b[ts_col], utc=True, errors="coerce")
+    b = b.dropna(subset=[ts_col, symbol_col])
+    b[ts_col] = b[ts_col].dt.floor(freq)
+
+    # present mask
+    presence_basis = None
+    if presence_col in b.columns:
+        bp = pd.to_numeric(b[presence_col], errors="coerce").fillna(0)
+        b["_present"] = (bp > 0)
+        presence_basis = presence_col
+    elif "close" in b.columns:
+        b["_present"] = b["close"].notna()
+        presence_basis = "close.notna"
+    else:
+        b["_present"] = True
+        presence_basis = "fallback_true"
+
+    # reduce to observed rows
+    b = b[b["_present"]]
+
+    if len(b) == 0:
+        return pd.DatetimeIndex([], tz="UTC"), {
+            "policy": policy,
+            "min_symbols": int(min_symbols),
+            "n_minutes": 0,
+            "ts_min": None,
+            "ts_max": None,
+            "presence_basis": presence_basis,
+        }
+
+    counts = b.groupby(ts_col)[symbol_col].nunique()
+
+    if policy == "union_observed":
+        keep = counts.index
+    elif policy == "min_symbols_observed":
+        keep = counts.index[counts >= int(min_symbols)]
+    else:
+        raise ValueError(f"Unknown clock policy: {policy!r}")
+
+    clock = pd.DatetimeIndex(pd.to_datetime(keep, utc=True)).sort_values()
+
+    meta = {
+        "policy": policy,
+        "min_symbols": int(min_symbols),
+        "n_minutes": int(len(clock)),
+        "ts_min": str(clock.min()) if len(clock) else None,
+        "ts_max": str(clock.max()) if len(clock) else None,
+        "presence_basis": presence_basis,
+        "n_unique_ts_present": int(len(counts)),
+        "n_ts_meeting_threshold": int(len(clock)),
+    }
+    return clock, meta
+
+
+def assert_df_on_clock(
+    df: pd.DataFrame,
+    *,
+    clock_index: pd.DatetimeIndex,
+    expected_clock_hash: str,
+    ts_col: str = "timestamp",
+    who: str = "df",
+) -> None:
+    """
+    Hard enforcement: all timestamps used by df must be subset of clock_index.
+    """
+    if clock_index is None or len(clock_index) == 0:
+        raise ClockMismatchError(f"[{who}] unified_clock is empty; cannot validate timestamps.")
+
+    if df is None or len(df) == 0:
+        return
+
+    if ts_col not in df.columns:
+        raise ClockMismatchError(f"[{who}] missing ts_col={ts_col!r}; cannot validate clock usage.")
+
+    ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    bad_nat = int(ts.isna().sum())
+    if bad_nat:
+        raise ClockMismatchError(f"[{who}] has {bad_nat} NaT timestamps; cannot validate clock usage.")
+
+    # subset check
+    clock_set = set(pd.DatetimeIndex(clock_index).tz_convert("UTC"))
+    uniq = pd.DatetimeIndex(ts.unique()).tz_convert("UTC")
+    extra = [t for t in uniq if t not in clock_set]
+    if extra:
+        extra_sorted = sorted(extra)[:10]
+        raise ClockMismatchError(
+            f"[{who}] timestamps not in unified_clock (showing up to 10): {extra_sorted}"
+        )
+
+    # hash consistency check (cheap sanity)
+    actual_hash = compute_clock_hash(clock_index)
+    if actual_hash != expected_clock_hash:
+        raise ClockMismatchError(
+            f"[{who}] clock hash mismatch: expected={expected_clock_hash} actual={actual_hash}"
+        )
+
+
+
 def _median_delta_seconds(ts: pd.Series) -> float | None:
     if len(ts) < 2:
         return None
@@ -47,6 +218,10 @@ def _seconds_on_boundary_ratio(ts: pd.Series, freq_s: int) -> float:
 
     ok = (s % int(freq_s)) == 0
     return float(ok.mean()) if len(ok) else 1.0
+
+
+
+
 
 
 def standardize_bars_to_grid(
