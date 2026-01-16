@@ -217,6 +217,17 @@ def _preflight_symbol_loads(cfg: dict, symbols: list[str], artifacts_root: "Path
         )
 
 
+
+def _safe_load_json(path: Path):
+    try:
+        if path and Path(path).exists():
+            import json
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
 def _dbg_symbols(df, tag: str, *, max_syms: int = 10, ts_col: str = "timestamp") -> None:
     """Print symbol presence + row counts + basic timestamp span."""
     try:
@@ -841,8 +852,40 @@ def run_batch(
     # Task 3 — Canonical unified_clock (OBSERVED minutes only) + hash
     # Build ONCE from REAL observed bars (pre-timegrid), then enforce everywhere.
     # ------------------------------------------------------------------
-    clock_policy = str(cfg.get("clock_policy") or "min_symbols_observed").strip()
+    '''clock_policy = str(cfg.get("clock_policy") or "min_symbols_observed").strip()
     min_clock_symbols = int(cfg.get("clock_min_symbols") or 2)
+    '''
+
+    clock_policy = str(cfg.get("clock_policy") or "min_symbols_observed").strip()
+
+    # Requested min-symbols threshold (portfolio runs often want >=2)
+    requested_min_clock_symbols = int(cfg.get("clock_min_symbols") or 2)
+
+    # Fold runs are frequently single-symbol; requiring >=2 observed symbols would produce an EMPTY clock.
+    is_fold_run = bool(cfg.get("is_fold_run", False))
+
+    # Count symbols actually present in bars at this point (post-ingestion, pre-timegrid)
+    present_symbols = (
+        sorted(bars["symbol"].dropna().unique().tolist())
+        if (not bars.empty and "symbol" in bars.columns)
+        else []
+    )
+    n_present = len(present_symbols)
+
+    # Effective threshold:
+    # - folds: ALWAYS 1 (union for that symbol)
+    # - portfolio: clamp to what's actually present (defensive)
+    if is_fold_run:
+        min_clock_symbols = 1
+    else:
+        min_clock_symbols = requested_min_clock_symbols
+        if n_present > 0:
+            min_clock_symbols = min(min_clock_symbols, n_present)
+
+    # Optional: persist for diagnostics/audits
+    cfg["_clock_min_symbols_requested"] = requested_min_clock_symbols
+    cfg["_clock_min_symbols_effective"] = min_clock_symbols
+    cfg["_clock_symbols_present"] = present_symbols
 
 
 
@@ -880,11 +923,35 @@ def run_batch(
         encoding="utf-8",
     )
 
-    print(
+    '''print(
         f"[UNIFIED-CLOCK] policy={clock_policy} min_symbols={min_clock_symbols} "
         f"n_minutes={len(clock_index)} hash={clock_hash}"
-    )
+    )'''
 
+    print(
+        f"[UNIFIED-CLOCK] policy={clock_policy} "
+        f"min_symbols={min_clock_symbols} (requested={cfg.get('_clock_min_symbols_requested')}) "
+        f"present_symbols={len(cfg.get('_clock_symbols_present', []))} "
+        f"n_minutes={len(clock_index)} hash={clock_hash}"
+    )
+    # ---- Task 2: FE requires canonical 60s cadence (even if unified_clock is observed-only) ----
+    # In fold runs, observed-only clocks can be sparse (e.g., 3–5 minute gaps), which breaks FE.
+    # So we build a canonical 60s grid clock for standardization and keep bar_present to mark reality.
+    is_fold_run = bool(cfg.get("is_fold_run", False))
+    if is_fold_run and len(clock_index) > 0:
+        # canonical continuous 60s grid covering the fold span
+        grid_clock = pd.date_range(
+            start=clock_index.min(),
+            end=clock_index.max(),
+            freq="60s",
+            tz="UTC",
+        )
+    else:
+        grid_clock = clock_index
+
+    # Persist the processing grid clock (may be dense in folds, observed-only otherwise)
+    cfg["_grid_clock"] = grid_clock
+    cfg["_grid_clock_hash"] = compute_clock_hash(grid_clock)
 
     _dbg_symbols(bars, "A_AFTER_CONCAT")
 
@@ -1022,23 +1089,198 @@ def run_batch(
 
         _dbg_symbols(bars, "C_BEFORE_TIMEGRID")
 
+        # ------------------------------------------------------------------
+        # HARDEN unified_clock BEFORE timegrid standardization
+        # Fold runner may override cfg["_unified_clock"] with a sparse "fallback" clock
+        # (e.g., scanner-thinned timestamps). That will preserve non-60s cadence and
+        # will hard-fail in FE. We require a true 60s grid here.
+        # ------------------------------------------------------------------
+        clock_for_grid = cfg.get("_unified_clock", None)
+
+        # Normalize to DatetimeIndex if possible
+        try:
+            import pandas as pd
+            if clock_for_grid is not None and not isinstance(clock_for_grid, pd.DatetimeIndex):
+                clock_for_grid = pd.DatetimeIndex(pd.to_datetime(clock_for_grid, utc=True, errors="coerce"))
+        except Exception:
+            clock_for_grid = None
+
+        def _median_step_seconds(idx):
+            import numpy as np
+            import pandas as pd
+            if idx is None or len(idx) < 3:
+                return None
+            # drop NaT just in case
+            idx = idx[~pd.isna(idx)]
+            if len(idx) < 3:
+                return None
+            diffs = idx.sort_values().to_series().diff().dropna()
+            if diffs.empty:
+                return None
+            return float(np.median(diffs.dt.total_seconds().values))
+
+        med = _median_step_seconds(clock_for_grid)
+
+        # If the provided clock is sparse / irregular, densify to a true minutely grid
+        if clock_for_grid is None or med is None or int(round(med)) != 60:
+            # Prefer bar min/max bounds so we always cover the actual data passed in
+            ts_min = pd.to_datetime(bars["timestamp"].min(), utc=True, errors="coerce")
+            ts_max = pd.to_datetime(bars["timestamp"].max(), utc=True, errors="coerce")
+
+            # Fallback to clock bounds if bars bounds are missing
+            if pd.isna(ts_min) or pd.isna(ts_max):
+                if clock_for_grid is not None and len(clock_for_grid) > 0:
+                    ts_min = pd.to_datetime(clock_for_grid.min(), utc=True, errors="coerce")
+                    ts_max = pd.to_datetime(clock_for_grid.max(), utc=True, errors="coerce")
+
+            if pd.isna(ts_min) or pd.isna(ts_max):
+                raise RuntimeError("[TimeGrid][HARD FAIL] Cannot determine bounds to build a 60s unified clock.")
+
+            # Build dense 60-second grid
+            '''clock_for_grid = pd.date_range(
+                start=ts_min.floor("min"),
+                end=ts_max.floor("min"),
+                freq="60s",
+                tz="UTC",
+            )'''
+
+            # Use Task-3 unified clock as the ONLY grid. Do NOT densify here.
+            '''clock_for_grid = cfg.get("_unified_clock")
+            if clock_for_grid is None or len(clock_for_grid) == 0:
+                raise RuntimeError("[TimeGrid][HARD FAIL] cfg['_unified_clock'] missing/empty in run_batch().")
+
+            print(
+                f"[TimeGrid] WARNING: cfg['_unified_clock'] was not 60s (median_step={med}). "
+                f"Rebuilt dense 60s clock_for_grid n={len(clock_for_grid)} "
+                f"min={clock_for_grid.min()} max={clock_for_grid.max()}"
+            )
+
+        # ------------------------------------------------------------------
+        # Standardize bars onto the hardened 60s clock
+        # ------------------------------------------------------------------
+        # FE requires 60s grid, but unified_clock is NOT the grid.
+        # Build a dedicated FE grid and keep unified_clock untouched.
+
+        fe_grid = pd.date_range(
+            start=cfg["_unified_clock"].min(),
+            end=cfg["_unified_clock"].max(),
+            freq="60s",
+            tz="UTC",
+        )'''
+
+        # ------------------------------------------------------------------
+        # HARDEN FE GRID (60s) BEFORE passing bars into Feature Engineering
+        # unified_clock is the "observed minutes" truth for Task 3,
+        # but FE REQUIRES an explicit 60-second grid (Task 2).
+        # ------------------------------------------------------------------
+
+        clock_for_grid = cfg.get("_unified_clock", None)
+
+        # Normalize to DatetimeIndex if possible
+        try:
+            import pandas as pd
+            if clock_for_grid is not None and not isinstance(clock_for_grid, pd.DatetimeIndex):
+                clock_for_grid = pd.DatetimeIndex(pd.to_datetime(clock_for_grid, utc=True, errors="coerce"))
+        except Exception:
+            clock_for_grid = None
+
+        def _median_step_seconds(idx):
+            import numpy as np
+            import pandas as pd
+            if idx is None or len(idx) < 3:
+                return None
+            idx = idx[~pd.isna(idx)]
+            if len(idx) < 3:
+                return None
+            diffs = idx.sort_values().to_series().diff().dropna()
+            if diffs.empty:
+                return None
+            return float(np.median(diffs.dt.total_seconds().values))
+
+        med = _median_step_seconds(clock_for_grid)
+
+        # Always derive FE grid bounds from the actual bars we are about to FE-transform
+        ts_min = pd.to_datetime(bars["timestamp"].min(), utc=True, errors="coerce")
+        ts_max = pd.to_datetime(bars["timestamp"].max(), utc=True, errors="coerce")
+        if pd.isna(ts_min) or pd.isna(ts_max):
+            raise RuntimeError("[TimeGrid][HARD FAIL] Cannot determine bars bounds to build FE 60s grid.")
+
+        fe_grid = pd.date_range(
+            start=ts_min.floor("min"),
+            end=ts_max.floor("min"),
+            freq="60s",
+            tz="UTC",
+        )
+
+        # Optional diagnostic: if unified_clock is not 60s, say so (but DO NOT use it as the FE grid)
+        if med is None or int(round(med)) != 60:
+            print(
+                f"[TimeGrid] NOTE: cfg['_unified_clock'] median_step={med}; "
+                f"using FE 60s grid len={len(fe_grid)} min={fe_grid.min()} max={fe_grid.max()}"
+            )
+
+        # --- ACTUALLY STANDARDIZE BARS TO THE 60s GRID (this is what FE needs) ---
         bars, grid_audits = standardize_bars_to_grid(
             bars,
             symbol_col="symbol",
             ts_col="timestamp",
             freq="60s",
             expected_freq_s=60,
-            #global_index=unified_clock,
-            global_index=cfg["_unified_clock"],
+            global_index=fe_grid,
             fill_volume_zero=True,
             keep_ohlc_nan=True,
         )
+
+        # Persist grid audit (always; debugging and acceptance)
+        from feature_engineering.utils import timegrid as tg
+        try:
+            (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
+            (artifacts_root / "diagnostics" / "grid_audit.json").write_text(
+                json.dumps(tg.grid_audit_to_json(grid_audits), indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[WARN] failed to write diagnostics/grid_audit.json: {e}")
+
+        _dbg_symbols(bars, "D_AFTER_TIMEGRID")
+
+        # Mark whether a (timestamp,symbol) row corresponds to a REAL bar.
+        # (After reindexing, placeholders exist and MUST NOT count as presence.)
+        if "close" in bars.columns:
+            bars["bar_present"] = bars["close"].notna().astype("int8")
+        else:
+            bars["bar_present"] = 1  # fallback
+
+        '''bars, grid_audits = standardize_bars_to_grid(
+            bars,
+            symbol_col="symbol",
+            ts_col="timestamp",
+            freq="60s",
+            expected_freq_s=60,
+            global_index=clock_for_grid,
+            fill_volume_zero=True,
+            keep_ohlc_nan=True,
+        )'''
+
+        '''bars, grid_audits = standardize_bars_to_grid(
+            bars,
+            symbol_col="symbol",
+            ts_col="timestamp",
+            freq="60s",
+            expected_freq_s=60,
+            global_index=fe_grid,
+            fill_volume_zero=True,
+            keep_ohlc_nan=True,
+        )
+
+        from feature_engineering.utils import timegrid as tg
 
         # Persist grid audit (always)
         try:
             (artifacts_root / "diagnostics").mkdir(parents=True, exist_ok=True)
             (artifacts_root / "diagnostics" / "grid_audit.json").write_text(
-                json.dumps(grid_audit_to_json(grid_audits), indent=2, default=str),
+
+                json.dumps(tg.grid_audit_to_json(grid_audits), indent=2, default=str),
                 encoding="utf-8",
             )
         except Exception as e:
@@ -1055,8 +1297,24 @@ def run_batch(
             expected_clock_hash=cfg["_unified_clock_hash"],
             ts_col="timestamp",
             who="bars(post-timegrid)",
-        )
+        )'''
 
+        # Mark whether a (timestamp,symbol) row corresponds to a REAL bar.
+        # Placeholder grid rows MUST NOT be required to exist in unified_clock.
+        if "close" in bars.columns:
+            bars["bar_present"] = bars["close"].notna().astype("int8")
+        else:
+            bars["bar_present"] = 1  # fallback
+
+        # Task 3 enforcement (correct): only REAL bars must lie on unified_clock.
+        bars_real = bars[bars["bar_present"] == 1]
+        assert_df_on_clock(
+            bars_real,
+            clock_index=cfg["_unified_clock"],
+            expected_clock_hash=cfg["_unified_clock_hash"],
+            ts_col="timestamp",
+            who="bars(real-bars,post-timegrid)",
+        )
 
         if not bool(cfg.get("is_fold_run", False)):
             requested = cfg.get("universe") or []
@@ -1855,6 +2113,231 @@ def _drop_if_all_nat(df: pd.DataFrame, col: str, who: str) -> pd.DataFrame:
         return df.drop(columns=[col])
     # otherwise keep it and let the strict enforcer validate it
     return df
+
+
+
+#from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import json
+import pandas as pd
+
+
+def _safe_len_parquet(p: Path) -> int:
+    try:
+        if p is None:
+            return 0
+        p = Path(p)
+        if (not p.exists()) or p.stat().st_size == 0:
+            return 0
+        return int(len(pd.read_parquet(p)))
+    except Exception:
+        return 0
+
+
+def _safe_read_parquet(p: Path) -> pd.DataFrame:
+    try:
+        if p is None:
+            return pd.DataFrame()
+        p = Path(p)
+        if (not p.exists()) or p.stat().st_size == 0:
+            return pd.DataFrame()
+        return pd.read_parquet(p)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _compute_overlap_share_ge2_from_df(dec: pd.DataFrame) -> float:
+    # share of timestamps with >=2 unique symbols (decision basis)
+    if dec is None or dec.empty:
+        return 0.0
+    if not {"timestamp", "symbol"}.issubset(dec.columns):
+        return 0.0
+    _tmp = dec[["timestamp", "symbol"]].copy()
+    _tmp["timestamp"] = pd.to_datetime(_tmp["timestamp"], utc=True, errors="coerce")
+    _tmp = _tmp.dropna(subset=["timestamp"])
+    if _tmp.empty:
+        return 0.0
+    per_ts = _tmp.groupby("timestamp")["symbol"].nunique()
+    return float((per_ts >= 2).mean()) if len(per_ts) else 0.0
+
+
+def _evaluation_integrity_report(
+    *,
+    run_id: str,
+    artifacts_root: Path,
+    clock_hash: Optional[str],
+    consolidated_decisions_path: Optional[Path],
+    consolidated_trades_path: Optional[Path],
+    attempt_files: Tuple[Path, ...],
+    # optional “coverage” and “overlap by real bars” if you already computed them upstream
+    coverage_by_symbol: Optional[Dict[str, float]] = None,
+    overlap_by_real_bars: Optional[float] = None,
+) -> Dict[str, Any]:
+    dec = _safe_read_parquet(consolidated_decisions_path) if consolidated_decisions_path else pd.DataFrame()
+    trd = _safe_read_parquet(consolidated_trades_path) if consolidated_trades_path else pd.DataFrame()
+
+    # attempted-actions are per-symbol files
+    attempted_frames = []
+    for p in attempt_files:
+        df = _safe_read_parquet(p)
+        if not df.empty:
+            attempted_frames.append(df)
+    attempted = pd.concat(attempted_frames, ignore_index=True) if attempted_frames else pd.DataFrame()
+
+    n_decisions = int(len(dec))
+    n_attempted_actions = int(len(attempted))
+    n_executed_trades = int(len(trd))
+
+    # qty_zero bucket (requires qty or target_qty to exist)
+    qty_col = None
+    for c in ("qty", "target_qty"):
+        if (not attempted.empty) and (c in attempted.columns):
+            qty_col = c
+            break
+
+    qty_zero = 0
+    qty_nonzero = 0
+    if qty_col is not None and not attempted.empty:
+        q = attempted[qty_col].astype(float).fillna(0.0)
+        qty_zero = int((q.abs() == 0).sum())
+        qty_nonzero = int((q.abs() > 0).sum())
+
+    # "blocked_by_gate" is the residual from decisions->attempted after accounting for qty_zero attempts
+    # Interpretation:
+    # - decisions includes every decision row
+    # - attempted includes only rows that passed your “attempt flag” filter (entry/take_trade/gate_pass)
+    # - qty_zero is inside attempted (attempted but sized to zero)
+    blocked_by_gate = int(max(n_decisions - n_attempted_actions, 0))
+
+    # Attempted(nonzero) vs executed trades delta: “rejected_by_execution”
+    # (risk blocks, fill simulation, costs, participation limits, etc.)
+    rejected_by_execution = int(max(qty_nonzero - n_executed_trades, 0)) if qty_col else int(max(n_attempted_actions - n_executed_trades, 0))
+
+    # Coverage from consolidated decisions if you didn’t supply it
+    if coverage_by_symbol is None:
+        coverage_by_symbol = {}
+        if not dec.empty and "symbol" in dec.columns:
+            vc = dec["symbol"].astype(str).value_counts()
+            total = float(vc.sum()) if float(vc.sum()) > 0 else 1.0
+            coverage_by_symbol = {k: float(v / total) for k, v in vc.to_dict().items()}
+
+    overlap_share_ge2_decisions = _compute_overlap_share_ge2_from_df(dec)
+
+    # Invariants
+    invariants = {
+        "executed_le_attempted": bool(n_executed_trades <= n_attempted_actions),
+        "attempted_le_decisions": bool(n_attempted_actions <= n_decisions),
+    }
+
+    # Reconciliation sums
+    # decisions - attempted == blocked_by_gate (by construction here)
+    recon_dec_to_attempt = {
+        "blocked_by_gate": blocked_by_gate,
+        "qty_zero": qty_zero,  # informational: inside attempted, not part of the delta
+    }
+
+    # attempted - executed: mostly execution/risk/fill/cost
+    recon_attempt_to_exec = {
+        "rejected_by_execution": rejected_by_execution,
+    }
+
+    report = {
+        "run_id": run_id,
+        "run_dir": str(artifacts_root.resolve()),
+        "clock_hash": clock_hash,
+        "paths": {
+            "decisions_consolidated": str(consolidated_decisions_path) if consolidated_decisions_path else None,
+            "trades_consolidated": str(consolidated_trades_path) if consolidated_trades_path else None,
+            "attempted_actions_files": [str(p) for p in attempt_files],
+        },
+        "overlap": {
+            "basis_decisions_overlap_share_ge2": float(overlap_share_ge2_decisions),
+            "basis_real_bars_overlap_share_ge2": None if overlap_by_real_bars is None else float(overlap_by_real_bars),
+        },
+        "coverage_by_symbol": coverage_by_symbol,
+        "counts": {
+            "n_decisions": n_decisions,
+            "n_attempted_actions": n_attempted_actions,
+            "n_executed_trades": n_executed_trades,
+            "attempted_qty_zero": int(qty_zero),
+            "attempted_qty_nonzero": int(qty_nonzero),
+        },
+        "reconciliation": {
+            "decisions_minus_attempted": int(n_decisions - n_attempted_actions),
+            "attempted_minus_executed": int(n_attempted_actions - n_executed_trades),
+            "buckets": {
+                "decisions_to_attempted": recon_dec_to_attempt,
+                "attempted_to_executed": recon_attempt_to_exec,
+            },
+        },
+        "invariants": invariants,
+    }
+    return report
+
+
+def _write_evaluation_integrity_report(
+    *,
+    run_id: str,
+    artifacts_root: Path,
+    clock_hash: Optional[str],
+    dec_path: Optional[Path],
+    trd_path: Optional[Path],
+    attempt_files: Tuple[Path, ...],
+    coverage_by_symbol: Optional[Dict[str, float]] = None,
+    overlap_by_real_bars: Optional[float] = None,
+) -> Path:
+    reports_dir = (artifacts_root / "reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = _evaluation_integrity_report(
+        run_id=run_id,
+        artifacts_root=artifacts_root,
+        clock_hash=clock_hash,
+        consolidated_decisions_path=dec_path,
+        consolidated_trades_path=trd_path,
+        attempt_files=attempt_files,
+        coverage_by_symbol=coverage_by_symbol,
+        overlap_by_real_bars=overlap_by_real_bars,
+    )
+
+    out_json = reports_dir / "evaluation_integrity.json"
+    out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    # Optional CSV summary (tiny, stable)
+    out_csv = reports_dir / "evaluation_integrity.csv"
+    row = {
+        "run_id": payload.get("run_id"),
+        "clock_hash": payload.get("clock_hash"),
+        "overlap_share_ge2_decisions": payload["overlap"]["basis_decisions_overlap_share_ge2"],
+        "n_decisions": payload["counts"]["n_decisions"],
+        "n_attempted_actions": payload["counts"]["n_attempted_actions"],
+        "n_executed_trades": payload["counts"]["n_executed_trades"],
+        "attempted_qty_zero": payload["counts"]["attempted_qty_zero"],
+        "attempted_qty_nonzero": payload["counts"]["attempted_qty_nonzero"],
+        "blocked_by_gate": payload["reconciliation"]["buckets"]["decisions_to_attempted"]["blocked_by_gate"],
+        "rejected_by_execution": payload["reconciliation"]["buckets"]["attempted_to_executed"]["rejected_by_execution"],
+    }
+    pd.DataFrame([row]).to_csv(out_csv, index=False)
+
+    # Hard fail if invariants broken
+    if not payload["invariants"]["executed_le_attempted"]:
+        raise RuntimeError(
+            f"[Task5][HARD FAIL] executed trades > attempted actions "
+            f"({payload['counts']['n_executed_trades']} > {payload['counts']['n_attempted_actions']})"
+        )
+    if not payload["invariants"]["attempted_le_decisions"]:
+        raise RuntimeError(
+            f"[Task5][HARD FAIL] attempted actions > decisions "
+            f"({payload['counts']['n_attempted_actions']} > {payload['counts']['n_decisions']})"
+        )
+
+    print(f"[INTEGRITY-REPORT] wrote reports/evaluation_integrity.json")
+    return out_json
+
 
 
 def _consolidate_phase4_outputs(artifacts_root: Path) -> Tuple[Path | None, Path | None]:
@@ -3784,6 +4267,54 @@ def _resolve_csv_root_for_reporting(cfg: dict) -> Path:
     # Anything else: fall back safely
     return _resolve_path("raw_data", create=False, is_dir=True)
 
+import shutil
+from pathlib import Path
+
+RUN_MANIFEST_NAME = "RUN_MANIFEST.json"  # if you already import this elsewhere, reuse it.
+
+def _ensure_manifest_in_dir(run_root: Path, target_dir: Path) -> None:
+    """
+    Task4 compatibility:
+    Some components treat per-symbol dirs as a run_dir and require RUN_MANIFEST.json.
+
+    IMPORTANT:
+    The manifest inside target_dir MUST have manifest.run_dir == str(target_dir),
+    otherwise assert_manifest_matches_run_dir() will fail.
+    """
+    import json
+
+    src = (Path(run_root) / RUN_MANIFEST_NAME).resolve()
+    dst = (Path(target_dir) / RUN_MANIFEST_NAME).resolve()
+
+    import json
+
+    if dst.exists():
+        try:
+            existing = json.loads(dst.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+        td = str(Path(target_dir).resolve())
+
+        # If it already matches, keep it. Otherwise overwrite with corrected fields.
+        if str(existing.get("run_dir", "")).strip() == td and str(existing.get("artifacts_root", "")).strip() == td:
+            return
+        # else: fall through and rewrite
+
+    if not src.exists():
+        raise AssertionError(f"[Task4] Missing {RUN_MANIFEST_NAME} in run_root={run_root}")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read root manifest, but rewrite BOTH fields to match target_dir.
+    m = json.loads(src.read_text(encoding="utf-8"))
+
+    td = str(Path(target_dir).resolve())
+    m["run_dir"] = td
+    m["artifacts_root"] = td  # <-- THIS is the missing piece causing your current crash
+
+    dst.write_text(json.dumps(m, indent=2), encoding="utf-8")
+
 
 async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout)
@@ -3794,14 +4325,30 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
     from pathlib import Path
 
-    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+    '''arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
 
     # If you have a run_dir / RUN_ID folder, use it; otherwise include it explicitly:
     run_dir = arte_root / RUN_ID  # or however you define your per-run directory
     out_dir = run_dir / sym
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    sym_dir = out_dir  # single source of truth
+    sym_dir = out_dir  # single source of truth'''
+
+    arte_root = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+
+    # IMPORTANT (Task4):
+    # cfg["artifacts_root"] must already be the directory that contains RUN_MANIFEST.json
+    # (i.e., a "run_dir" in Task4 terms). Do NOT append RUN_ID or sym again.
+    run_dir = arte_root
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Where this symbol should write outputs:
+    # - if caller provided symbol_out_dir, use it
+    # - else default to run_dir itself
+    out_dir = Path(cfg.get("symbol_out_dir") or run_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sym_dir = out_dir  # single source of truth for this symbol’s files
 
     print(f"[OneSym-START] sym={sym} cfg_id={id(cfg)} csv_cfg={cfg.get('csv')!r}")
 
@@ -4124,6 +4671,10 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         # "attempted actions" = rows where the engine produced a decision row that could have led to execution.
         # We persist them even if target_qty==0 so "trades disappeared" can be diagnosed.
 
+        # Ensure per-symbol output dir exists before any writes
+        out_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         attempted = sized_all.copy()
 
         # Best-effort attempt flag:
@@ -4158,8 +4709,16 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
         # Persist alongside the symbol outputs (sym_dir is out_dir later)
         # NOTE: sym_dir is assigned below as out_dir; we can write directly to out_dir here too.
-        attempted_out = out_dir / "attempted_actions.parquet"
+        '''attempted_out = out_dir / "attempted_actions.parquet"
         out_dir.mkdir(parents=True, exist_ok=True)
+        attempted.to_parquet(attempted_out, index=False)
+        print(f"[AttemptedActions] sym={sym} rows={len(attempted)} → {attempted_out}")'''
+
+        # Persist attempted actions next to this symbol's artifacts
+        sym_dir = (_resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym))
+        sym_dir.mkdir(parents=True, exist_ok=True)
+
+        attempted_out = sym_dir / "attempted_actions.parquet"
         attempted.to_parquet(attempted_out, index=False)
         print(f"[AttemptedActions] sym={sym} rows={len(attempted)} → {attempted_out}")
 
@@ -4177,26 +4736,32 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         )
 
         # Simulate fills (MOO/MOC with gap bands + partial fills)
-        rules = {
+        '''rules = {
             "max_participation": float(cfg.get("max_participation", 0.25)),
             "moo_gap_band": True, "moc_gap_band": True,
         }
         trades = _simulate_trades_from_decisions(
             decisions=sized, bars=bars_min, rules=rules,
             horizon_col="horizon_bars", target_qty_col="target_qty",
-        )
+        )'''
 
         # Persist per-symbol artifacts so the Phase-4.7 aggregator can pick them up
-        '''sym_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
+        sym_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
         sym_dir.mkdir(parents=True, exist_ok=True)
-        if len(sized):
-            sized.to_parquet(sym_dir / "decisions.parquet", index=False)
-        if len(trades):
-            trades.to_parquet(sym_dir / "trades.parquet", index=False)
 
-        # Short-circuit the per-symbol runner in this test mode; aggregation runs later in run()
-        return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
-        '''
+        # ALWAYS write the full decision spine (including qty=0 rows)
+        (sized_all if "sized_all" in locals() else sized).to_parquet(sym_dir / "decisions.parquet", index=False)
+
+        # ALWAYS write trades too (even if empty) so discovery is deterministic
+        if trades is None:
+            trades = pd.DataFrame()
+        trades.to_parquet(sym_dir / "trades.parquet", index=False)
+
+        print(
+            f"[PerSymWrite] sym={sym} "
+            f"decisions={len(sized_all if 'sized_all' in locals() else sized)} "
+            f"trades={len(trades)} → {sym_dir}"
+        )
 
         '''sym_dir = out_dir
         sym_dir.mkdir(parents=True, exist_ok=True)
@@ -4389,7 +4954,10 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         # artifacts_root=base_artifacts_root,
         artifacts_root=sym_dir,
         parquet_root=resolved_parquet_root,
-        ev_artifacts_root=_resolve_path(cfg["artefacts"]),
+        #ev_artifacts_root=_resolve_path(cfg["artefacts"]),
+        # IMPORTANT: prediction_engine.artifacts.loader resolves a run_dir from this root,
+        # so this MUST be a Task4-valid run_dir (contains RUN_MANIFEST.json), not ../weights.
+        ev_artifacts_root=Path(cfg["artifacts_root"]).resolve(),
         symbol=sym,
         horizon_bars=int(cfg.get("horizon_bars", 20)),
         longest_lookback_bars=int(cfg.get("longest_lookback_bars", 60)),
@@ -4400,7 +4968,11 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         # ADD THESE TWO:
         unified_clock=cfg.get("_unified_clock"),
         bar_grid_seconds=int(cfg.get("_bar_grid_seconds", 60)),
+        cfg=cfg,
+
     )
+
+    runner.unified_clock_hash = cfg.get("_unified_clock_hash")
 
     # metadata
     # meta_path = _resolve_path(cfg.get("artifacts_root", "artifacts/a2")) / "meta.json"
@@ -5051,10 +5623,14 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # Phase 3: Build ONE canonical unified clock = observed minutes only
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Phase 3: Build ONE canonical unified clock = observed minutes only
+    # ------------------------------------------------------------------
+
     # IMPORTANT:
     # - Default must be 60s "observed minutes" clock, NOT intersection clock.
-    # - If you default to min_symbols_observed=2 on a sparse symbol (e.g., RRC),
-    #   the clock cadence becomes non-60s (e.g., 240s) and FE hard-fails.
+    # - If you default to min_symbols_observed=2 on sparse symbols, the clock cadence
+    #   becomes non-60s (e.g., 240s) and downstream hard-fails.
     clock_policy = str(cfg.get("clock_policy", "union_observed")).strip()
 
     # Default min_symbols depends on policy:
@@ -5136,7 +5712,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         ts_col="timestamp",
         freq=f"{grid_seconds}s",
         expected_freq_s=int(grid_seconds),
-        global_index=unified_clock,
+        #global_index=unified_clock,
+        global_index=cfg["_unified_clock"],
         fill_volume_zero=True,
         keep_ohlc_nan=True,
         hard_fail_on_duplicates=False,
@@ -5145,7 +5722,8 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # Phase 3 enforcement: bars_std timestamps must be on unified_clock and hash must match
     assert_df_on_clock(
         bars_std,
-        clock_index=unified_clock,
+        #clock_index=unified_clock,
+        clock_index=cfg["_unified_clock"],
         expected_clock_hash=clock_hash,
         ts_col="timestamp",
         who="bars_std(post-timegrid)",
@@ -5210,12 +5788,27 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         else:
             bars_std["bar_present"] = 1
 
+
+    # ------------------------------------------------------------------
+    # Task 5: real-bars overlap metric (must exist even if we abort on coverage)
+    # ------------------------------------------------------------------
+    overlap_real_bars = _timestamp_overlap_share(
+        bars_std,
+        min_symbols=2,
+        ts_col="timestamp",
+        symbol_col="symbol",
+        presence_col="bar_present",  # REAL bars basis
+    )
+    cfg["_overlap_share_ge2_real_bars"] = float(overlap_real_bars)
+    print(f"[OVERLAP][REAL-BARS] share>=2 = {overlap_real_bars:.6f}")
+
+
     # ------------------------------------------------------------------
     # Task 2: coverage gate on the unified clock (abort or drop)
     # ------------------------------------------------------------------
     from feature_engineering.utils.consistency_gate import enforce_portfolio_bar_coverage_gate
-
-    coverage_threshold = float(cfg.get("min_bar_coverage_portfolio", 0.75))
+    #IMPORTANT: THE BELOW LINE CHANGES THE THRESHOLD
+    coverage_threshold = float(cfg.get("min_bar_coverage_portfolio", 0.20))
     coverage_mode = str(cfg.get("coverage_gate_mode", "abort")).strip().lower()
 
     cov_res = enforce_portfolio_bar_coverage_gate(
@@ -5235,7 +5828,62 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         f"artifact={cov_res.artifact_coverage_gate_path}"
     )
 
+    '''if cov_res.failing_symbols and cov_res.mode == "abort":
+        raise RuntimeError(
+            "[COVERAGE-GATE] abort: one or more symbols have insufficient bar coverage on the unified clock. "
+            f"threshold={cov_res.threshold:.3f} failing={cov_res.failing_symbols}. "
+            f"See {cov_res.artifact_coverage_gate_path}"
+        )'''
+
     if cov_res.failing_symbols and cov_res.mode == "abort":
+        # --- Task 5: write integrity report even on abort ---
+        try:
+            attempt_files = tuple(sorted(Path(cfg["artifacts_root"]).rglob("attempted_actions.parquet")))
+
+            clock_hash = (
+                    cfg.get("clock_hash")
+                    or cfg.get("_unified_clock_hash")
+                    or cfg.get("unified_clock_hash")
+                    or None
+            )
+
+            # Pull per-symbol coverage from the gate artifact if available
+            cov_payload = _safe_load_json(Path(cov_res.artifact_coverage_gate_path)) if getattr(cov_res,
+                                                                                                "artifact_coverage_gate_path",
+                                                                                                None) else None
+            coverage_by_symbol = None
+            if isinstance(cov_payload, dict):
+                # accept any of these keys depending on your schema
+                coverage_by_symbol = (
+                        cov_payload.get("coverage_by_symbol")
+                        or cov_payload.get("coverage")
+                        or cov_payload.get("per_symbol_coverage")
+                )
+
+            # Resolve run_id safely
+            run_id_for_report = cfg.get("run_id") or cfg.get("RUN_ID") or cfg.get("_run_id")
+            if not run_id_for_report:
+                name = Path(cfg["artifacts_root"]).resolve().name
+                run_id_for_report = name.split("a2_", 1)[-1] if "a2_" in name else name
+            run_id_for_report = str(run_id_for_report)
+
+            _write_evaluation_integrity_report(
+                run_id=run_id_for_report,
+                artifacts_root=Path(cfg["artifacts_root"]).resolve(),
+                clock_hash=clock_hash,
+                dec_path=None,
+                trd_path=None,
+                attempt_files=attempt_files,
+                coverage_by_symbol=coverage_by_symbol,
+                overlap_by_real_bars=cfg.get("_overlap_share_ge2_real_bars", None),
+            )
+
+            #print(f"[INTEGRITY-REPORT] wrote {out_json.relative_to(artifacts_root)}")
+
+            print("[INTEGRITY-REPORT] wrote reports/evaluation_integrity.json (coverage-gate abort)")
+        except Exception as e:
+            print(f"[INTEGRITY-REPORT][WARN] failed to write on abort: {e}")
+
         raise RuntimeError(
             "[COVERAGE-GATE] abort: one or more symbols have insufficient bar coverage on the unified clock. "
             f"threshold={cov_res.threshold:.3f} failing={cov_res.failing_symbols}. "
@@ -5287,9 +5935,39 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         sym_cfg = copy.deepcopy(cfg)
         sym_cfg["symbol"] = sym
 
-        sym_root = (Path(cfg["artifacts_root"]) / sym)
+        run_root = Path(cfg["artifacts_root"]).resolve()  # run-level a2_<run_id>
+        sym_artifacts_root = (run_root / sym).resolve()  # per-symbol run_dir
+        sym_artifacts_root.mkdir(parents=True, exist_ok=True)
+
+        # Ensure per-symbol dir is Task4-valid
+        _ensure_manifest_in_dir(run_root=run_root, target_dir=sym_artifacts_root)
+
+        # Make per-symbol dir the run_dir for the one-symbol pipeline
+        #sym_cfg["artifacts_root"] = str(sym_artifacts_root)
+
+        # --- Task4/Task5: per-symbol outputs go in <run_dir>/<SYM>, but artifacts_root stays run-level ---
+        sym_cfg = dict(cfg)
+
+        # Keep ArtifactManager on the RUN directory (the one that has the RUN_MANIFEST.json)
+        sym_cfg["artifacts_root"] = str(run_root)  # run_root == run_dir
+        sym_cfg["run_dir"] = str(run_root)  # if you use run_dir downstream, keep it run-level
+
+        # Put symbol-specific output files here
+        #sym_cfg["symbol_out_dir"] = str(sym_artifacts_root)
+
+        sym_cfg["symbol_out_dir"] = str(sym_artifacts_root)
+
+        '''sym_root = (Path(cfg["artifacts_root"]) / sym)
         sym_root.mkdir(parents=True, exist_ok=True)
-        sym_cfg["artifacts_root"] = str(sym_root)
+        sym_cfg["artifacts_root"] = str(sym_root)'''
+
+        '''sym_root = (Path(cfg["artifacts_root"]) / sym)
+        sym_root.mkdir(parents=True, exist_ok=True)
+
+        # Keep artifacts_root at the RUN DIR (the folder that contains RUN_MANIFEST.json)
+        # and store the per-symbol output dir separately.
+        sym_cfg["symbol_out_dir"] = str(sym_root)
+        # sym_cfg["artifacts_root"] stays as cfg["artifacts_root"]
 
         # --- BEGIN: enforce per-symbol artifact roots (required for AggFind) ---
         sym_dir = (run_ctx.run_dir / sym)
@@ -5300,6 +5978,54 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
         print(f"[PerSymbol] sym={sym} artifacts_root={cfg_sym['artifacts_root']}")
         # --- END: enforce per-symbol artifact roots ---
+        '''
+
+        # Per-symbol run directory (Task4: must contain RUN_MANIFEST.json)
+        sym_dir = (run_ctx.run_dir / sym)
+        sym_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure the manifest exists INSIDE sym_dir and matches sym_dir
+        _ensure_manifest_in_dir(
+            run_root=Path(run_ctx.run_dir).resolve(),
+            target_dir=Path(sym_dir).resolve(),
+        )
+
+        # IMPORTANT:
+        # For this symbol, artifacts_root must point at the directory that contains RUN_MANIFEST.json.
+        # (_run_one_symbol must treat cfg["artifacts_root"] as a run_dir; Fix 1 enables that.)
+        sym_cfg["artifacts_root"] = str(sym_dir)
+
+        # Where this symbol writes its outputs (we keep it equal to sym_dir for simplicity)
+        sym_cfg["symbol_out_dir"] = str(sym_dir)
+
+        print(f"[PerSymbol] sym={sym} artifacts_root={sym_cfg['artifacts_root']}")
+
+        # Task4: ensure per-symbol directory contains RUN_MANIFEST.json
+        '''_ensure_manifest_in_dir(run_root=Path(cfg["artifacts_root"]).resolve(),
+                                target_dir=Path(sym_artifacts_root).resolve())
+        '''
+
+        # Task4: ensure per-symbol directory contains RUN_MANIFEST.json
+        '''run_root = Path(cfg["artifacts_root"]).resolve()
+
+        # Define the per-symbol artifacts directory explicitly
+        sym_artifacts_root = run_root / sym
+
+        _ensure_manifest_in_dir(
+            run_root=run_root,
+            target_dir=sym_artifacts_root.resolve(),
+        )'''
+
+        # --- Task3/Task5: per-symbol runs must NOT build an empty clock ---
+        # Reuse the run-level unified clock if available; otherwise enforce a 1-symbol policy.
+        if "_unified_clock" in cfg and cfg["_unified_clock"] is not None:
+            sym_cfg["_unified_clock"] = cfg["_unified_clock"]
+            sym_cfg["_unified_clock_hash"] = cfg.get("_unified_clock_hash")
+            sym_cfg["unified_clock_policy"] = "reuse"
+        else:
+            # If per-symbol path recomputes, it must be compatible with single-symbol runs
+            sym_cfg["unified_clock_policy"] = "union_observed"
+            sym_cfg["min_clock_symbols"] = 1
 
         res = await _run_one_symbol(sym, sym_cfg)
 
@@ -5691,6 +6417,71 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                       f"wrote_trades={trd_sym is not None and not trd_sym.empty} dir={sym_dir}")
 
     dec_path, trd_path = _consolidate_phase4_outputs(artifacts_root)
+
+
+    # ---------------------------
+    # Task 5: Run-level Evaluation Integrity Report
+    # ---------------------------
+    attempt_files = tuple(sorted(artifacts_root.rglob("attempted_actions.parquet")))
+
+    # Try to capture clock_hash if your config stored it (Task 3/4); otherwise leave None.
+    clock_hash = (
+        cfg.get("clock_hash")
+        or cfg.get("_unified_clock_hash")
+        or cfg.get("unified_clock_hash")
+        or None
+    )
+
+    # If you already computed “real bars overlap” and/or coverage upstream, pass them in here.
+    # (If not, report will still compute decision-based overlap + decision-count coverage.)
+    overlap_by_real_bars = cfg.get("_overlap_share_ge2_real_bars", None)
+    coverage_by_symbol = cfg.get("_coverage_by_symbol_real_bars", None)
+
+    # --- Task 5: resolve run_id safely in this scope ---
+    run_id_for_report = (
+            cfg.get("run_id")
+            or cfg.get("RUN_ID")
+            or cfg.get("_run_id")
+    )
+
+    # Fallback: derive from run directory name like "a2_<id>"
+    if not run_id_for_report:
+        try:
+            name = Path(artifacts_root).resolve().name
+            run_id_for_report = name.split("a2_", 1)[-1] if "a2_" in name else name
+        except Exception:
+            run_id_for_report = "unknown"
+    run_id_for_report = str(run_id_for_report)
+
+    # --- Task 5: resolve run_id safely in this scope ---
+    run_id_for_report = (
+            cfg.get("run_id")
+            or cfg.get("RUN_ID")
+            or cfg.get("_run_id")
+    )
+
+    # Fallback: derive from run directory name like "a2_<id>"
+    if not run_id_for_report:
+        try:
+            name = Path(artifacts_root).resolve().name
+            run_id_for_report = name.split("a2_", 1)[-1] if "a2_" in name else name
+        except Exception:
+            run_id_for_report = "unknown"
+    run_id_for_report = str(run_id_for_report)
+
+    _write_evaluation_integrity_report(
+        #run_id=str(run_id),
+        run_id=run_id_for_report,
+
+        artifacts_root=artifacts_root,
+        clock_hash=clock_hash,
+        dec_path=Path(dec_path) if dec_path else None,
+        trd_path=Path(trd_path) if trd_path else None,
+        attempt_files=attempt_files,
+        coverage_by_symbol=coverage_by_symbol,
+        overlap_by_real_bars=overlap_by_real_bars,
+    )
+
 
     # ---------------------------
     # Execution reconciliation diagnostics

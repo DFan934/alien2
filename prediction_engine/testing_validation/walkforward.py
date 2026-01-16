@@ -310,7 +310,7 @@ class WalkForwardRunner:
         metrics.json
     """
 
-    def __init__(
+    '''def __init__(
         self,
         *,
         artifacts_root: Path,
@@ -326,6 +326,24 @@ class WalkForwardRunner:
         tz: str = "America/New_York",
         debug_no_costs: bool = False,
 
+    ) -> None:'''
+
+    def __init__(
+            self,
+            *,
+            artifacts_root: Path,
+            parquet_root: Path,
+            ev_artifacts_root: Path,
+            symbol: str,
+            horizon_bars: int,
+            longest_lookback_bars: int,
+            unified_clock=None,
+            bar_grid_seconds: int = 60,
+            p_gate_q: float = 0.65,
+            full_p_q: float = 0.80,
+            tz: str = "America/New_York",
+            debug_no_costs: bool = False,
+            cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.artifacts_root = Path(artifacts_root)
         self.parquet_root = Path(parquet_root)
@@ -339,6 +357,7 @@ class WalkForwardRunner:
         self.full_p_q = float(full_p_q)
         self.tz = tz
         self.debug_no_costs = debug_no_costs
+        self.cfg = dict(cfg or {})
 
     # ------------------------------ helpers ------------------------------
 
@@ -627,6 +646,21 @@ class WalkForwardRunner:
                 fold_idx=f.idx,
             )
 
+            # ------------------------------------------------------------
+            # CRITICAL: clamp scanned train/test slices to the intersection
+            # returned by the audit. Otherwise decisions can be made on
+            # timestamps that do not exist in FULL fold data → NaN pricing
+            # → keep.any() == False → empty trades.parquet.
+            # ------------------------------------------------------------
+            scan_tr_ts_set = set(pd.to_datetime(scan_tr_in_fold_ts, utc=True, errors="coerce"))
+            scan_te_ts_set = set(pd.to_datetime(scan_te_in_fold_ts, utc=True, errors="coerce"))
+
+            scan_tr["timestamp"] = pd.to_datetime(scan_tr["timestamp"], utc=True, errors="coerce")
+            scan_te["timestamp"] = pd.to_datetime(scan_te["timestamp"], utc=True, errors="coerce")
+
+            scan_tr = scan_tr.loc[scan_tr["timestamp"].isin(scan_tr_ts_set)].reset_index(drop=True)
+            scan_te = scan_te.loc[scan_te["timestamp"].isin(scan_te_ts_set)].reset_index(drop=True)
+
             # ---- FE: fit on full TRAIN, transform SCANNED train/test (no eval fit)
             '''pipe = CoreFeaturePipeline(parquet_root=Path(""))
             feats_full_tr, _ = pipe.run_mem(full_tr)       # fits scaler/PCA
@@ -821,6 +855,10 @@ class WalkForwardRunner:
                 # "test_features_df": feats_scan_te,
                 "horizon_bars": int(self.horizon_bars),
                 "execution_rules": execution_rules,
+                # Task 3/4: carry the canonical run-level unified clock into the fold
+                "_unified_clock": self.unified_clock,
+                "_unified_clock_hash": getattr(self, "unified_clock_hash", None),
+                "is_fold_run": True,
 
             }
 
@@ -1353,7 +1391,8 @@ class WalkForwardRunner:
             open_fwd_H = open_s.shift(-H)  # open H bars ahead
 
             # Restrict to current fold’s SCANNED TEST timestamps
-            ts_decisions = pd.to_datetime(scan_te["timestamp"]).values
+            #ts_decisions = pd.to_datetime(scan_te["timestamp"]).values
+            ts_decisions = pd.DatetimeIndex(pd.to_datetime(scan_te["timestamp"], utc=True, errors="coerce"))
 
             # Map decision bars → entry/exit timestamps and prices
             entry_ts = ts_fwd_1.reindex(ts_decisions).values
@@ -1366,6 +1405,9 @@ class WalkForwardRunner:
             valid_future = (~pd.isna(entry_ts)) & (~pd.isna(exit_ts)) & (~pd.isna(entry_px)) & (~pd.isna(exit_px))
             keep = mask_gate & valid_future
 
+            print(
+                f"[Fold {f.idx}] [TRADES] gate_true={mask_gate.sum()} valid_future={valid_future.sum()} keep={keep.sum()} n_test={len(ts_decisions)}")
+
             if keep.any():
                 # Position sizing: 1 share (you can upgrade later)
                 qty = np.ones(int(keep.sum()), dtype=float)
@@ -1375,7 +1417,12 @@ class WalkForwardRunner:
                 #slippage = np.zeros_like(qty) if self.debug_no_costs else np.zeros_like(qty)
 
                 # Costs (Phase 1.1): commission must be non-zero when enabled.
-                commission_per_share = float(getattr(self, "commission", self.cfg.get("commission", 0.0)))
+                #commission_per_share = float(getattr(self, "commission", self.cfg.get("commission", 0.0)))
+
+                commission_per_share = float(
+                    getattr(self, "commission", (self.cfg or {}).get("commission", 0.0))
+                )
+
                 slippage_bp = float(getattr(self, "slippage_bp", self.cfg.get("slippage_bp", 0.0)))
 
                 if self.debug_no_costs:
