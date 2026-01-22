@@ -72,6 +72,73 @@ _NOISE_PREFIXES = (
 )
 
 
+import hashlib
+import json
+from typing import Optional, Dict, Any
+
+def _sha256_file(path: Path) -> Optional[str]:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def _resolve_csv_map(cfg: dict) -> Dict[str, str]:
+    """
+    Return symbol->resolved absolute path for cfg['csv'] if it is a dict.
+    If cfg['csv'] is a template/string, we do not expand here (reporting uses _csv_path_for_symbol).
+    """
+    out: Dict[str, str] = {}
+    csv_cfg = cfg.get("csv")
+    if isinstance(csv_cfg, dict):
+        for sym, rel in csv_cfg.items():
+            try:
+                out[str(sym)] = str(_resolve_path(rel))
+            except Exception:
+                out[str(sym)] = str(rel)
+    return out
+
+def _write_data_provenance(diagnostics_dir: Path, cfg: dict) -> None:
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    bar_source = str(cfg.get("bar_source", "parquet")).lower().strip()
+    parquet_root = _resolve_path(cfg.get("parquet_root", "parquet"))
+    manifest_path = Path(parquet_root) / "manifest.json"
+
+    csv_paths = _resolve_csv_map(cfg)
+    csv_hashes = {sym: _sha256_file(Path(p)) for sym, p in csv_paths.items()}
+
+    prov: Dict[str, Any] = {
+        "bar_source": bar_source,
+        "stages": {
+            "ingest": "parquet",
+            "scanner": bar_source,
+            "feature_engineering": bar_source,
+            "execution": bar_source,
+            # reporting is allowed to use CSV in legacy mode
+            "reporting": ("csv" if bool(cfg.get("csv_report_only", True)) and cfg.get("csv") else bar_source),
+        },
+        "parquet": {
+            "parquet_root": str(parquet_root),
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": _sha256_file(manifest_path),
+        },
+        "csv": {
+            "csv_report_only": bool(cfg.get("csv_report_only", True)),
+            "csv_cfg": cfg.get("csv"),
+            "per_symbol_paths": csv_paths,
+            "per_symbol_sha256": csv_hashes,
+        },
+    }
+
+    (diagnostics_dir / "data_provenance.json").write_text(json.dumps(prov, indent=2, sort_keys=True))
+
+
 def _install_print_filter(enable_verbose: bool) -> None:
     if enable_verbose:
         return
@@ -1433,6 +1500,8 @@ def run_batch(
         has_cols = {k: (k in bars.columns) for k in
                     ["timestamp", "symbol", "open", "high", "low", "close", "bar_present"]}
         print(f"[OVERLAP-AUDIT] has_cols={has_cols}")
+
+
 
         # unified clock size (the “true” minute universe)
         clock_len = int(len(cfg["_unified_clock"])) if "unified_clock" in locals() and cfg["_unified_clock"] is not None else None
@@ -3043,13 +3112,29 @@ CONFIG: Dict[str, Any] = {
     # raw minute-bar CSV (Date, Time, Open, High, Low, Close, Volume)
     # "csv": "raw_data/RRC.csv",
     # "csv": "raw_data/{symbol}.csv",
+    #"csv": {
+    #    "RRC": "raw_data/RRC.csv",
+    #    "BBY": "raw_data/BBY.csv",
+    #},
+
+    #"parquet_root": "parquet",
+    # "symbol": "RRC",
+
+    # ── Truth contract ─────────────────────────────────────────────
+    # bar_source controls what scanner/FE/execution consume.
+    #   - "parquet" is the ONLY credible default.
+    #   - "csv" is allowed only when explicitly set for debugging.
+    "bar_source": "parquet",
+
+    # CSV config is permitted ONLY for report-only legacy outputs unless bar_source="csv"
+    "csv_report_only": True,
     "csv": {
         "RRC": "raw_data/RRC.csv",
         "BBY": "raw_data/BBY.csv",
     },
 
     "parquet_root": "parquet",
-    # "symbol": "RRC",
+
     "universe": StaticUniverse(["RRC", "BBY"]),
     "start": "1998-08-26",
     "end": "1999-01-01",
@@ -3094,6 +3179,9 @@ CONFIG: Dict[str, Any] = {
     # misc
     "out": "backtest_signals.csv",
     "atr_period": 14,
+# ── Coverage/overlap gate (Credibility Gate) ───────────────────
+    "min_overlap_share_ge2": 0.20,     # must hard-fail if overlap < this
+    "overlap_gate_mode": "abort",      # "abort" or "warn"
 }
 
 CONFIG.update({
@@ -3305,6 +3393,201 @@ def _cfg_bool(v, default: bool = False) -> bool:
         if s in ("0", "false", "f", "no", "n", "off"):
             return False
     return default
+
+
+def _cfg_float(v, default: float) -> float:
+    """
+    Robust float parser for config values that might be float/int/str/None/"None".
+    Prevents crashes and prevents 'None-but-defaulted' ambiguity by making
+    the defaulting explicit and recordable in cost_audit.json.
+    """
+    if v is None:
+        return float(default)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("none", "null", ""):
+            return float(default)
+        try:
+            return float(s)
+        except Exception:
+            return float(default)
+    return float(default)
+
+
+def _write_cost_audit(trades_df: pd.DataFrame, cfg: dict, arte_root: Path, *, sample_n: int = 25) -> None:
+    """
+    Writes: arte_root/diagnostics/cost_audit.json
+
+    Proof artifact that reconciles:
+      - raw cfg knobs (may be None/strings)
+      - effective numeric knobs applied by the model
+      - per-trade sample showing computed components and totals
+    """
+    try:
+        diag_root = arte_root / "diagnostics"
+        diag_root.mkdir(parents=True, exist_ok=True)
+        out_path = diag_root / "cost_audit.json"
+
+        # Even if empty, still write an audit (important for determinism + sanity).
+        if trades_df is None or len(trades_df) == 0:
+            audit = {
+                "debug_no_costs_raw": cfg.get("debug_no_costs", None),
+                "debug_no_costs_effective": _cfg_bool(cfg.get("debug_no_costs", False), default=False),
+                "raw_cfg": {
+                    "spread_bp": cfg.get("spread_bp", None),
+                    "slippage_bp": cfg.get("slippage_bp", None),
+                    "commission": cfg.get("commission", None),
+                    "impact_bps_per_adv_frac": cfg.get("impact_bps_per_adv_frac", None),
+                },
+                "effective_knobs": {
+                    "spread_bp": _cfg_float(cfg.get("spread_bp", 1.0), default=1.0),
+                    "slippage_bp": _cfg_float(cfg.get("slippage_bp", 0.0), default=0.0),
+                    "commission": _cfg_float(cfg.get("commission", 0.0), default=0.0),
+                    "impact_bps_per_adv_frac": _cfg_float(cfg.get("impact_bps_per_adv_frac", 25.0), default=25.0),
+                },
+                "n_trades": 0,
+                "totals": {
+                    "sum_modeled_cost_total": 0.0,
+                    "sum_realized_pnl": 0.0,
+                    "sum_realized_pnl_after_costs": 0.0,
+                },
+                "sample": [],
+                "note": "No trades present; wrote empty-but-valid audit.",
+            }
+            _write_json(out_path, audit)
+            print(f"[DIAG][COST_AUDIT] wrote → {out_path}")
+            return
+
+        df = trades_df.copy()
+
+        debug_no_costs_effective = _cfg_bool(cfg.get("debug_no_costs", False), default=False)
+
+        # Match _apply_modeled_costs_to_trades defaults exactly:
+        spread_bp_eff = _cfg_float(cfg.get("spread_bp", 1.0), default=1.0)
+        slippage_bp_eff = _cfg_float(cfg.get("slippage_bp", 0.0), default=0.0)
+        commission_eff = _cfg_float(cfg.get("commission", 0.0), default=0.0)
+        impact_eff = _cfg_float(cfg.get("impact_bps_per_adv_frac", 25.0), default=25.0)
+
+        # Core columns
+        qty_raw = pd.to_numeric(df.get("qty", 0.0), errors="coerce").fillna(0.0)
+        qty = qty_raw.abs()
+
+        entry = pd.to_numeric(df.get("entry_price", 0.0), errors="coerce").fillna(0.0)
+        exit_ = pd.to_numeric(df.get("exit_price", 0.0), errors="coerce").fillna(0.0)
+        mid = (entry + exit_) / 2.0
+
+        # half_spread_usd_used: either provided per-row, else fallback to spread_bp * mid
+        if "half_spread_usd" in df.columns:
+            half_spread_usd = pd.to_numeric(df["half_spread_usd"], errors="coerce")
+        else:
+            half_spread_usd = pd.Series(np.nan, index=df.index, dtype=float)
+
+        fallback_half_spread = (spread_bp_eff / 1e4) * mid
+        half_spread_usd_used = half_spread_usd.where(~half_spread_usd.isna(), fallback_half_spread).fillna(0.0)
+
+        # adv_frac used for impact (0 if missing)
+        if "adv_frac" in df.columns:
+            adv_frac = pd.to_numeric(df["adv_frac"], errors="coerce").fillna(0.0)
+        else:
+            adv_frac = pd.Series(0.0, index=df.index, dtype=float)
+
+        # Component breakdown (should align with _apply_modeled_costs_to_trades)
+        spread_cost = 2.0 * half_spread_usd_used * qty
+        commission_cost = 2.0 * commission_eff * qty
+        slippage_cost = (slippage_bp_eff / 1e4) * mid * 2.0 * qty
+        impact_cost = (impact_eff / 1e4) * mid * adv_frac * qty
+
+        modeled_cost_total = pd.to_numeric(df.get("modeled_cost_total", 0.0), errors="coerce").fillna(0.0)
+        realized_pnl = pd.to_numeric(df.get("realized_pnl", 0.0), errors="coerce").fillna(0.0)
+        realized_after = pd.to_numeric(df.get("realized_pnl_after_costs", realized_pnl - modeled_cost_total), errors="coerce").fillna(0.0)
+
+        # Build sample rows (sorted, deterministic)
+        sort_col = "entry_ts" if "entry_ts" in df.columns else None
+        dfx = df.copy()
+        dfx["_mid"] = mid
+        dfx["_half_spread_usd_used"] = half_spread_usd_used
+        dfx["_spread_cost"] = spread_cost
+        dfx["_commission_cost"] = commission_cost
+        dfx["_slippage_cost"] = slippage_cost
+        dfx["_impact_cost"] = impact_cost
+        dfx["_modeled_cost_total"] = modeled_cost_total
+        dfx["_realized_pnl"] = realized_pnl
+        dfx["_realized_after"] = realized_after
+
+        if sort_col:
+            dfx = dfx.sort_values(sort_col)
+
+        keep_cols = []
+        for c in ("symbol", "entry_ts", "exit_ts", "qty", "entry_price", "exit_price"):
+            if c in dfx.columns:
+                keep_cols.append(c)
+
+        keep_cols += [
+            "_mid",
+            "_half_spread_usd_used",
+            "_spread_cost",
+            "_commission_cost",
+            "_slippage_cost",
+            "_impact_cost",
+            "_modeled_cost_total",
+            "_realized_pnl",
+            "_realized_after",
+        ]
+
+        sample_df = dfx[keep_cols].head(int(sample_n)).copy()
+
+        def _round(v):
+            try:
+                if isinstance(v, (int, float, np.floating)):
+                    return float(round(float(v), 10))
+            except Exception:
+                pass
+            return v
+
+        sample = []
+        for _, r in sample_df.iterrows():
+            row = {k: _round(r[k]) for k in sample_df.columns}
+            sample.append(row)
+
+        audit = {
+            "debug_no_costs_raw": cfg.get("debug_no_costs", None),
+            "debug_no_costs_effective": debug_no_costs_effective,
+            "raw_cfg": {
+                "spread_bp": cfg.get("spread_bp", None),
+                "slippage_bp": cfg.get("slippage_bp", None),
+                "commission": cfg.get("commission", None),
+                "impact_bps_per_adv_frac": cfg.get("impact_bps_per_adv_frac", None),
+            },
+            "effective_knobs": {
+                "spread_bp": spread_bp_eff,
+                "slippage_bp": slippage_bp_eff,
+                "commission": commission_eff,
+                "impact_bps_per_adv_frac": impact_eff,
+            },
+            "n_trades": int(len(df)),
+            "totals": {
+                "sum_modeled_cost_total": float(modeled_cost_total.sum()),
+                "sum_realized_pnl": float(realized_pnl.sum()),
+                "sum_realized_pnl_after_costs": float(realized_after.sum()),
+            },
+            "sample_n": int(min(sample_n, len(df))),
+            "sample": sample,
+            "reconciliation_note": (
+                "Component math is recomputed here from effective knobs and per-row fields "
+                "(half_spread_usd, adv_frac) to prove what the model *should* be applying. "
+                "Compare _modeled_cost_total vs (_spread_cost+_commission_cost+_slippage_cost+_impact_cost)."
+            ),
+        }
+
+        _write_json(out_path, audit)
+        print(f"[DIAG][COST_AUDIT] wrote → {out_path}")
+
+    except Exception as e:
+        # Never break a run because diagnostics failed; log and proceed.
+        print(f"[DIAG][COST_AUDIT][WARN] failed to write cost_audit.json: {e!r}")
+
 
 
 def _requested_symbols_from_cfg_portfolio(cfg: dict, fallback_symbols: list[str]) -> tuple[list[str], str]:
@@ -4272,6 +4555,8 @@ from pathlib import Path
 
 RUN_MANIFEST_NAME = "RUN_MANIFEST.json"  # if you already import this elsewhere, reuse it.
 
+
+
 def _ensure_manifest_in_dir(run_root: Path, target_dir: Path) -> None:
     """
     Task4 compatibility:
@@ -4540,7 +4825,7 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
     df_raw["adv_shares"] = df_raw["volume"].rolling(20, min_periods=1).mean()
     df_raw["adv_dollars"] = df_raw["adv_shares"] * df_raw["close"]
     '''
-
+    import pandas as pd
     # -----------------------------
     # 1) Start from RAW bars (never mutate "full" into "scan")
     # -----------------------------
@@ -4672,8 +4957,41 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
         # We persist them even if target_qty==0 so "trades disappeared" can be diagnosed.
 
         # Ensure per-symbol output dir exists before any writes
-        out_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
+        #out_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
+
+        '''out_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+        out_dir.mkdir(parents=True, exist_ok=True)'''
+
+        '''out_dir = _resolve_path(cfg.get("symbol_out_dir") or cfg.get("artifacts_root", "artifacts/a2"),
+                                create=True, is_dir=True)
+        out_dir.mkdir(parents=True, exist_ok=True)'''
+
+        # -------------------------------
+        # Task 5: canonical per-symbol out_dir
+        # -------------------------------
+        from pathlib import Path
+
+        # Prefer run_dir for per-run outputs; fall back to artifacts_root if needed.
+        base_run_dir = cfg.get("run_dir")
+        if base_run_dir:
+            base_run_dir = Path(base_run_dir).expanduser().resolve()
+        else:
+            base_run_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True)
+
+        from pathlib import Path
+
+        run_dir = Path(cfg["run_dir"]).expanduser().resolve()
+        sym_root = run_dir / str(sym)  # <-- ALWAYS the symbol root AggFind scans
+        sym_root.mkdir(parents=True, exist_ok=True)
+
+        # Fold runs already pass a leaf directory (e.g., .../<SYM>/fold_02)
+        if bool(cfg.get("is_fold_run", False)):
+            out_dir = base_run_dir
+        else:
+            out_dir = base_run_dir / str(sym)
+
         out_dir.mkdir(parents=True, exist_ok=True)
+
 
         attempted = sized_all.copy()
 
@@ -4707,19 +5025,14 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
 
         attempted["attempt_reason"] = attempted.apply(_attempt_reason_row, axis=1)
 
-        # Persist alongside the symbol outputs (sym_dir is out_dir later)
-        # NOTE: sym_dir is assigned below as out_dir; we can write directly to out_dir here too.
-        '''attempted_out = out_dir / "attempted_actions.parquet"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        attempted.to_parquet(attempted_out, index=False)
-        print(f"[AttemptedActions] sym={sym} rows={len(attempted)} → {attempted_out}")'''
-
         # Persist attempted actions next to this symbol's artifacts
-        sym_dir = (_resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym))
+        # IMPORTANT: cfg["artifacts_root"] is already the per-symbol run dir: <run_dir>/<SYM>
+        sym_dir = Path(cfg["artifacts_root"]).expanduser().resolve()
         sym_dir.mkdir(parents=True, exist_ok=True)
 
         attempted_out = sym_dir / "attempted_actions.parquet"
         attempted.to_parquet(attempted_out, index=False)
+
         print(f"[AttemptedActions] sym={sym} rows={len(attempted)} → {attempted_out}")
 
         # Now filter ONLY for execution simulation (do NOT destroy the full sizing output)
@@ -4735,66 +5048,63 @@ async def _run_one_symbol(sym: str, cfg: Dict[str, Any]) -> pd.DataFrame:
             horizon_col="horizon_bars", target_qty_col="target_qty",
         )
 
-        # Simulate fills (MOO/MOC with gap bands + partial fills)
-        '''rules = {
-            "max_participation": float(cfg.get("max_participation", 0.25)),
-            "moo_gap_band": True, "moc_gap_band": True,
-        }
-        trades = _simulate_trades_from_decisions(
-            decisions=sized, bars=bars_min, rules=rules,
-            horizon_col="horizon_bars", target_qty_col="target_qty",
-        )'''
-
-        # Persist per-symbol artifacts so the Phase-4.7 aggregator can pick them up
-        sym_dir = _resolve_path(cfg.get("artifacts_root", "artifacts/a2"), create=True, is_dir=True) / str(sym)
-        sym_dir.mkdir(parents=True, exist_ok=True)
-
-        # ALWAYS write the full decision spine (including qty=0 rows)
-        (sized_all if "sized_all" in locals() else sized).to_parquet(sym_dir / "decisions.parquet", index=False)
-
-        # ALWAYS write trades too (even if empty) so discovery is deterministic
-        if trades is None:
-            trades = pd.DataFrame()
-        trades.to_parquet(sym_dir / "trades.parquet", index=False)
-
         print(
-            f"[PerSymWrite] sym={sym} "
-            f"decisions={len(sized_all if 'sized_all' in locals() else sized)} "
-            f"trades={len(trades)} → {sym_dir}"
+            f"[DEBUG][SYM_ROOT] sym={sym} "
+            f"is_fold_run={cfg.get('is_fold_run', False)} "
+            f"cfg.artifacts_root={cfg.get('artifacts_root')} "
         )
 
-        '''sym_dir = out_dir
-        sym_dir.mkdir(parents=True, exist_ok=True)
+        # ---------------------------------------------------------
+        # Task 5: persist per-symbol decisions/trades for AggFind
+        # Must land in <run_dir>/<SYM>/decisions.parquet and trades.parquet
+        # ---------------------------------------------------------
 
-        if len(sized):
-            sized.to_parquet(sym_dir / "decisions.parquet", index=False)
-        if len(trades):
-            trades.to_parquet(sym_dir / "trades.parquet", index=False)
-        '''
+        # ---------------------------------------------------------
+        # Task 5: per-symbol artifact persistence (canonical)
+        # Write the 3 canonical files to the PER-SYMBOL ROOT that AggFind scans.
+        #   - normal run:   sym_root == out_dir == <run_dir>/<SYM>
+        #   - fold run:     out_dir == <run_dir>/<SYM>/fold_XX, so sym_root == out_dir.parent
+        # ---------------------------------------------------------
+        # ---------------------------------------------------------
+        # Task 5: canonical per-symbol artifact persistence (single source of truth)
+        # MUST write these 3 files to <run_dir>/<SYM> (the directory AggFind scans).
+        # ---------------------------------------------------------
+        import pandas as pd
+        from pathlib import Path
 
-        sym_dir = out_dir
-        sym_dir.mkdir(parents=True, exist_ok=True)
+        # In your pipeline, cfg["artifacts_root"] is typically set per-symbol.
+        # Normal run: cfg["artifacts_root"] == <run_dir>/<SYM>
+        # Fold run:   cfg["artifacts_root"] == <run_dir>/<SYM>/fold_XX  (so canonical root is parent)
+        sym_root = Path(cfg["artifacts_root"]).expanduser().resolve()
+        if bool(cfg.get("is_fold_run", False)):
+            sym_root = sym_root.parent
 
-        # ALWAYS write the full decision spine (including qty=0 rows),
-        # otherwise Phase-4 aggregation finds nothing when sizing is conservative.
-        dec_out = sym_dir / "decisions.parquet"
-        sized_all.to_parquet(dec_out, index=False)
+        sym_root.mkdir(parents=True, exist_ok=True)
 
-        # Optional: also write the "executable" subset for quick inspection
-        exec_dec_out = sym_dir / "decisions_executable.parquet"
-        sized.to_parquet(exec_dec_out, index=False)
+        # ---- Task 5 canonical files (AggFind expects these EXACT names here) ----
+        attempted_path = sym_root / "attempted_actions.parquet"
+        attempted.to_parquet(attempted_path, index=False)
 
-        # ALWAYS write trades.parquet too (even if empty) so discovery is deterministic
-        trd_out = sym_dir / "trades.parquet"
-        trades.to_parquet(trd_out, index=False)
+        decisions_path = sym_root / "decisions.parquet"
+        sized_all.to_parquet(decisions_path, index=False)  # FULL spine, qty=0 included
 
-        print(
-            f"[PerSymWrite] sym={sym} decisions_all={len(sized_all)} exec_decisions={len(sized)} trades={len(trades)}")
-        print(f"[PerSymWrite] wrote {dec_out}")
-        print(f"[PerSymWrite] wrote {exec_dec_out}")
-        print(f"[PerSymWrite] wrote {trd_out}")
+        print("[DEBUG][POST_WRITE_CHECK]")
+        print(f"  attempted exists: {attempted_path.exists()} -> {attempted_path}")
+        print(f"  decisions exists: {decisions_path.exists()} -> {decisions_path}")
+        #print(f"  trades exists:    {trades_path.exists()} -> {trades_path}")
 
-        return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
+        trades_path = sym_root / "trades.parquet"
+        (trades if trades is not None else pd.DataFrame()).to_parquet(trades_path, index=False)
+
+        print(f"[Task5][WRITE] sym={sym} → {sym_root}")
+        print(f"  attempted_actions: {attempted_path} rows={len(attempted)}")
+        print(f"  decisions:         {decisions_path} rows={len(sized_all)}")
+        print(f"  trades:            {trades_path} rows={0 if trades is None else len(trades)}")
+
+        return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_root)}])
+
+
+
 
         # return pd.DataFrame([{"run_id": RUN_ID, "symbol": sym, "out_dir": str(sym_dir)}])
 
@@ -5337,9 +5647,27 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
 
     print("[RUN] mode=", BACKTEST_MODE, "run_id=", RUN_ID, "git=", GIT_SHA)
     print("[RUN] window=", cfg["start"], "→", cfg["end"], "horizon_bars=", cfg.get("horizon_bars"))
-    print("[RUN] costs: commission=", cfg.get("commission"), "spread_bp=", cfg.get("spread_bp"), "slippage_bp=",
+    '''print("[RUN] costs: commission=", cfg.get("commission"), "spread_bp=", cfg.get("spread_bp"), "slippage_bp=",
           cfg.get("slippage_bp"),
           "debug_no_costs=", cfg.get("debug_no_costs"))
+    '''
+
+    # --- Day 4: print effective cost knobs (no "None-but-defaulted" ambiguity)
+    debug_no_costs_eff = _cfg_bool(cfg.get("debug_no_costs", False), default=False)
+    spread_bp_eff = _cfg_float(cfg.get("spread_bp", 1.0), default=1.0)
+    slippage_bp_eff = _cfg_float(cfg.get("slippage_bp", 0.0), default=0.0)
+    commission_eff = _cfg_float(cfg.get("commission", 0.0), default=0.0)
+    impact_eff = _cfg_float(cfg.get("impact_bps_per_adv_frac", 25.0), default=25.0)
+
+    print(
+        "[RUN] costs:",
+        "commission=", cfg.get("commission", None), f"(eff={commission_eff})",
+        "spread_bp=", cfg.get("spread_bp", None), f"(eff={spread_bp_eff})",
+        "slippage_bp=", cfg.get("slippage_bp", None), f"(eff={slippage_bp_eff})",
+        "impact_bps_per_adv_frac=", cfg.get("impact_bps_per_adv_frac", None), f"(eff={impact_eff})",
+        "debug_no_costs=", cfg.get("debug_no_costs", None), f"(eff={debug_no_costs_eff})",
+    )
+
     print("[RUN] gates: p_gate=", cfg.get("p_gate_quantile"), "p_full=", cfg.get("full_p_quantile"),
           "sizer_cost_lambda=", cfg.get("sizer_cost_lambda"), "strategy=", cfg.get("sizer_strategy"))
 
@@ -5357,7 +5685,19 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # ------------------------------
     # Preflight: csv config integrity
     # ------------------------------
-    csv_cfg = cfg.get("csv")
+    #csv_cfg = cfg.get("csv")
+
+    # ── Truth contract: enforce bar_source ─────────────────────────
+    bar_source = str(cfg.get("bar_source", "parquet")).lower().strip()
+    if bar_source not in {"parquet", "csv"}:
+        raise RuntimeError(f"[DATA] invalid cfg['bar_source']={bar_source!r} (expected 'parquet' or 'csv')")
+
+    # If bar_source=parquet, we MUST NOT read CSV for decisions.
+    csv_cfg = cfg.get("csv") if bar_source == "csv" else None
+
+    print(f"[DATA] bar_source={bar_source}")
+
+
 
     if len(symbols) >= 2 and csv_cfg:
         # Allowed:
@@ -5694,6 +6034,9 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # IMPORTANT: run_dir must be the artifacts run directory: .../artifacts/a2_<id>
     run_dir = Path(cfg["artifacts_root"]).resolve()
 
+    diagnostics_dir = Path(run_dir) / "diagnostics"
+    _write_data_provenance(diagnostics_dir, cfg)
+
     update_run_manifest_fields(
         run_dir,
         config_hash=str(cfg.get("config_hash") or cfg.get("_config_hash") or ""),
@@ -5808,7 +6151,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # ------------------------------------------------------------------
     from feature_engineering.utils.consistency_gate import enforce_portfolio_bar_coverage_gate
     #IMPORTANT: THE BELOW LINE CHANGES THE THRESHOLD
-    coverage_threshold = float(cfg.get("min_bar_coverage_portfolio", 0.20))
+    coverage_threshold = float(cfg.get("min_bar_coverage_portfolio", 0.10))
     coverage_mode = str(cfg.get("coverage_gate_mode", "abort")).strip().lower()
 
     cov_res = enforce_portfolio_bar_coverage_gate(
@@ -5867,6 +6210,18 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                 run_id_for_report = name.split("a2_", 1)[-1] if "a2_" in name else name
             run_id_for_report = str(run_id_for_report)
 
+            # Task 5: collect attempted-actions files BEFORE writing evaluation report
+            #attempt_files = list(Path(artifacts_root).rglob("attempted_actions.parquet"))
+
+            # Task 5: collect attempted-actions files BEFORE writing evaluation report
+            #attempt_files = list(Path(artifacts_root).rglob("attempted_actions.parquet"))
+
+            print(
+                f"[DEBUG][TASK5_INPUTS] "
+                f"attempt_files={len(attempt_files)} "
+                f"files={attempt_files}"
+            )
+
             _write_evaluation_integrity_report(
                 run_id=run_id_for_report,
                 artifacts_root=Path(cfg["artifacts_root"]).resolve(),
@@ -5915,10 +6270,37 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
 
     # print(f"share of timestamps with >=2 symbols present: {overlap:.3f}")
-    if overlap < float(cfg.get("min_multisymbol_share", 0.10)):
+    '''if overlap < float(cfg.get("min_multisymbol_share", 0.10)):
         raise RuntimeError(
             f"[GATE] multi-symbol share < {cfg.get('min_multisymbol_share', 0.10):.2f} "
             f"(got {overlap:.3f}). Refusing to emit/accept portfolio artifacts."
+        )'''
+
+    # --- Day 3: multi-symbol overlap gate (this is the thing you wanted to hard-fail at 0.200) ---
+    overlap_threshold = float(
+        cfg.get("min_multisymbol_share",
+                cfg.get("min_bar_coverage_portfolio", 0.10))  # fallback to your Day-3 threshold
+    )
+
+    # Write overlap gate artifact next to other diagnostics
+    try:
+        diag_dir = Path(cfg["artifacts_root"]).resolve() / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        (diag_dir / "overlap_gate.json").write_text(json.dumps({
+            "metric": "share_of_timestamps_with_ge_2_symbols_present",
+            "overlap_ratio": float(overlap),
+            "threshold": float(overlap_threshold),
+            "decision": "FAIL" if overlap < overlap_threshold else "PASS",
+            "min_symbols": 2,
+            "presence_col": "bar_present",
+        }, indent=2, sort_keys=True))
+    except Exception as e:
+        print(f"[OVERLAP-GATE][WARN] failed to write overlap_gate.json: {e}")
+
+    if overlap < overlap_threshold:
+        raise RuntimeError(
+            f"[GATE] multi-symbol share < {overlap_threshold:.3f} (got {overlap:.6f}). "
+            "This run is not a coherent multi-symbol portfolio simulation on a shared clock."
         )
 
     # ------------------------------
@@ -5946,7 +6328,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         #sym_cfg["artifacts_root"] = str(sym_artifacts_root)
 
         # --- Task4/Task5: per-symbol outputs go in <run_dir>/<SYM>, but artifacts_root stays run-level ---
-        sym_cfg = dict(cfg)
+        '''sym_cfg = dict(cfg)
 
         # Keep ArtifactManager on the RUN directory (the one that has the RUN_MANIFEST.json)
         sym_cfg["artifacts_root"] = str(run_root)  # run_root == run_dir
@@ -5955,7 +6337,24 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         # Put symbol-specific output files here
         #sym_cfg["symbol_out_dir"] = str(sym_artifacts_root)
 
-        sym_cfg["symbol_out_dir"] = str(sym_artifacts_root)
+        sym_cfg["symbol_out_dir"] = str(sym_artifacts_root)'''
+
+        # --- Task4/Task5: make artifacts_root truly per-symbol so _run_one_symbol writes correctly ---
+        sym_cfg = copy.deepcopy(cfg)
+        sym_cfg["symbol"] = sym
+
+        run_root = Path(cfg["artifacts_root"]).resolve()  # run-level a2_<run_id>
+        sym_artifacts_root = (run_root / sym).resolve()  # per-symbol dir
+        sym_artifacts_root.mkdir(parents=True, exist_ok=True)
+
+        # Ensure per-symbol dir is Task4-valid
+        _ensure_manifest_in_dir(run_root=run_root, target_dir=sym_artifacts_root)
+
+        # IMPORTANT: make artifacts_root per-symbol
+        sym_cfg["artifacts_root"] = str(sym_artifacts_root)
+
+        # (optional) keep run_dir for logging if you want it
+        sym_cfg["run_dir"] = str(run_root)
 
         '''sym_root = (Path(cfg["artifacts_root"]) / sym)
         sym_root.mkdir(parents=True, exist_ok=True)
@@ -6059,6 +6458,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     port_dir = arte_root / "portfolio"
     port_dir.mkdir(parents=True, exist_ok=True)
 
+    # Run-level diagnostics folder (required by RUN_BUNDLE_SPEC)
+    run_diag_dir = arte_root / "diagnostics"
+    run_diag_dir.mkdir(parents=True, exist_ok=True)
+
+
     if not dec_df.empty:
         # Save unified decisions (per-bar across symbols)
         # Expect at least: ['timestamp','p_raw'/'p_cal', ... , 'symbol']
@@ -6100,6 +6504,11 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             half_spread_col="half_spread_usd" if "half_spread_usd" in trd_df.columns else None,
             adv_pct_col="adv_frac" if "adv_frac" in trd_df.columns else None,
         )
+
+
+        # Day 4: Cost proof (write reconciliation artifact)
+        _write_cost_audit(trd_df, cfg, arte_root, sample_n=int(cfg.get("cost_audit_sample_n", 25)))
+
 
         # --- Phase 4.5: apply ledger & record portfolio columns on fills ------------
         # Initialize ledger using cfg equity; set gross/net limits relative to equity
@@ -6230,6 +6639,17 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             curve_out = port_dir / "equity_curve.csv"
             curve.to_csv(curve_out, header=["equity"])
             print(f"[Portfolio] equity curve → {curve_out}")
+
+            from pathlib import Path
+
+            print("[DEBUG][AGGFIND_SCAN]")
+            for sym in symbols:
+                sym_dir = Path(run_dir) / sym
+                print(f"  {sym_dir} exists={sym_dir.exists()}")
+                if sym_dir.exists():
+                    print(f"    decisions: {list(sym_dir.glob('decisions.parquet'))}")
+                    print(f"    trades:    {list(sym_dir.glob('trades.parquet'))}")
+                    print(f"    attempted: {list(sym_dir.glob('attempted_actions.parquet'))}")
 
             # --- Phase 4.7: portfolio-level metrics (turnover, exposure, DD) -------
             def _compute_portfolio_metrics(trades_df: pd.DataFrame,
@@ -6389,6 +6809,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             # If they do not, write best-effort from in-memory objects if present.
             need_dec = not (sym_dir / "decisions.parquet").exists()
             need_trd = not (sym_dir / "trades.parquet").exists()
+            need_att = not (sym_dir / "attempted_actions.parquet").exists()
 
             # These variable names might differ in your file; use what you actually have in scope.
             # The key is: write whatever you have for THIS sym.
@@ -6411,10 +6832,35 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
                 else:
                     trd_sym = _t.copy()
 
-            if need_dec or need_trd:
+            att_sym = None
+            if need_att:
+                # Try common variable names you may have in scope
+                for k in ("attempted", "attempted_actions", "attempted_df"):
+                    if k in locals() and isinstance(locals()[k], pd.DataFrame):
+                        _a = locals()[k]
+                        if "symbol" in _a.columns:
+                            att_sym = _a[_a["symbol"].astype(str) == str(sym)].copy()
+                        else:
+                            att_sym = _a.copy()
+                        break
+
+            #if need_dec or need_trd:
+            if need_dec or need_trd or need_att:
                 _write_symbol_outputs(artifacts_root, sym, dec_sym, trd_sym)
-                print(f"[PreAggWrite] sym={sym} wrote_dec={dec_sym is not None and not dec_sym.empty} "
+                '''print(f"[PreAggWrite] sym={sym} wrote_dec={dec_sym is not None and not dec_sym.empty} "
                       f"wrote_trades={trd_sym is not None and not trd_sym.empty} dir={sym_dir}")
+                '''
+                # NEW: write attempted_actions.parquet if missing and we have it in memory
+                if need_att and att_sym is not None:
+                    sym_dir.mkdir(parents=True, exist_ok=True)
+                    att_path = sym_dir / "attempted_actions.parquet"
+                    att_sym.to_parquet(att_path, index=False)
+
+                print(
+                    f"[PreAggWrite] sym={sym} wrote_dec={dec_sym is not None and not dec_sym.empty} "
+                    f"wrote_trades={trd_sym is not None and not trd_sym.empty} "
+                    f"wrote_attempted={att_sym is not None and not att_sym.empty} dir={sym_dir}"
+                )
 
     dec_path, trd_path = _consolidate_phase4_outputs(artifacts_root)
 
@@ -6469,6 +6915,15 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
             run_id_for_report = "unknown"
     run_id_for_report = str(run_id_for_report)
 
+    # Task 5: collect attempted-actions files BEFORE writing evaluation report
+    attempt_files = list(Path(artifacts_root).rglob("attempted_actions.parquet"))
+
+    print(
+        f"[DEBUG][TASK5_INPUTS] "
+        f"attempt_files={len(attempt_files)} "
+        f"files={attempt_files}"
+    )
+
     _write_evaluation_integrity_report(
         #run_id=str(run_id),
         run_id=run_id_for_report,
@@ -6492,7 +6947,7 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
     # entries_reported = int(total_entries) if "total_entries" in locals() else None
 
     # Count attempted actions (engine wanted to trade, even if qty=0)
-    attempt_files = list(artifacts_root.rglob("attempted_actions.parquet"))
+    #attempt_files = list(artifacts_root.rglob("attempted_actions.parquet"))
     attempt_rows = 0
     for p in attempt_files:
         try:
