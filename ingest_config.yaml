@@ -13,3 +13,18 @@ dividends_path: "./data/meta/dividends.csv"
 mem_target_mb: 512                # MB memory budget per chunk (auto‑calc rows)
 bad_line_policy: "warn"           # one of: raise | warn | skip
 fail_fast: false                  # abort on first bad file if true
+
+
+broker:
+  alpaca:
+    key_id: "PK5EYQM5MDOEQFHKZ64G6B4PDT"
+    secret_key: "BWrgSmp8thxQE6W5zJb64vpgcDf5P9bjnyc1ZxdF1XRR"
+    trading_base_url: "https://paper-api.alpaca.markets"
+    api_version: "v2"
+
+  call_policy:
+    timeout_s: 5.0
+    max_retries: 3
+    backoff_s: [1.0, 2.0, 5.0]
+    circuit_breaker_failures: 3
+    circuit_breaker_cooloff_s: 60.0
