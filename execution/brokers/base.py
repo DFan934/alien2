@@ -170,10 +170,26 @@ class MockBrokerAdapter:
         self._breaker = CircuitBreaker(
             fail_threshold=self.policy.circuit_breaker_failures,
             cooloff_s=self.policy.circuit_breaker_cooloff_s,
+
         )
+        # inside MockBrokerAdapter.__init__
+        self._ou_q: asyncio.Queue[OrderUpdateEvent] = asyncio.Queue()
+        self._order_updates_q: "asyncio.Queue[OrderUpdateEvent]" = asyncio.Queue()
+
+    async def stream_order_updates(self) -> AsyncIterator[OrderUpdateEvent]:
+        if not self._connected:
+            raise BrokerDisconnected("mock adapter not connected")
+        while self._connected:
+            upd = await self._ou_q.get()
+            yield upd
 
     async def connect(self) -> None:
         self._connected = True
+
+    async def push_order_update(self, upd: OrderUpdateEvent) -> None:
+        """Test helper: inject an OrderUpdateEvent into the mock order-updates stream."""
+        await self._order_updates_q.put(upd)
+
 
     async def close(self) -> None:
         self._connected = False
@@ -195,6 +211,8 @@ class MockBrokerAdapter:
         Test helper: push an event into the stream.
         """
         await self._md_q.put(evt)
+
+
 
     async def stream_market_data(self, *, symbols: list[str]) -> AsyncIterator[MarketDataEvent]:
         """

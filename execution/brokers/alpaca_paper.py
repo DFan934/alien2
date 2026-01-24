@@ -121,6 +121,12 @@ class AlpacaPaperAdapter:
             cooloff_s=self.policy.circuit_breaker_cooloff_s,
         )
 
+        # Step 8: in-process idempotency cache
+        # If submit_order() is called again with the same client_order_id during this run,
+        # return the original ack without re-posting.
+        self._submitted_by_client_id: Dict[str, OrderUpdateEvent] = {}
+
+
     async def connect(self) -> None:
         self._connected = True
 
@@ -157,8 +163,79 @@ class AlpacaPaperAdapter:
     async def stream_market_data(self, *, symbols: list[str]) -> AsyncIterator[MarketDataEvent]:
         raise NotImplementedError("Task 5+ will add Alpaca market data streaming")
 
-    async def submit_order(self, req: OrderRequest) -> OrderUpdateEvent:
+    '''async def submit_order(self, req: OrderRequest) -> OrderUpdateEvent:
         raise NotImplementedError("Task 6+ will add Alpaca order submission")
+    '''
+
+    async def submit_order(self, req: OrderRequest) -> OrderUpdateEvent:
+        # Step 8: idempotency (within this process)
+        cached = self._submitted_by_client_id.get(req.client_order_id)
+        if cached is not None:
+            return cached
+
+        # Map your canonical order types to Alpaca types
+        type_map = {
+            "MKT": "market",
+            "LMT": "limit",
+            "STP": "stop",
+            "STP_LMT": "stop_limit",
+        }
+        alpaca_type = type_map.get(req.order_type)
+        if alpaca_type is None:
+            raise BrokerInvalidRequest(f"Unsupported order_type: {req.order_type}")
+
+        # Alpaca expects lowercase tif values like "day", "gtc", ...
+        tif = str(req.tif).lower()
+
+        body: Dict[str, Any] = {
+            "symbol": req.symbol,
+            "qty": str(int(req.qty)),
+            "side": str(req.side).lower(),
+            "type": alpaca_type,
+            "time_in_force": tif,
+            "client_order_id": req.client_order_id,
+        }
+
+        # Optional prices depending on type
+        if req.limit_price is not None:
+            body["limit_price"] = str(float(req.limit_price))
+        if req.stop_price is not None:
+            body["stop_price"] = str(float(req.stop_price))
+
+        payload = await self._call_json("POST", f"/{self._api_version}/orders", body)
+
+        broker_order_id = str(payload.get("id") or "") or None
+        alpaca_status = str(payload.get("status") or "").lower()
+
+        # Map Alpaca statuses into your canonical OrderStatus
+        if alpaca_status in ("accepted", "new", "pending_new"):
+            status: str = "ACCEPTED"
+        elif alpaca_status in ("partially_filled",):
+            status = "PARTIALLY_FILLED"
+        elif alpaca_status in ("filled",):
+            status = "FILLED"
+        elif alpaca_status in ("canceled", "cancelled"):
+            status = "CANCELED"
+        elif alpaca_status in ("rejected",):
+            status = "REJECTED"
+        else:
+            # Safe fallback: we at least have an ack
+            status = "SUBMITTED"
+
+        evt = OrderUpdateEvent(
+            broker_order_id=broker_order_id,
+            client_order_id=req.client_order_id,
+            symbol=req.symbol,
+            side=req.side,
+            status=status,  # type: ignore[arg-type]
+            filled_qty=int(payload.get("filled_qty") or 0),
+            avg_fill_price=(float(payload["filled_avg_price"]) if payload.get("filled_avg_price") not in (None, "") else None),
+            raw={"alpaca": payload},
+        )
+
+        self._submitted_by_client_id[req.client_order_id] = evt
+        return evt
+
 
     # ----------------------------
     # Internal HTTP + retry/breaker

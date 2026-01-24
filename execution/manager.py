@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timezone
 
 import pandas as pd
 
+from execution.brokers import BrokerAdapter
+from execution.contracts_live import OrderRequest, OrderUpdateEvent
 from execution.latency import latency_monitor
 #from execution.latency import timeit
 
@@ -18,6 +21,12 @@ from execution.latency import latency_monitor
 from execution.position_store import PositionStore
 from execution.core.contracts import TradeSignal
 from execution.latency import latency_monitor, timeit
+
+import contextlib
+from pathlib import Path
+
+from execution.order_router import OrderRouter
+from execution._parquet_writer import AppendParquetDatasetWriter
 
 """Execution Manager
 ====================
@@ -85,6 +94,11 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
             risk_mgr = RiskManager(account_equity=equity)
             lat_monitor = latency_monitor
             config = {}
+
+            # Step 8 tests / lightweight mode: do NOT initialize optional heavy subsystems
+            config["enable_retraining"] = False
+
+
             log_path = Path(".")
 
         # sanity check
@@ -104,6 +118,40 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self.lat_monitor = lat_monitor
         #self.safety = SafetyFSM(config.get("safety", {}))
 
+
+        # ----------------------------
+        # Step 8: paper submit wiring + limits (must exist for all init paths)
+        # ----------------------------
+        '''self._broker = None
+        self._orders_out_dir = None'''
+
+        from datetime import date
+
+        # --- Step 8 paper-submit state ---
+        self._broker = None
+        self._orders_out_dir: Path | None = None
+        self._attempted_writer = None
+        self._orders_writer = None
+
+        self._tiny_qty = int((config or {}).get("tiny_qty", 1))
+        self._order_limit_per_day = int((config or {}).get("order_limit_per_day", 1))
+
+        self._utc_day: date | None = None
+        self._orders_today: int = 0
+
+        # Defaults (can be overridden via config or tests)
+        self._order_limit_per_day = int((config or {}).get("live_order_limit_per_day", 1))
+        self._tiny_qty = int((config or {}).get("live_tiny_qty", 1))
+
+        # Track submissions per UTC day
+        self._utc_day = None
+        self._orders_submitted_today = 0
+
+        # Parquet dataset “append” counters
+        self._orders_part_idx = 0
+        self._attempts_part_idx = 0
+
+
         self._safety_q: "asyncio.Queue[SafetyAction]" = asyncio.Queue()
         self.safety = SafetyFSM(config.get("safety", {}), channel=self._safety_q)
 
@@ -111,7 +159,25 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self.regime_detector = RegimeDetector()
         self.drift_monitor = DriftMonitor(ckpt_path=Path(config.get("drift_ckpt_path", "artifacts/drift_state.json")))
         # Note: ModelManager (mm) would be shared or passed in
-        self.retraining_manager = RetrainingManager(mm=ModelManager(), drift_thresh=0.15)
+        #self.retraining_manager = RetrainingManager(mm=ModelManager(), drift_thresh=0.15)
+
+
+        if config.get("enable_retraining", True):
+            # Full/live mode
+            #self.retraining_manager = RetrainingManager(mm=ModelManager(), drift_thresh=0.15)
+            # --- Optional: retraining stack (disable in lightweight / tests) ---
+            self.retraining_manager = None
+            enable_retraining = bool((config or {}).get("enable_retraining", False))
+            if enable_retraining:
+                # ModelManager requires an artefact_dir in your codebase
+                artefact_dir = Path((config or {}).get("model_artifacts_dir", "models"))
+                self.retraining_manager = RetrainingManager(mm=ModelManager(artefact_dir=artefact_dir),
+                                                            drift_thresh=0.15)
+
+        else:
+            # Lightweight/test mode
+            self.retraining_manager = None
+
 
         # NEW: State for tracking trades and market data
         self._open_trades: Dict[str, Dict] = {}  # Keyed by a unique trade ID
@@ -144,7 +210,42 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
         # background watcher
         #self._safety_task = asyncio.create_task(self._safety_watcher())
-        self.regime_profiles: dict = config.get("regime_profiles", {})
+        self._ou_seen = 0
+        self._fills_emitted = 0
+        self._order_updates_consumer_exc = None
+        #self.regime_profiles: dict = config.get("regime_profiles", {})
+
+    async def _order_updates_consumer(self) -> None:
+        try:
+            async for upd in self._broker.stream_order_updates():
+                self._ou_seen += 1
+
+                fills = self._order_router.on_order_update(upd)
+
+                if fills:
+                    self._fills_emitted += len(fills)
+                    self._fills_writer.append_rows([f.to_row() for f in fills])
+
+                    for f in fills:
+                        self.risk_mgr.process_fill(
+                            {"price": float(f.price), "size": float(f.qty), "side": str(f.side).lower(),
+                             "trade_id": str(f.fill_id)}
+                        )
+
+                    snap = {
+                        "ts_utc": upd.event_ts_utc,
+                        "symbol": str(upd.symbol).upper(),
+                        "position_size": float(getattr(self.risk_mgr, "position_size", 0.0)),
+                        "avg_entry_price": float(getattr(self.risk_mgr, "avg_entry_price", 0.0)),
+                        "account_equity": float(getattr(self.risk_mgr, "account_equity", 0.0)),
+                    }
+                    self._positions_writer.append_rows([snap])
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._order_updates_consumer_exc = repr(e)
+            raise
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -556,3 +657,129 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
 
 
+
+    # ------------------------------------------------------------------
+    # Step 8: broker submission + parquet artifacts
+    # ------------------------------------------------------------------
+
+    def attach_broker(self, broker: BrokerAdapter, *, out_dir: Path) -> None:
+        """
+        Attach a live BrokerAdapter and specify where Step-8 artifacts are written.
+        NOTE: out_dir can be anywhere (NOT necessarily "artifacts/").
+        """
+        self._broker = broker
+        self._orders_out_dir = Path(out_dir)
+
+        # ----------------------------
+        # Step 9: order updates consumer + artifacts
+        # ----------------------------
+        self._order_router = OrderRouter()
+        self._fills_writer = AppendParquetDatasetWriter(Path(out_dir), "fills.parquet")
+        self._positions_writer = AppendParquetDatasetWriter(Path(out_dir), "positions.parquet")
+
+        # Start background consumer (idempotent)
+        if getattr(self, "_order_updates_task", None) is None:
+            self._order_updates_task = asyncio.create_task(self._order_updates_consumer())
+
+
+
+
+    def _append_dataset_part(self, dataset_dir: Path, *, rows: list[dict], stem: str) -> None:
+        """
+        Ultra-simple append-only parquet dataset:
+          <dataset_dir>/part-000001.parquet, part-000002.parquet, ...
+        """
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame.from_records(rows)
+        if df.empty:
+            return
+
+        if stem == "orders":
+            self._orders_part_idx += 1
+            idx = self._orders_part_idx
+        else:
+            self._attempts_part_idx += 1
+            idx = self._attempts_part_idx
+
+        part = dataset_dir / f"part-{idx:06d}.parquet"
+        df.to_parquet(part, index=False)
+
+    async def submit_order_paper(self, req: OrderRequest, *, reason: str = "live_paper") -> Optional[OrderUpdateEvent]:
+        """
+        Step 8: enforce tiny sizing + one-order-per-day limit, submit to broker, write:
+          - attempted_actions.parquet (every attempt, including blocked)
+          - orders.parquet (only when broker submission happens)
+        """
+        if self._broker is None or self._orders_out_dir is None:
+            raise RuntimeError("Broker not attached. Call attach_broker(broker, out_dir=...) first.")
+
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        if self._utc_day != today:
+            self._utc_day = today
+            self._orders_submitted_today = 0
+
+        allowed = True
+        block_reason = ""
+
+        # One-order-per-day limit
+        if self._orders_submitted_today >= self._order_limit_per_day:
+            allowed = False
+            block_reason = "daily_order_limit"
+
+        # Tiny sizing (even if blocked we log the intended -> effective qty)
+        effective_qty = int(min(int(req.qty), int(self._tiny_qty)))
+        if effective_qty <= 0:
+            allowed = False
+            block_reason = block_reason or "non_positive_qty"
+
+        attempted_row = {
+            "ts_utc": now,
+            "client_order_id": req.client_order_id,
+            "symbol": req.symbol,
+            "side": req.side,
+            "req_qty": int(req.qty),
+            "effective_qty": int(effective_qty),
+            "allowed": bool(allowed),
+            "block_reason": block_reason or None,
+            "reason": reason,
+        }
+
+        # Always write attempted action
+        attempts_dir = Path(self._orders_out_dir) / "attempted_actions.parquet"
+        self._append_dataset_part(attempts_dir, rows=[attempted_row], stem="attempts")
+
+        if not allowed:
+            return None
+
+        # Create a new request with tiny qty enforced
+        req2 = OrderRequest(
+            client_order_id=req.client_order_id,
+            symbol=req.symbol,
+            side=req.side,
+            qty=effective_qty,
+            order_type=req.order_type,
+            tif=req.tif,
+            limit_price=req.limit_price,
+            stop_price=req.stop_price,
+            signal_id=req.signal_id,
+            reason=req.reason,
+            created_ts_utc=req.created_ts_utc,
+        )
+
+        evt = await self._broker.submit_order(req2)
+        self._orders_submitted_today += 1
+
+        order_row = {
+            "ts_utc": now,
+            "client_order_id": evt.client_order_id,
+            "broker_order_id": evt.broker_order_id,
+            "symbol": evt.symbol,
+            "side": evt.side,
+            "status": evt.status,
+            "qty": effective_qty,
+        }
+
+        orders_dir = Path(self._orders_out_dir) / "orders.parquet"
+        self._append_dataset_part(orders_dir, rows=[order_row], stem="orders")
+        return evt
