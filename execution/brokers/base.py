@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Dict, Optional, Protocol, runtime_checkable, List
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
@@ -150,6 +150,21 @@ class BrokerAdapter(Protocol):
     async def submit_order(self, req: OrderRequest) -> OrderUpdateEvent:
         ...
 
+    async def get_positions_snapshot(self) -> List[Dict[str, Any]]:
+        """
+        Returns broker-truth positions snapshot.
+        Row schema (minimum):
+          {"symbol": "AAPL", "side": "BUY", "qty": 2, "avg_entry_price": 100.0}
+        """
+        raise NotImplementedError
+
+    async def get_open_orders_snapshot(self) -> List[Dict[str, Any]]:
+        """
+        Returns broker-truth open orders snapshot.
+        Row schema (minimum):
+          {"client_order_id": "...", "symbol": "AAPL", "side": "SELL", "qty": 1, "status": "OPEN"}
+        """
+        return []
 
 # -----------------------------
 # Mock adapter for tests/MVP
@@ -165,8 +180,13 @@ class MockBrokerAdapter:
     def __init__(self, policy: Optional[BrokerCallPolicy] = None) -> None:
         self.policy = policy or BrokerCallPolicy()
         self._connected = False
+        #self._md_q: asyncio.Queue[MarketDataEvent] = asyncio.Queue()
+        #self._orders: Dict[str, OrderUpdateEvent] = {}
+
         self._md_q: asyncio.Queue[MarketDataEvent] = asyncio.Queue()
         self._orders: Dict[str, OrderUpdateEvent] = {}
+        self._positions: Dict[str, Dict[str, Any]] = {}
+
         self._breaker = CircuitBreaker(
             fail_threshold=self.policy.circuit_breaker_failures,
             cooloff_s=self.policy.circuit_breaker_cooloff_s,
@@ -174,7 +194,7 @@ class MockBrokerAdapter:
         )
         # inside MockBrokerAdapter.__init__
         self._ou_q: asyncio.Queue[OrderUpdateEvent] = asyncio.Queue()
-        self._order_updates_q: "asyncio.Queue[OrderUpdateEvent]" = asyncio.Queue()
+        #self._order_updates_q: "asyncio.Queue[OrderUpdateEvent]" = asyncio.Queue()
 
     async def stream_order_updates(self) -> AsyncIterator[OrderUpdateEvent]:
         if not self._connected:
@@ -188,8 +208,28 @@ class MockBrokerAdapter:
 
     async def push_order_update(self, upd: OrderUpdateEvent) -> None:
         """Test helper: inject an OrderUpdateEvent into the mock order-updates stream."""
-        await self._order_updates_q.put(upd)
+        #await self._order_updates_q.put(upd)
+        await self._ou_q.put(upd)   # <-- change this line
 
+    async def get_positions_snapshot(self) -> List[Dict[str, Any]]:
+        if not self._connected:
+            raise BrokerDisconnected("mock adapter not connected")
+        return list(self._positions.values())
+
+    async def get_open_orders_snapshot(self) -> List[Dict[str, Any]]:
+        if not self._connected:
+            raise BrokerDisconnected("mock adapter not connected")
+        out: List[Dict[str, Any]] = []
+        for evt in self._orders.values():
+            out.append({
+                "client_order_id": evt.client_order_id,
+                "symbol": str(evt.symbol).upper(),
+                "side": str(evt.side).upper(),
+                # mock doesn't simulate fills; report 0 or infer from raw if you store it
+                "qty": 0,
+                "status": str(evt.status),
+            })
+        return out
 
     async def close(self) -> None:
         self._connected = False
@@ -257,4 +297,30 @@ class MockBrokerAdapter:
         )
         self._orders[req.client_order_id] = upd
         self._breaker.record_success()
+
+        # --- minimal mock position bookkeeping for reconciliation ---
+        sym = req.symbol.upper()
+        side = req.side.upper()
+        qty = int(req.qty)
+
+        pos = self._positions.get(sym)
+
+        if side == "BUY":
+            if pos is None:
+                self._positions[sym] = {
+                    "symbol": sym,
+                    "side": "BUY",
+                    "qty": qty,
+                    "avg_entry_price": 0.0,
+                }
+            else:
+                # increase existing position (same-side only for mock simplicity)
+                pos["qty"] = int(pos.get("qty", 0)) + qty
+
+        elif side == "SELL":
+            if pos is not None and pos.get("side") == "BUY":
+                pos["qty"] = max(0, int(pos.get("qty", 0)) - qty)
+                if pos["qty"] == 0:
+                    self._positions.pop(sym, None)
+
         return upd
