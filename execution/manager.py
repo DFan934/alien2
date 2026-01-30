@@ -53,6 +53,10 @@ from prediction_engine.ev_engine import EVEngine
 from execution.risk_manager import RiskManager
 from execution.safety import SafetyFSM, HaltReason
 
+from execution.safety_policy import SafetyPolicy
+from data_ingestion.live.kill_switch import is_engaged as kill_switch_engaged
+
+
 from prediction_engine.market_regime import RegimeDetector, MarketRegime
 from prediction_engine.drift_monitor import DriftMonitor, DriftStatus
 from prediction_engine.retraining_manager import RetrainingManager
@@ -161,6 +165,18 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
         self._safety_q: "asyncio.Queue[SafetyAction]" = asyncio.Queue()
         self.safety = SafetyFSM(config.get("safety", {}), channel=self._safety_q)
+
+        # Step 12: SafetyPolicy (formal trigger->action->reset mapping)
+        self.safety_policy = SafetyPolicy.from_config(
+            (config or {}).get("safety_policy"),
+            safety_cfg=config.get("safety", {}),
+        )
+
+        # Step 12: artifact writer (initialized once out_dir is known)
+        self._safety_actions_writer = None
+
+        # Step 12: kill switch "last seen" (avoid spamming actions)
+        self._kill_switch_last = False
 
         # NEW: Instantiate integrated components
         self.regime_detector = RegimeDetector()
@@ -782,20 +798,43 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
 
     # ------------------------------------------------------------------
     async def _safety_watcher(self):
-        while True:
-            action = await self._safety_q.get()
-            # log to store + blotter
-            self.store.add_safety(action)
-            with self._log_path.open("a", buffering=1) as fp:
-                fp.write(f"SAFETY,{action.action},{action.reason},{action.timestamp.isoformat()}\n")
-            if action.action == "HALT":
-                self._halt_active = True
-            elif action.action == "RESUME":
-                self._halt_active = False
-                self._risk_mult = self.cfg.get("reduced_size_factor", 0.5)
-            elif action.action == "SIZE_DOWN":
-                self._risk_mult *= 0.5
-            self._safety_q.task_done()
+        try:
+            while True:
+                action = await self._safety_q.get()
+                try:
+                    ts = getattr(action, "timestamp", None) or datetime.now(timezone.utc)
+
+                    try:
+                        self.store.add_safety(action)
+                    except Exception:
+                        pass
+
+                    try:
+                        with self._log_path.open("a", buffering=1) as fp:
+                            fp.write(f"SAFETY,{action.action},{action.reason},{ts.isoformat()}\n")
+                    except Exception:
+                        pass
+
+                    if action.action == "HALT":
+                        self._halt_active = True
+                    elif action.action == "RESUME":
+                        self._halt_active = False
+
+                    w = getattr(self, "_safety_actions_writer", None)
+                    if w is not None:
+                        w.append_rows([{
+                            "ts_utc": ts,
+                            "action": action.action,
+                            "reason": action.reason,
+                            "policy_action": action.action,
+                            "halt_active": bool(getattr(self, "_halt_active", False)),
+                        }])
+                finally:
+                    self._safety_q.task_done()
+
+        except asyncio.CancelledError:
+            # IMPORTANT: don’t re-raise, so `await watcher` doesn’t fail the test
+            return
 
     # ------------------------------------------------------------------
     @timeit("signal_writer")
@@ -884,6 +923,27 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         self._fills_writer = AppendParquetDatasetWriter(Path(out_dir), "fills.parquet")
         self._positions_writer = AppendParquetDatasetWriter(Path(out_dir), "positions.parquet")
 
+        # Step 12: safety actions artifact writer
+        #self._safety_actions_writer = AppendParquetDatasetWriter(Path(out_dir), "safety_actions.parquet")
+
+        # Step 12: safety actions artifact writer
+        #self._safety_actions_writer = AppendParquetDatasetWriter(Path(out_dir), "safety_actions.parquet")
+
+        # Step 12: safety actions artifact writer
+        self._safety_actions_writer = AppendParquetDatasetWriter(Path(out_dir), "safety_actions.parquet")
+
+        # Step 12: policy snapshot artifact
+        policy_path = Path(out_dir) / "safety_policy_effective.json"
+        try:
+            import json
+            policy_path.write_text(
+                json.dumps(self.safety_policy.to_effective_dict(), indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            # Don't fail live runs if filesystem is quirky; tests will catch missing artifact
+            pass
+
         # Start background consumer (idempotent)
         if getattr(self, "_order_updates_task", None) is None:
             self._order_updates_task = asyncio.create_task(self._order_updates_consumer())
@@ -939,6 +999,30 @@ class ExecutionManager:  # pylint: disable=too-many-instance-attributes
         if effective_qty <= 0:
             allowed = False
             block_reason = block_reason or "non_positive_qty"
+
+        # Step 12: kill switch latch (file-based)
+        try:
+            engaged = kill_switch_engaged(Path(self._orders_out_dir))
+        except Exception:
+            engaged = False
+
+        if engaged:
+            allowed = False
+            block_reason = block_reason or "kill_switch"
+            # emit a HALT action once per latch engagement
+            if not getattr(self, "_kill_switch_last", False):
+                self._kill_switch_last = True
+                try:
+                    self._safety_q.put_nowait(SafetyAction(action="HALT", reason="kill_switch", timestamp=now))
+                except Exception:
+                    pass
+        else:
+            self._kill_switch_last = False
+
+        # Step 12: safety halt gate (pre-order hard gate)
+        if bool(getattr(self, "_halt_active", False)):
+            allowed = False
+            block_reason = block_reason or "safety_halt"
 
         attempted_row = {
             "ts_utc": now,

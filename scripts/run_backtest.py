@@ -16,6 +16,7 @@ import asyncio
 # from ledger import PortfolioLedger, equity_curve_from_trades
 import glob
 
+from data_ingestion.live.gating import write_promotion_readiness
 from feature_engineering.utils.artifacts_root import resolve_artifacts_root
 from pathlib import Path
 from feature_engineering.utils.timegrid import (
@@ -5545,6 +5546,8 @@ def _promotion_checks_step4_8(*, port_dir: Path, cfg: dict | None = None) -> dic
     ]
     results["passed"] = all(ok for ok, _ in checks)
 
+
+
     print("[4.8] Promotion checklist:")
     for ok, label in checks:
         print(f"    [{'OK' if ok else 'FAIL'}] {label}")
@@ -7507,6 +7510,30 @@ async def run(cfg: Dict[str, Any]) -> pd.DataFrame:
         port_dir.mkdir(parents=True, exist_ok=True)
 
         promo = _promotion_checks_step4_8(port_dir=port_dir, cfg=cfg)
+        #write_promotion_readiness(Path(artifacts_dir), readiness)
+        #print("PHASE 14 WRITTEN TO:", artifacts_dir)
+
+        # Phase 14: promotion_readiness.json
+        readiness = {
+            "gates_passed": bool(promo.get("passed", False)),
+            "gates": {
+                "share_multisymbol": bool(promo.get("share_multisymbol", 0.0) >= 0.10),
+                "slip_median_bps": bool(promo.get("slippage_median_bps", 1e9) < 10.0),
+                "sizing_cost_hurdle": bool(int(promo.get("sizing_cost_hurdle_violations", 1)) == 0),
+            },
+            "metrics": {
+                "share_multisymbol": promo.get("share_multisymbol"),
+                "slip_median_bps": promo.get("slippage_median_bps"),
+                "sizing_cost_hurdle_violations": promo.get("sizing_cost_hurdle_violations"),
+            },
+        }
+        # cfg["artifacts_root"] is the run dir; write artifact at root (not inside /portfolio)
+        write_promotion_readiness(Path(cfg["artifacts_root"]), readiness)
+
+        # right after: write_promotion_readiness(Path(cfg["artifacts_root"]), readiness)
+        _out = Path(cfg["artifacts_root"]) / "promotion_readiness.json"
+        print("[Phase14] wrote:", _out, "exists?", _out.exists())
+
         print(f"[4.8] passed={promo['passed']}  "
               f"multi={promo['share_multisymbol']:.3f}  "
               f"slip_bps={promo['slippage_median_bps']:.2f}")

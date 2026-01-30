@@ -31,6 +31,13 @@ def _parse() -> argparse.Namespace:
 
     # If you want to run without Step5 temporarily, enable dummy feed
     p.add_argument("--dummy-feed", action="store_true", help="Use synthetic bars instead of Step 5 market feed")
+
+    p.add_argument(
+        "--unattended",
+        action="store_true",
+        help="Refuse to run unless promotion gates pass AND UNATTENDED_ALLOWED latch is present in out_dir.",
+    )
+
     return p.parse_args()
 
 
@@ -58,6 +65,10 @@ async def _dummy_feed(bar_queue: "asyncio.Queue[list[dict]]") -> None:
 async def main() -> None:
     args = _parse()
     out_dir = Path(args.out)
+
+    if args.unattended:
+        from data_ingestion.live.gating import assert_unattended_allowed
+        assert_unattended_allowed(out_dir)
 
     # Bar queue that ScannerLoop reads from (Step 5 will feed this)
     bar_queue: "asyncio.Queue[list[dict]]" = asyncio.Queue()
